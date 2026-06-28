@@ -28,6 +28,8 @@ use wayfinder_internal_core::pricing::{estimate_tokens, price_table, turn_cost, 
 use wayfinder_internal_core::vkeys;
 use wayfinder_internal_core::{DEFAULT_HOST, DEFAULT_PORT};
 
+pub mod bootstrap;
+
 pub const COMMAND_NAME: &str = "serve";
 
 const DEMO_HTML: &str = include_str!("../../../wayfinder_router/demo.html");
@@ -141,6 +143,7 @@ pub struct GatewayModel {
     pub base_url: String,
     pub model: String,
     pub api_key_env: Option<String>,
+    pub api_key_cmd: Option<String>,
     pub cost_per_1k: Option<f64>,
 }
 
@@ -509,6 +512,21 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
             })?),
             None => None,
         };
+        let api_key_cmd = match table.get("api_key_cmd") {
+            Some(value) => Some(string_field(Some(value)).ok_or_else(|| {
+                GatewayError::new(format!(
+                    "{where_}: 'gateway.models.{name}.api_key_cmd' must be a non-empty string"
+                ))
+            })?),
+            None => None,
+        };
+        if api_key_cmd.is_some() && api_key_env.is_none() {
+            // The command fills a named variable; without one there is nowhere to put the key.
+            return Err(GatewayError::new(format!(
+                "{where_}: 'gateway.models.{name}.api_key_cmd' needs 'api_key_env' to name \
+                 the variable it fills"
+            )));
+        }
         let cost_per_1k = match table.get("cost_per_1k") {
             Some(value) => Some(non_negative_number(value).ok_or_else(|| {
                 GatewayError::new(format!(
@@ -523,6 +541,7 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
                 base_url,
                 model,
                 api_key_env,
+                api_key_cmd,
                 cost_per_1k,
             },
         );

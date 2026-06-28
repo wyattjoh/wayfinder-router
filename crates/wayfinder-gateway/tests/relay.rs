@@ -113,6 +113,7 @@ fn model(base_url: &str, api_key_env: Option<&str>) -> GatewayModel {
         base_url: base_url.to_owned(),
         model: "upstream-model".to_owned(),
         api_key_env: api_key_env.map(str::to_owned),
+        api_key_cmd: None,
         cost_per_1k: None,
     }
 }
