@@ -130,8 +130,8 @@ struct AppState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct GatewayConfig {
-    models: BTreeMap<String, GatewayModel>,
+pub struct GatewayConfig {
+    pub models: BTreeMap<String, GatewayModel>,
     cache: Option<CacheConfig>,
     rate_limit: Option<RateLimitConfig>,
     keys: BTreeMap<String, VirtualKeyConfig>,
@@ -452,6 +452,83 @@ pub fn load_gateway_models(
         .map_err(|err| GatewayError::new(format!("{}: {err}", path.display())))?;
     let where_ = path.to_string_lossy();
     Ok(parse_gateway_config(&text, &where_)?.models)
+}
+
+/// Parse `[gateway]` TOML from file text without touching the environment.
+pub fn gateway_config_from_toml(text: &str, where_: &str) -> Result<GatewayConfig, GatewayError> {
+    parse_gateway_config(text, where_)
+}
+
+/// Validate `[gateway]` TOML for UI callers that only need the error surface.
+pub fn validate_gateway_toml(text: &str, where_: &str) -> Result<(), GatewayError> {
+    gateway_config_from_toml(text, where_).map(|_| ())
+}
+
+/// Serialize parsed gateway config back to TOML without resolving secrets.
+pub fn dump_gateway_toml(gateway: &GatewayConfig) -> String {
+    let mut blocks = Vec::new();
+    if let Some(cache) = &gateway.cache {
+        let mut lines = vec![
+            "[gateway.cache]".to_owned(),
+            format!("enabled = {}", cache.enabled),
+        ];
+        if cache.ttl != DEFAULT_CACHE_TTL {
+            lines.push(format!("ttl = {}", python_float_repr(cache.ttl)));
+        }
+        if cache.max_entries != DEFAULT_CACHE_MAX_ENTRIES {
+            lines.push(format!("max_entries = {}", cache.max_entries));
+        }
+        if cache.max_bytes != DEFAULT_CACHE_MAX_BYTES {
+            lines.push(format!("max_bytes = {}", cache.max_bytes));
+        }
+        blocks.push(lines.join("\n"));
+    }
+    if let Some(rate_limit) = &gateway.rate_limit {
+        let mut lines = vec!["[gateway.rate_limit]".to_owned()];
+        if let Some(rpm) = rate_limit.rpm {
+            lines.push(format!("rpm = {rpm}"));
+        }
+        if let Some(tpm) = rate_limit.tpm {
+            lines.push(format!("tpm = {tpm}"));
+        }
+        if rate_limit.window != DEFAULT_RATE_LIMIT_WINDOW {
+            lines.push(format!("window = {}", python_float_repr(rate_limit.window)));
+        }
+        blocks.push(lines.join("\n"));
+    }
+    for (id, key) in &gateway.keys {
+        blocks.push(format!("[gateway.keys.{id}]\nhash = \"{}\"", key.hash));
+    }
+    for (name, model) in &gateway.models {
+        let mut lines = vec![
+            format!("[gateway.models.{name}]"),
+            format!("base_url = \"{}\"", model.base_url),
+            format!("model = \"{}\"", model.model),
+        ];
+        if let Some(api_key_env) = &model.api_key_env {
+            lines.push(format!("api_key_env = \"{api_key_env}\""));
+        }
+        if let Some(api_key_cmd) = &model.api_key_cmd {
+            lines.push(format!("api_key_cmd = \"{api_key_cmd}\""));
+        }
+        if let Some(cost_per_1k) = model.cost_per_1k {
+            lines.push(format!("cost_per_1k = {}", python_float_repr(cost_per_1k)));
+        }
+        blocks.push(lines.join("\n"));
+    }
+    blocks.join("\n\n")
+}
+
+fn python_float_repr(value: f64) -> String {
+    let rounded = (value * 1_000_000.0).round() / 1_000_000.0;
+    let mut rendered = format!("{rounded:.6}");
+    while rendered.contains('.') && rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.push('0');
+    }
+    rendered
 }
 
 fn find_config(start_dir: &Path) -> Option<PathBuf> {
