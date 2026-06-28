@@ -31,6 +31,17 @@ pub use theme::{palette_for, resolve_theme, Palette};
 
 pub const COMMAND_NAME: &str = "chat";
 
+/// Decide whether to open the full-screen interactive app instead of the
+/// non-interactive transcript path.
+///
+/// The interactive app is the default on an interactive terminal with no prompt
+/// supplied. A piped stdin or a prompt argument (both of which populate the
+/// caller's `input`) keep the scriptable [`run_chat`] transcript so CI and shell
+/// pipelines stay deterministic.
+pub fn should_launch_interactive(stdin_is_terminal: bool, has_input: bool) -> bool {
+    stdin_is_terminal && !has_input
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatOptions {
     pub theme: String,

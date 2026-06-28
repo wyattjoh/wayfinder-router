@@ -1,5 +1,7 @@
 use std::io::{self, IsTerminal, Read};
 
+use wayfinder_internal_tui::{run_chat, run_interactive_chat, should_launch_interactive};
+
 fn main() {
     let mut options = wayfinder_internal_tui::ChatOptions::default();
     let mut args = std::env::args().skip(1);
@@ -29,10 +31,21 @@ fn main() {
             }
         }
     }
+    // Capture the terminal state before reading stdin: a piped stdin populates
+    // `input` and keeps the transcript path, so the decision must see whether the
+    // user is at an interactive terminal with nothing to route yet.
+    let stdin_is_terminal = io::stdin().is_terminal();
     if options.input.is_none() {
         options.input = read_piped_stdin();
     }
-    match wayfinder_internal_tui::run_chat(&options) {
+    if should_launch_interactive(stdin_is_terminal, options.input.is_some()) {
+        if let Err(err) = run_interactive_chat(&options) {
+            eprintln!("wayfinder-router-tui: {err}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    match run_chat(&options) {
         Ok(output) => println!("{output}"),
         Err(err) => {
             eprintln!("wayfinder-router-tui: {err}");

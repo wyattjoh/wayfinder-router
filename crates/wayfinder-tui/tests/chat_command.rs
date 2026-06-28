@@ -4,8 +4,45 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use wayfinder_internal_tui::{
     apply_chat_line, list_thread_summaries, load_thread, render_route_decision, run_chat,
-    save_thread, ChatCommand, ChatOptions, ChatState, RouteMode,
+    save_thread, should_launch_interactive, ChatCommand, ChatOptions, ChatState, RouteMode,
 };
+
+#[test]
+fn terminal_without_input_launches_interactive() {
+    // The interactive app is the new default: a real terminal with nothing to route.
+    assert!(should_launch_interactive(true, false));
+}
+
+#[test]
+fn prompt_or_piped_input_keeps_transcript() {
+    // A prompt argument or piped stdin populates `input`, so the scriptable
+    // transcript path is used even on a terminal.
+    assert!(!should_launch_interactive(true, true));
+    assert!(!should_launch_interactive(false, true));
+}
+
+#[test]
+fn non_terminal_without_input_keeps_transcript() {
+    // No terminal and no input (for example a closed/empty pipe) stays on the
+    // transcript path rather than launching a UI with no stdin to drive it.
+    assert!(!should_launch_interactive(false, false));
+}
+
+#[test]
+fn transcript_path_renders_for_prompt_input() {
+    // Coverage for the non-interactive path the decision falls back to.
+    let options = ChatOptions {
+        dry_run: true,
+        input: Some("What is DNS?".to_string()),
+        ..ChatOptions::default()
+    };
+
+    let output = run_chat(&options).expect("transcript should render");
+
+    assert!(output.contains("wayfinder-router chat"));
+    assert!(output.contains("prompt: What is DNS?"));
+    assert!(output.contains("route: local"));
+}
 
 #[test]
 fn parser_recognizes_chat_commands_and_plain_prompts() {

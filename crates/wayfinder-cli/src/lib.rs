@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 use wayfinder_internal_gateway::{serve_summary, ServeOptions};
-use wayfinder_internal_tui::{run_chat, ChatOptions};
+use wayfinder_internal_tui::{run_chat, ChatOptions, HELP};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CliError(String);
@@ -24,6 +24,28 @@ impl Error for CliError {}
 pub enum CliCommand {
     Serve(ServeOptions),
     Chat(ChatOptions),
+    Help(String),
+}
+
+/// Usage block for `chat --help`, joined with the slash-command [`HELP`] summary.
+const CHAT_USAGE: &str = "\
+usage: wayfinder-router chat [OPTIONS] [PROMPT]
+
+Open the interactive chat on a terminal. When a prompt is passed as arguments or
+stdin is piped, print the routing transcript instead so scripting and CI work.
+
+options:
+  --theme <name>       color theme: auto, dark, or light
+  --threshold <0..1>   local/cloud routing cut
+  --why                expand the routing decision for each prompt
+  --dry-run            skip the gateway call
+  --no-stream          disable token-by-token streaming
+  --base-url <url>     gateway base url for the thin client
+  --thread-dir <dir>   directory for saved conversation threads
+  --help, -h           show this help";
+
+fn chat_help() -> String {
+    format!("{CHAT_USAGE}\n\n{HELP}")
 }
 
 pub fn run<I>(args: I) -> Result<String, CliError>
@@ -44,6 +66,7 @@ where
         CliCommand::Chat(options) => {
             run_chat(&options).map_err(|err| CliError::new(err.to_string()))
         }
+        CliCommand::Help(text) => Ok(text),
     }
 }
 
@@ -63,13 +86,15 @@ where
     let mut args = args.into_iter().map(Into::into);
     match args.next().as_deref() {
         Some("serve") => Ok(CliCommand::Serve(parse_serve(args)?)),
-        Some("chat") => {
-            let mut options = parse_chat(args)?;
-            if options.input.is_none() {
-                options.input = stdin.and_then(non_empty);
+        Some("chat") => match parse_chat(args)? {
+            None => Ok(CliCommand::Help(chat_help())),
+            Some(mut options) => {
+                if options.input.is_none() {
+                    options.input = stdin.and_then(non_empty);
+                }
+                Ok(CliCommand::Chat(options))
             }
-            Ok(CliCommand::Chat(options))
-        }
+        },
         Some(command) => Err(CliError::new(format!(
             "unknown command '{command}' (expected 'serve' or 'chat')"
         ))),
@@ -105,7 +130,7 @@ where
     Ok(options)
 }
 
-fn parse_chat<I>(args: I) -> Result<ChatOptions, CliError>
+fn parse_chat<I>(args: I) -> Result<Option<ChatOptions>, CliError>
 where
     I: IntoIterator<Item = String>,
 {
@@ -114,6 +139,7 @@ where
     let mut prompt_parts = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
             "--theme" => options.theme = next_value(&mut args, "--theme")?,
             "--threshold" => {
                 options.threshold = Some(
@@ -142,7 +168,7 @@ where
     if !prompt_parts.is_empty() {
         options.input = Some(prompt_parts.join(" "));
     }
-    Ok(options)
+    Ok(Some(options))
 }
 
 fn next_value<I>(args: &mut I, flag: &str) -> Result<String, CliError>
@@ -226,5 +252,24 @@ mod tests {
 
         assert!(output.contains("prompt: What is DNS?"));
         assert!(output.contains("why:"));
+    }
+
+    #[test]
+    fn chat_help_prints_usage_and_command_summary() {
+        let output = run(["chat", "--help"]).expect("chat --help should succeed");
+
+        assert!(output.contains("usage: wayfinder-router chat"));
+        assert!(output.contains("--theme"));
+        assert!(output.contains("--thread-dir"));
+        assert!(output.contains("commands"));
+        assert!(output.contains("/why"));
+    }
+
+    #[test]
+    fn chat_help_short_flag_matches_long_flag() {
+        let long = run(["chat", "--help"]).expect("chat --help should succeed");
+        let short = run(["chat", "-h"]).expect("chat -h should succeed");
+
+        assert_eq!(long, short);
     }
 }
