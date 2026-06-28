@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::to_bytes;
 use axum::body::Body;
@@ -17,13 +17,15 @@ use axum::{Json, Router};
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde_json::{json, Map, Value as JsonValue};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use toml::Value;
 use wayfinder_internal_core::complexity::{
     recommend_tier, score_complexity, ComplexityScore, RoutingConfig, Tier,
 };
 use wayfinder_internal_core::config::{routing_config_from_toml, CONFIG_FILE};
-use wayfinder_internal_core::pricing::{estimate_tokens, usage_tokens};
+use wayfinder_internal_core::pricing::{estimate_tokens, price_table, turn_cost, usage_tokens};
+use wayfinder_internal_core::vkeys;
 use wayfinder_internal_core::{DEFAULT_HOST, DEFAULT_PORT};
 
 pub const COMMAND_NAME: &str = "serve";
@@ -34,6 +36,11 @@ const AUTO_DIRECTIVE: &str = "auto";
 const PREFER_LOCAL_DIRECTIVE: &str = "prefer-local";
 const PREFER_HOSTED_DIRECTIVE: &str = "prefer-hosted";
 const PREFER_CLOUD_DIRECTIVE: &str = "prefer-cloud";
+const DEFAULT_CACHE_TTL: f64 = 300.0;
+const DEFAULT_CACHE_MAX_ENTRIES: usize = 1024;
+const DEFAULT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_RATE_LIMIT_WINDOW: f64 = 60.0;
+const RECENT_LIMIT: usize = 200;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const DASHBOARD_HTML: &str = r#"<!doctype html>
@@ -115,18 +122,137 @@ struct AppState {
     routing: RoutingConfig,
     gateway: GatewayConfig,
     model_ids: Vec<String>,
+    price_table: BTreeMap<String, f64>,
+    priced: bool,
+    runtime: Arc<GatewayRuntime>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct GatewayConfig {
     models: BTreeMap<String, GatewayModel>,
+    cache: Option<CacheConfig>,
+    rate_limit: Option<RateLimitConfig>,
+    keys: BTreeMap<String, VirtualKeyConfig>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct GatewayModel {
     base_url: String,
     model: String,
     api_key_env: Option<String>,
+    cost_per_1k: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CacheConfig {
+    enabled: bool,
+    ttl: f64,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RateLimitConfig {
+    rpm: Option<u64>,
+    tpm: Option<u64>,
+    window: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VirtualKeyConfig {
+    hash: String,
+}
+
+struct GatewayRuntime {
+    cache: Mutex<ResponseCache>,
+    rate_limiter: Mutex<RateLimiter>,
+    metrics: Mutex<Metrics>,
+    recent: Mutex<VecDeque<RecentDecision>>,
+}
+
+#[derive(Default)]
+struct ResponseCache {
+    config: Option<CacheConfig>,
+    entries: BTreeMap<String, CacheEntry>,
+    lru: VecDeque<String>,
+    bytes: usize,
+}
+
+#[derive(Clone)]
+struct CacheEntry {
+    status: StatusCode,
+    content_type: String,
+    body: Vec<u8>,
+    stored_at: Instant,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    estimated: bool,
+    avoided_cost: f64,
+}
+
+#[derive(Default)]
+struct RateLimiter {
+    config: Option<RateLimitConfig>,
+    window_started: Option<Instant>,
+    requests: u64,
+    tokens: u64,
+}
+
+struct RateAdmission {
+    allowed: bool,
+    limit: &'static str,
+    retry_after: u64,
+}
+
+struct RateSnapshot {
+    limit: u64,
+    remaining: u64,
+    reset: u64,
+}
+
+#[derive(Default)]
+struct Metrics {
+    requests: BTreeMap<(String, String), u64>,
+    upstream_errors: BTreeMap<String, u64>,
+    rate_limited: BTreeMap<String, u64>,
+    key_requests: BTreeMap<String, u64>,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_avoided_cost: f64,
+    realized_cost: f64,
+    baseline_cost: f64,
+    decision_latency_sum: f64,
+    decision_latency_count: u64,
+    upstream_latency: BTreeMap<String, LatencyTotals>,
+}
+
+#[derive(Default)]
+struct LatencyTotals {
+    sum: f64,
+    count: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct RecentDecision {
+    request_id: String,
+    model: String,
+    served_by: String,
+    score: f64,
+    mode: String,
+    ts: u64,
+    cost: RecentCost,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_id: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct RecentCost {
+    realized: f64,
+    baseline: f64,
+    saved: f64,
+    tokens: usize,
+    unit: &'static str,
+    estimated: bool,
 }
 
 #[derive(Serialize)]
@@ -208,11 +334,27 @@ impl AppState {
     fn load(options: ServeOptions, start_dir: &Path) -> Result<Self, GatewayError> {
         let loaded = load_config(start_dir)?;
         let model_ids = model_ids(&loaded.routing, &loaded.gateway);
+        let tier_ladder = loaded
+            .routing
+            .tiers
+            .iter()
+            .map(|tier| tier.model.as_str())
+            .collect::<Vec<_>>();
+        let model_costs = loaded
+            .gateway
+            .models
+            .iter()
+            .map(|(name, model)| (name.as_str(), model.cost_per_1k));
+        let (costs, priced) = price_table(model_costs, tier_ladder);
+        let runtime = Arc::new(GatewayRuntime::new(&loaded.gateway));
         Ok(Self {
             options,
             routing: loaded.routing,
             gateway: loaded.gateway,
             model_ids,
+            price_table: costs,
+            priced,
+            runtime,
         })
     }
 }
@@ -228,6 +370,9 @@ fn load_config(start_dir: &Path) -> Result<LoadedConfig, GatewayError> {
             routing: RoutingConfig::default(),
             gateway: GatewayConfig {
                 models: BTreeMap::new(),
+                cache: None,
+                rate_limit: None,
+                keys: BTreeMap::new(),
             },
         });
     };
@@ -261,8 +406,18 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
     else {
         return Ok(GatewayConfig {
             models: BTreeMap::new(),
+            cache: None,
+            rate_limit: None,
+            keys: BTreeMap::new(),
         });
     };
+    let gateway_table = data
+        .get("gateway")
+        .and_then(Value::as_table)
+        .ok_or_else(|| GatewayError::new(format!("{where_}: '[gateway]' must be a table")))?;
+    let cache = parse_cache_config(gateway_table.get("cache"), where_)?;
+    let rate_limit = parse_rate_limit_config(gateway_table.get("rate_limit"), where_)?;
+    let keys = parse_keys_config(gateway_table.get("keys"), where_)?;
     let mut parsed = BTreeMap::new();
     for (name, value) in models {
         let Some(table) = value.as_table() else {
@@ -288,16 +443,30 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
             })?),
             None => None,
         };
+        let cost_per_1k = match table.get("cost_per_1k") {
+            Some(value) => Some(non_negative_number(value).ok_or_else(|| {
+                GatewayError::new(format!(
+                    "{where_}: 'gateway.models.{name}.cost_per_1k' must be a non-negative number"
+                ))
+            })?),
+            None => None,
+        };
         parsed.insert(
             name.clone(),
             GatewayModel {
                 base_url,
                 model,
                 api_key_env,
+                cost_per_1k,
             },
         );
     }
-    Ok(GatewayConfig { models: parsed })
+    Ok(GatewayConfig {
+        models: parsed,
+        cache,
+        rate_limit,
+        keys,
+    })
 }
 
 fn string_field(value: Option<&Value>) -> Option<String> {
@@ -307,6 +476,172 @@ fn string_field(value: Option<&Value>) -> Option<String> {
     } else {
         Some(value.to_owned())
     }
+}
+
+fn parse_cache_config(
+    value: Option<&Value>,
+    where_: &str,
+) -> Result<Option<CacheConfig>, GatewayError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Value::Table(table) = value else {
+        return Err(GatewayError::new(format!(
+            "{where_}: '[gateway.cache]' must be a table"
+        )));
+    };
+    let enabled = match table.get("enabled") {
+        Some(Value::Boolean(value)) => *value,
+        Some(_) => {
+            return Err(GatewayError::new(format!(
+                "{where_}: 'gateway.cache.enabled' must be a boolean"
+            )));
+        }
+        None => false,
+    };
+    let ttl = match table.get("ttl") {
+        Some(value) => non_negative_number(value).ok_or_else(|| {
+            GatewayError::new(format!(
+                "{where_}: 'gateway.cache.ttl' must be a non-negative number"
+            ))
+        })?,
+        None => DEFAULT_CACHE_TTL,
+    };
+    let max_entries = match table.get("max_entries") {
+        Some(value) => positive_usize(value).ok_or_else(|| {
+            GatewayError::new(format!(
+                "{where_}: 'gateway.cache.max_entries' must be a positive integer"
+            ))
+        })?,
+        None => DEFAULT_CACHE_MAX_ENTRIES,
+    };
+    let max_bytes = match table.get("max_bytes") {
+        Some(value) => positive_usize(value).ok_or_else(|| {
+            GatewayError::new(format!(
+                "{where_}: 'gateway.cache.max_bytes' must be a positive integer"
+            ))
+        })?,
+        None => DEFAULT_CACHE_MAX_BYTES,
+    };
+    Ok(Some(CacheConfig {
+        enabled,
+        ttl,
+        max_entries,
+        max_bytes,
+    }))
+}
+
+fn parse_rate_limit_config(
+    value: Option<&Value>,
+    where_: &str,
+) -> Result<Option<RateLimitConfig>, GatewayError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Value::Table(table) = value else {
+        return Err(GatewayError::new(format!(
+            "{where_}: '[gateway.rate_limit]' must be a table"
+        )));
+    };
+    let rpm = match table.get("rpm") {
+        Some(value) => Some(positive_u64(value).ok_or_else(|| {
+            GatewayError::new(format!(
+                "{where_}: 'gateway.rate_limit.rpm' must be a positive integer"
+            ))
+        })?),
+        None => None,
+    };
+    let tpm = match table.get("tpm") {
+        Some(value) => Some(positive_u64(value).ok_or_else(|| {
+            GatewayError::new(format!(
+                "{where_}: 'gateway.rate_limit.tpm' must be a positive integer"
+            ))
+        })?),
+        None => None,
+    };
+    if rpm.is_none() && tpm.is_none() {
+        return Err(GatewayError::new(format!(
+            "{where_}: '[gateway.rate_limit]' must set 'rpm' and/or 'tpm'"
+        )));
+    }
+    let window = match table.get("window") {
+        Some(value) => positive_number(value).ok_or_else(|| {
+            GatewayError::new(format!(
+                "{where_}: 'gateway.rate_limit.window' must be a positive number"
+            ))
+        })?,
+        None => DEFAULT_RATE_LIMIT_WINDOW,
+    };
+    Ok(Some(RateLimitConfig { rpm, tpm, window }))
+}
+
+fn parse_keys_config(
+    value: Option<&Value>,
+    where_: &str,
+) -> Result<BTreeMap<String, VirtualKeyConfig>, GatewayError> {
+    let Some(value) = value else {
+        return Ok(BTreeMap::new());
+    };
+    let Value::Table(table) = value else {
+        return Err(GatewayError::new(format!(
+            "{where_}: '[gateway.keys]' must be a table"
+        )));
+    };
+    let mut keys = BTreeMap::new();
+    for (id, value) in table {
+        let Some(entry) = value.as_table() else {
+            return Err(GatewayError::new(format!(
+                "{where_}: '[gateway.keys.{id}]' must be a table"
+            )));
+        };
+        let Some(hash) = string_field(entry.get("hash")) else {
+            return Err(GatewayError::new(format!(
+                "{where_}: 'gateway.keys.{id}.hash' must be a SHA-256 hex digest"
+            )));
+        };
+        if !is_sha256_hex(&hash) {
+            return Err(GatewayError::new(format!(
+                "{where_}: 'gateway.keys.{id}.hash' must be a SHA-256 hex digest"
+            )));
+        }
+        keys.insert(
+            id.clone(),
+            VirtualKeyConfig {
+                hash: hash.to_ascii_lowercase(),
+            },
+        );
+    }
+    Ok(keys)
+}
+
+fn non_negative_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Integer(value) if *value >= 0 => Some(*value as f64),
+        Value::Float(value) if *value >= 0.0 => Some(*value),
+        _ => None,
+    }
+}
+
+fn positive_number(value: &Value) -> Option<f64> {
+    non_negative_number(value).filter(|value| *value > 0.0)
+}
+
+fn positive_usize(value: &Value) -> Option<usize> {
+    let Value::Integer(value) = value else {
+        return None;
+    };
+    usize::try_from(*value).ok().filter(|value| *value > 0)
+}
+
+fn positive_u64(value: &Value) -> Option<u64> {
+    let Value::Integer(value) = value else {
+        return None;
+    };
+    u64::try_from(*value).ok().filter(|value| *value > 0)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn model_ids(routing: &RoutingConfig, gateway: &GatewayConfig) -> Vec<String> {
@@ -324,6 +659,356 @@ fn model_ids(routing: &RoutingConfig, gateway: &GatewayConfig) -> Vec<String> {
     };
     ids.dedup();
     ids
+}
+
+impl GatewayRuntime {
+    fn new(gateway: &GatewayConfig) -> Self {
+        Self {
+            cache: Mutex::new(ResponseCache::new(gateway.cache.clone())),
+            rate_limiter: Mutex::new(RateLimiter::new(gateway.rate_limit.clone())),
+            metrics: Mutex::new(Metrics::default()),
+            recent: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
+impl ResponseCache {
+    fn new(config: Option<CacheConfig>) -> Self {
+        Self {
+            config: config.filter(|config| config.enabled),
+            entries: BTreeMap::new(),
+            lru: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<CacheEntry> {
+        let config = self.config.as_ref()?;
+        let entry = self.entries.get(key)?;
+        if config.ttl > 0.0 && entry.stored_at.elapsed() >= Duration::from_secs_f64(config.ttl) {
+            self.drop_key(key);
+            return None;
+        }
+        let entry = self.entries.get(key)?.clone();
+        self.touch(key);
+        Some(entry)
+    }
+
+    fn put(&mut self, key: String, entry: CacheEntry) {
+        let Some(config) = self.config.clone() else {
+            return;
+        };
+        let size = entry.body.len();
+        if size > config.max_bytes {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.body.len());
+            self.lru.retain(|item| item != &key);
+        }
+        self.bytes += size;
+        self.entries.insert(key.clone(), entry);
+        self.lru.push_back(key);
+        self.evict(&config);
+    }
+
+    fn touch(&mut self, key: &str) {
+        self.lru.retain(|item| item != key);
+        self.lru.push_back(key.to_owned());
+    }
+
+    fn drop_key(&mut self, key: &str) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.bytes = self.bytes.saturating_sub(entry.body.len());
+        }
+        self.lru.retain(|item| item != key);
+    }
+
+    fn evict(&mut self, config: &CacheConfig) {
+        while self.entries.len() > config.max_entries || self.bytes > config.max_bytes {
+            let Some(key) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(entry.body.len());
+            }
+        }
+    }
+}
+
+impl RateLimiter {
+    fn new(config: Option<RateLimitConfig>) -> Self {
+        Self {
+            config,
+            window_started: None,
+            requests: 0,
+            tokens: 0,
+        }
+    }
+
+    fn admit(&mut self) -> RateAdmission {
+        let Some(config) = self.config.clone() else {
+            return RateAdmission {
+                allowed: true,
+                limit: "",
+                retry_after: 0,
+            };
+        };
+        self.roll_window(&config);
+        let retry_after = self.retry_after(&config);
+        if config.rpm.is_some_and(|rpm| self.requests >= rpm) {
+            return RateAdmission {
+                allowed: false,
+                limit: "rpm",
+                retry_after,
+            };
+        }
+        if config.tpm.is_some_and(|tpm| self.tokens >= tpm) {
+            return RateAdmission {
+                allowed: false,
+                limit: "tpm",
+                retry_after,
+            };
+        }
+        self.requests += 1;
+        RateAdmission {
+            allowed: true,
+            limit: "",
+            retry_after: 0,
+        }
+    }
+
+    fn add_tokens(&mut self, tokens: usize) {
+        let Some(config) = self.config.clone() else {
+            return;
+        };
+        if config.tpm.is_none() {
+            return;
+        }
+        self.roll_window(&config);
+        self.tokens = self.tokens.saturating_add(tokens as u64);
+    }
+
+    fn snapshot(&mut self) -> Option<RateSnapshot> {
+        let config = self.config.clone()?;
+        let rpm = config.rpm?;
+        self.roll_window(&config);
+        Some(RateSnapshot {
+            limit: rpm,
+            remaining: rpm.saturating_sub(self.requests),
+            reset: self.retry_after(&config),
+        })
+    }
+
+    fn roll_window(&mut self, config: &RateLimitConfig) {
+        let now = Instant::now();
+        let window = Duration::from_secs_f64(config.window);
+        match self.window_started {
+            Some(started) if now.duration_since(started) < window => {}
+            _ => {
+                self.window_started = Some(now);
+                self.requests = 0;
+                self.tokens = 0;
+            }
+        }
+    }
+
+    fn retry_after(&self, config: &RateLimitConfig) -> u64 {
+        let window = Duration::from_secs_f64(config.window);
+        let Some(started) = self.window_started else {
+            return config.window.ceil().max(1.0) as u64;
+        };
+        let elapsed = Instant::now().duration_since(started);
+        if elapsed >= window {
+            1
+        } else {
+            (window - elapsed).as_secs_f64().ceil().max(1.0) as u64
+        }
+    }
+}
+
+impl Metrics {
+    fn observe_decision(&mut self, model: &str, mode: &str, latency: Duration) {
+        *self
+            .requests
+            .entry((model.to_owned(), mode.to_owned()))
+            .or_default() += 1;
+        self.decision_latency_count += 1;
+        self.decision_latency_sum += latency.as_secs_f64();
+    }
+
+    fn observe_upstream(&mut self, model: &str, latency: Duration) {
+        let totals = self.upstream_latency.entry(model.to_owned()).or_default();
+        totals.count += 1;
+        totals.sum += latency.as_secs_f64();
+    }
+
+    fn observe_upstream_error(&mut self, model: &str) {
+        *self.upstream_errors.entry(model.to_owned()).or_default() += 1;
+    }
+
+    fn observe_cost(&mut self, realized: f64, baseline: f64) {
+        self.realized_cost = round_cost(self.realized_cost + realized);
+        self.baseline_cost = round_cost(self.baseline_cost + baseline);
+    }
+
+    fn observe_cache_hit(&mut self, avoided_cost: f64) {
+        self.cache_hits += 1;
+        self.cache_avoided_cost = round_cost(self.cache_avoided_cost + avoided_cost.max(0.0));
+    }
+
+    fn observe_cache_miss(&mut self) {
+        self.cache_misses += 1;
+    }
+
+    fn observe_rate_limited(&mut self, limit: &str) {
+        *self.rate_limited.entry(limit.to_owned()).or_default() += 1;
+    }
+
+    fn observe_key_request(&mut self, key_id: &str) {
+        *self.key_requests.entry(key_id.to_owned()).or_default() += 1;
+    }
+
+    fn render(&self, version: &str, dry_run: bool, recent_total: usize) -> String {
+        let mut lines = Vec::new();
+        lines.push("# HELP wayfinder_router_build_info Build and runtime metadata.".to_owned());
+        lines.push("# TYPE wayfinder_router_build_info gauge".to_owned());
+        lines.push(format!(
+            "wayfinder_router_build_info{{version=\"{}\",dry_run=\"{}\"}} 1",
+            label_escape(version),
+            dry_run
+        ));
+        lines.push(
+            "# HELP wayfinder_router_recent_decisions_total Number of routing decisions retained in memory."
+                .to_owned(),
+        );
+        lines.push("# TYPE wayfinder_router_recent_decisions_total gauge".to_owned());
+        lines.push(format!(
+            "wayfinder_router_recent_decisions_total {recent_total}"
+        ));
+        lines.push(
+            "# HELP wayfinder_router_requests_total Routed requests by model and mode.".to_owned(),
+        );
+        lines.push("# TYPE wayfinder_router_requests_total counter".to_owned());
+        for ((model, mode), count) in &self.requests {
+            lines.push(format!(
+                "wayfinder_router_requests_total{{model=\"{}\",mode=\"{}\"}} {count}",
+                label_escape(model),
+                label_escape(mode)
+            ));
+        }
+        lines.push(
+            "# HELP wayfinder_router_upstream_errors_total Upstream failures by model.".to_owned(),
+        );
+        lines.push("# TYPE wayfinder_router_upstream_errors_total counter".to_owned());
+        for (model, count) in &self.upstream_errors {
+            lines.push(format!(
+                "wayfinder_router_upstream_errors_total{{model=\"{}\"}} {count}",
+                label_escape(model)
+            ));
+        }
+        lines.push(
+            "# HELP wayfinder_router_cache_hits_total Exact-match response cache hits.".to_owned(),
+        );
+        lines.push("# TYPE wayfinder_router_cache_hits_total counter".to_owned());
+        lines.push(format!(
+            "wayfinder_router_cache_hits_total {}",
+            self.cache_hits
+        ));
+        lines.push(
+            "# HELP wayfinder_router_cache_misses_total Cacheable response cache misses."
+                .to_owned(),
+        );
+        lines.push("# TYPE wayfinder_router_cache_misses_total counter".to_owned());
+        lines.push(format!(
+            "wayfinder_router_cache_misses_total {}",
+            self.cache_misses
+        ));
+        lines.push(
+            "# HELP wayfinder_router_cache_avoided_cost_total Upstream cost avoided by cache hits."
+                .to_owned(),
+        );
+        lines.push("# TYPE wayfinder_router_cache_avoided_cost_total counter".to_owned());
+        lines.push(format!(
+            "wayfinder_router_cache_avoided_cost_total {}",
+            self.cache_avoided_cost
+        ));
+        lines.push(
+            "# HELP wayfinder_router_rate_limited_total Requests rejected with 429 by limit."
+                .to_owned(),
+        );
+        lines.push("# TYPE wayfinder_router_rate_limited_total counter".to_owned());
+        for (limit, count) in &self.rate_limited {
+            lines.push(format!(
+                "wayfinder_router_rate_limited_total{{limit=\"{}\"}} {count}",
+                label_escape(limit)
+            ));
+        }
+        if !self.key_requests.is_empty() {
+            lines.push(
+                "# HELP wayfinder_router_key_requests_total Requests by virtual-key id.".to_owned(),
+            );
+            lines.push("# TYPE wayfinder_router_key_requests_total counter".to_owned());
+            for (key, count) in &self.key_requests {
+                lines.push(format!(
+                    "wayfinder_router_key_requests_total{{key=\"{}\"}} {count}",
+                    label_escape(key)
+                ));
+            }
+        }
+        lines.push("# HELP wayfinder_router_realized_cost_total Cumulative realized spend on the chosen tier.".to_owned());
+        lines.push("# TYPE wayfinder_router_realized_cost_total counter".to_owned());
+        lines.push(format!(
+            "wayfinder_router_realized_cost_total {}",
+            self.realized_cost
+        ));
+        lines.push(
+            "# HELP wayfinder_router_baseline_cost_total Cumulative always-frontier baseline cost."
+                .to_owned(),
+        );
+        lines.push("# TYPE wayfinder_router_baseline_cost_total counter".to_owned());
+        lines.push(format!(
+            "wayfinder_router_baseline_cost_total {}",
+            self.baseline_cost
+        ));
+        lines.push(
+            "# HELP wayfinder_router_savings_cost_total Cumulative savings versus baseline."
+                .to_owned(),
+        );
+        lines.push("# TYPE wayfinder_router_savings_cost_total counter".to_owned());
+        lines.push(format!(
+            "wayfinder_router_savings_cost_total {}",
+            round_cost(self.baseline_cost - self.realized_cost)
+        ));
+        lines.push(
+            "# HELP wayfinder_router_decision_latency_seconds Time spent scoring and routing."
+                .to_owned(),
+        );
+        lines.push("# TYPE wayfinder_router_decision_latency_seconds summary".to_owned());
+        lines.push(format!(
+            "wayfinder_router_decision_latency_seconds_sum {}",
+            self.decision_latency_sum
+        ));
+        lines.push(format!(
+            "wayfinder_router_decision_latency_seconds_count {}",
+            self.decision_latency_count
+        ));
+        lines.push("# HELP wayfinder_router_upstream_latency_seconds Upstream model round-trip time by model.".to_owned());
+        lines.push("# TYPE wayfinder_router_upstream_latency_seconds summary".to_owned());
+        for (model, totals) in &self.upstream_latency {
+            lines.push(format!(
+                "wayfinder_router_upstream_latency_seconds_sum{{model=\"{}\"}} {}",
+                label_escape(model),
+                totals.sum
+            ));
+            lines.push(format!(
+                "wayfinder_router_upstream_latency_seconds_count{{model=\"{}\"}} {}",
+                label_escape(model),
+                totals.count
+            ));
+        }
+        lines.join("\n") + "\n"
+    }
 }
 
 async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -370,15 +1055,81 @@ async fn chat_completions_response(
     mut body: JsonValue,
 ) -> Response<Body> {
     let request_id = next_request_id();
+    let key_id = match authorize_key(&state, &headers, &request_id) {
+        Ok(key_id) => key_id,
+        Err(response) => return response,
+    };
+    let rate_admission = {
+        let mut limiter = state.runtime.rate_limiter.lock().unwrap();
+        limiter.admit()
+    };
+    if !rate_admission.allowed {
+        state
+            .runtime
+            .metrics
+            .lock()
+            .unwrap()
+            .observe_rate_limited(rate_admission.limit);
+        let mut headers = request_id_header(&request_id);
+        headers.insert(
+            "x-wayfinder-router-rate-limit",
+            HeaderValue::from_static(rate_admission.limit),
+        );
+        headers.insert(
+            "retry-after",
+            HeaderValue::from_str(&rate_admission.retry_after.to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("1")),
+        );
+        add_rate_limit_headers(&state, &mut headers);
+        return json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            headers,
+            json!({
+                "error": {
+                    "message": "wayfinder gateway rate limit exceeded",
+                    "type": "wayfinder_router_rate_limited"
+                }
+            }),
+        );
+    }
+
+    let decision_started = Instant::now();
     let prompt = extract_prompt(body.get("messages"));
     let decision = score_complexity(&prompt, &state.routing);
+    let decision_latency = decision_started.elapsed();
     let route = match route_decision(&state, &headers, body.get("model"), &decision, &request_id) {
         Ok(route) => route,
         Err(response) => return response,
     };
+    let client_body = body.clone();
     let mut response_headers =
         decision_headers(&route.chosen, decision.score, &route.mode, &request_id);
+    add_rate_limit_headers(&state, &mut response_headers);
+    if let Some(key_id) = &key_id {
+        response_headers.insert(
+            "x-wayfinder-router-key",
+            HeaderValue::from_str(key_id).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+        );
+        state
+            .runtime
+            .metrics
+            .lock()
+            .unwrap()
+            .observe_key_request(key_id);
+    }
     if state.options.dry_run {
+        let cost = zero_recent_cost(state.priced);
+        observe_decision(
+            &state,
+            &route,
+            &route.chosen,
+            &request_id,
+            decision.score,
+            decision_latency,
+            None,
+            cost,
+            key_id.clone(),
+        );
         return json_response(
             StatusCode::OK,
             response_headers,
@@ -414,19 +1165,66 @@ async fn chat_completions_response(
         "x-wayfinder-router-served-by",
         HeaderValue::from_str(&served_by).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
     );
+    let debug = debug_enabled(&headers);
+    let cache_key = if cache_enabled(&state) && is_cacheable_request(&client_body) && !debug {
+        Some(cache_key(&target.model, &client_body))
+    } else {
+        None
+    };
+    if let Some(cache_key) = &cache_key {
+        if let Some(entry) = state.runtime.cache.lock().unwrap().get(cache_key) {
+            response_headers.insert("x-wayfinder-router-cache", HeaderValue::from_static("hit"));
+            let cost = recent_cost_from_tokens(
+                &state,
+                &route.chosen,
+                entry.prompt_tokens,
+                entry.completion_tokens,
+                entry.estimated,
+            );
+            {
+                let mut metrics = state.runtime.metrics.lock().unwrap();
+                metrics.observe_cache_hit(entry.avoided_cost);
+                metrics.observe_decision(&route.chosen, &route.mode, decision_latency);
+            }
+            push_recent(
+                &state,
+                RecentDecision {
+                    request_id: request_id.clone(),
+                    model: route.chosen.clone(),
+                    served_by: served_by.clone(),
+                    score: round_score(decision.score),
+                    mode: route.mode.clone(),
+                    ts: unix_ts(),
+                    cost,
+                    key_id,
+                },
+            );
+            return bytes_response(
+                entry.status,
+                with_content_type(response_headers, &entry.content_type),
+                entry.body,
+            );
+        }
+        response_headers.insert("x-wayfinder-router-cache", HeaderValue::from_static("miss"));
+        state.runtime.metrics.lock().unwrap().observe_cache_miss();
+    }
     body["model"] = JsonValue::String(target.model.clone());
     if body.get("stream").and_then(JsonValue::as_bool) == Some(true) {
-        return stream_upstream(state.options, target, body, response_headers).await;
+        return stream_upstream(state, target, body, response_headers, &route.chosen).await;
     }
     forward_upstream(
-        state.options,
+        state,
         target,
         body,
         response_headers,
-        debug_enabled(&headers),
+        debug,
         decision,
         route,
         request_id,
+        prompt,
+        cache_key,
+        key_id,
+        decision_latency,
     )
     .await
 }
@@ -620,7 +1418,7 @@ fn threshold_tiers(routing: &RoutingConfig, threshold: f64) -> Option<Vec<Tier>>
 }
 
 async fn forward_upstream(
-    options: ServeOptions,
+    state: AppState,
     target: GatewayModel,
     body: JsonValue,
     headers: HeaderMap,
@@ -628,9 +1426,14 @@ async fn forward_upstream(
     decision: ComplexityScore,
     route: RouteDecision,
     request_id: String,
+    prompt: String,
+    cache_key: Option<String>,
+    key_id: Option<String>,
+    decision_latency: Duration,
 ) -> Response<Body> {
-    let client = upstream_client(&options);
+    let client = upstream_client(&state.options);
     let url = chat_url(&target.base_url);
+    let upstream_started = Instant::now();
     let response = client
         .post(url)
         .headers(upstream_headers(&target))
@@ -638,8 +1441,15 @@ async fn forward_upstream(
         .send()
         .await;
     let Ok(response) = response else {
+        state
+            .runtime
+            .metrics
+            .lock()
+            .unwrap()
+            .observe_upstream_error(&route.chosen);
         return upstream_error(headers, "upstream request failed");
     };
+    let upstream_latency = upstream_started.elapsed();
     let status = response.status();
     let content_type = response
         .headers()
@@ -649,7 +1459,15 @@ async fn forward_upstream(
         .to_owned();
     let bytes = match response.bytes().await {
         Ok(bytes) => bytes,
-        Err(_) => return upstream_error(headers, "upstream response failed"),
+        Err(_) => {
+            state
+                .runtime
+                .metrics
+                .lock()
+                .unwrap()
+                .observe_upstream_error(&route.chosen);
+            return upstream_error(headers, "upstream response failed");
+        }
     };
     if status.is_client_error() {
         return bytes_response(
@@ -659,10 +1477,74 @@ async fn forward_upstream(
         );
     }
     if !status.is_success() {
+        state
+            .runtime
+            .metrics
+            .lock()
+            .unwrap()
+            .observe_upstream_error(&route.chosen);
         return upstream_error(headers, &format!("upstream returned {status}"));
     }
+    let parsed = serde_json::from_slice::<JsonValue>(&bytes).ok();
+    let completion = parsed
+        .as_ref()
+        .map(extract_completion_text)
+        .unwrap_or_default();
+    let usage = parsed
+        .as_ref()
+        .map(|parsed| usage_tokens(parsed, &prompt, &completion))
+        .unwrap_or_else(|| usage_tokens(&JsonValue::Null, &prompt, &completion));
+    let cost = recent_cost_from_tokens(
+        &state,
+        &route.chosen,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.estimated,
+    );
+    state
+        .runtime
+        .rate_limiter
+        .lock()
+        .unwrap()
+        .add_tokens(usage.prompt_tokens + usage.completion_tokens);
+    {
+        let mut metrics = state.runtime.metrics.lock().unwrap();
+        metrics.observe_decision(&route.chosen, &route.mode, decision_latency);
+        metrics.observe_upstream(&route.chosen, upstream_latency);
+        metrics.observe_cost(cost.realized, cost.baseline);
+    }
+    push_recent(
+        &state,
+        RecentDecision {
+            request_id: request_id.clone(),
+            model: route.chosen.clone(),
+            served_by: route.chosen.clone(),
+            score: round_score(decision.score),
+            mode: route.mode.clone(),
+            ts: unix_ts(),
+            cost: cost.clone(),
+            key_id: key_id.clone(),
+        },
+    );
+    if let (Some(cache_key), Some(parsed)) = (&cache_key, parsed.as_ref()) {
+        if is_storable_response(status, &content_type, parsed) {
+            state.runtime.cache.lock().unwrap().put(
+                cache_key.clone(),
+                CacheEntry {
+                    status,
+                    content_type: content_type.clone(),
+                    body: bytes.to_vec(),
+                    stored_at: Instant::now(),
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    estimated: usage.estimated,
+                    avoided_cost: cost.realized,
+                },
+            );
+        }
+    }
     if debug && content_type.contains("json") {
-        if let Ok(mut parsed) = serde_json::from_slice::<JsonValue>(&bytes) {
+        if let Some(mut parsed) = parsed {
             if let Some(object) = parsed.as_object_mut() {
                 object.insert(
                     "wayfinder".to_owned(),
@@ -684,12 +1566,13 @@ async fn forward_upstream(
 }
 
 async fn stream_upstream(
-    options: ServeOptions,
+    state: AppState,
     target: GatewayModel,
     body: JsonValue,
     headers: HeaderMap,
+    served_by: &str,
 ) -> Response<Body> {
-    let client = upstream_client(&options);
+    let client = upstream_client(&state.options);
     let url = chat_url(&target.base_url);
     let response = client
         .post(url)
@@ -698,6 +1581,12 @@ async fn stream_upstream(
         .send()
         .await;
     let Ok(response) = response else {
+        state
+            .runtime
+            .metrics
+            .lock()
+            .unwrap()
+            .observe_upstream_error(served_by);
         return upstream_error(headers, "upstream stream request failed");
     };
     let status = response.status();
@@ -719,6 +1608,12 @@ async fn stream_upstream(
         );
     }
     if !status.is_success() {
+        state
+            .runtime
+            .metrics
+            .lock()
+            .unwrap()
+            .observe_upstream_error(served_by);
         return upstream_error(headers, &format!("upstream returned {status}"));
     }
     let stream = response
@@ -839,6 +1734,173 @@ fn with_content_type(mut headers: HeaderMap, content_type: &str) -> HeaderMap {
     headers
 }
 
+fn authorize_key(
+    state: &AppState,
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Result<Option<String>, Response<Body>> {
+    if state.gateway.keys.is_empty() {
+        return Ok(None);
+    }
+    let authorization = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let presented = vkeys::extract_bearer(authorization);
+    let hashes = state
+        .gateway
+        .keys
+        .iter()
+        .map(|(id, key)| (id.as_str(), key.hash.as_str()));
+    if let Some(key_id) = vkeys::match_key(presented.as_deref(), hashes) {
+        return Ok(Some(key_id));
+    }
+    let mut headers = request_id_header(request_id);
+    headers.insert(
+        axum::http::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer"),
+    );
+    Err(json_response(
+        StatusCode::UNAUTHORIZED,
+        headers,
+        json!({
+            "error": {
+                "message": "missing or invalid Wayfinder virtual key",
+                "type": "wayfinder_router_unauthorized"
+            }
+        }),
+    ))
+}
+
+fn add_rate_limit_headers(state: &AppState, headers: &mut HeaderMap) {
+    let snapshot = state.runtime.rate_limiter.lock().unwrap().snapshot();
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    headers.insert(
+        "x-ratelimit-limit",
+        HeaderValue::from_str(&snapshot.limit.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    headers.insert(
+        "x-ratelimit-remaining",
+        HeaderValue::from_str(&snapshot.remaining.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    headers.insert(
+        "x-ratelimit-reset",
+        HeaderValue::from_str(&snapshot.reset.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("1")),
+    );
+}
+
+fn cache_enabled(state: &AppState) -> bool {
+    state
+        .gateway
+        .cache
+        .as_ref()
+        .map(|config| config.enabled)
+        .unwrap_or(false)
+}
+
+fn cache_key(served_model: &str, body: &JsonValue) -> String {
+    let mut projected = BTreeMap::new();
+    if let Some(object) = body.as_object() {
+        for (key, value) in object {
+            if key != "model" && key != "stream" {
+                projected.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let blob = serde_json::to_vec(&json!({
+        "m": served_model,
+        "b": projected
+    }))
+    .unwrap_or_default();
+    let digest = Sha256::digest(blob);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn is_cacheable_request(body: &JsonValue) -> bool {
+    if body.get("stream").and_then(JsonValue::as_bool) == Some(true) {
+        return false;
+    }
+    if !json_number_equals(body.get("temperature"), 0.0, true) {
+        return false;
+    }
+    if !json_number_equals(body.get("top_p"), 1.0, true) {
+        return false;
+    }
+    if !json_number_equals(body.get("n"), 1.0, true) {
+        return false;
+    }
+    if body.get("seed").is_some()
+        || truthy_json(body.get("tools"))
+        || truthy_json(body.get("tool_choice"))
+    {
+        return false;
+    }
+    if truthy_json(body.get("logit_bias")) {
+        return false;
+    }
+    let Some(messages) = body.get("messages").and_then(JsonValue::as_array) else {
+        return false;
+    };
+    if messages.is_empty() {
+        return false;
+    }
+    messages.iter().all(|message| {
+        message
+            .as_object()
+            .and_then(|object| object.get("content"))
+            .and_then(JsonValue::as_str)
+            .is_some()
+    })
+}
+
+fn json_number_equals(value: Option<&JsonValue>, expected: f64, missing_is_ok: bool) -> bool {
+    let Some(value) = value else {
+        return missing_is_ok;
+    };
+    value.as_f64() == Some(expected)
+}
+
+fn truthy_json(value: Option<&JsonValue>) -> bool {
+    match value {
+        None | Some(JsonValue::Null) => false,
+        Some(JsonValue::Bool(value)) => *value,
+        Some(JsonValue::Array(values)) => !values.is_empty(),
+        Some(JsonValue::Object(values)) => !values.is_empty(),
+        Some(JsonValue::String(value)) => !value.is_empty(),
+        Some(JsonValue::Number(_)) => true,
+    }
+}
+
+fn is_storable_response(status: StatusCode, content_type: &str, response: &JsonValue) -> bool {
+    if status != StatusCode::OK || !content_type.contains("json") || response.get("error").is_some()
+    {
+        return false;
+    }
+    let Some(choice) = response
+        .get("choices")
+        .and_then(JsonValue::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(JsonValue::as_object)
+    else {
+        return false;
+    };
+    let Some(message) = choice.get("message").and_then(JsonValue::as_object) else {
+        return false;
+    };
+    if message.get("tool_calls").is_some() {
+        return false;
+    }
+    message
+        .get("content")
+        .and_then(JsonValue::as_str)
+        .map(|content| !content.is_empty())
+        .unwrap_or(false)
+}
+
 fn debug_enabled(headers: &HeaderMap) -> bool {
     headers
         .get("x-wayfinder-debug")
@@ -861,6 +1923,118 @@ fn debug_payload(decision: &ComplexityScore, route: &RouteDecision, request_id: 
         "features": decision.features,
         "tiers": decision.tiers
     })
+}
+
+fn extract_completion_text(response: &JsonValue) -> String {
+    response
+        .get("choices")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|choice| {
+            choice
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(JsonValue::as_str)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn recent_cost_from_tokens(
+    state: &AppState,
+    route: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    estimated: bool,
+) -> RecentCost {
+    let cost = turn_cost(
+        route,
+        prompt_tokens,
+        completion_tokens,
+        state
+            .price_table
+            .iter()
+            .map(|(model, cost)| (model.as_str(), *cost)),
+        estimated,
+        None,
+    );
+    RecentCost {
+        realized: cost.realized,
+        baseline: cost.baseline,
+        saved: cost.savings,
+        tokens: prompt_tokens + completion_tokens,
+        unit: if state.priced { "usd" } else { "relative" },
+        estimated: cost.estimated || !state.priced,
+    }
+}
+
+fn zero_recent_cost(priced: bool) -> RecentCost {
+    RecentCost {
+        realized: 0.0,
+        baseline: 0.0,
+        saved: 0.0,
+        tokens: 0,
+        unit: if priced { "usd" } else { "relative" },
+        estimated: !priced,
+    }
+}
+
+fn observe_decision(
+    state: &AppState,
+    route: &RouteDecision,
+    served_by: &str,
+    request_id: &str,
+    score: f64,
+    decision_latency: Duration,
+    upstream_latency: Option<Duration>,
+    cost: RecentCost,
+    key_id: Option<String>,
+) {
+    {
+        let mut metrics = state.runtime.metrics.lock().unwrap();
+        metrics.observe_decision(&route.chosen, &route.mode, decision_latency);
+        if let Some(upstream_latency) = upstream_latency {
+            metrics.observe_upstream(served_by, upstream_latency);
+        }
+        metrics.observe_cost(cost.realized, cost.baseline);
+    }
+    push_recent(
+        state,
+        RecentDecision {
+            request_id: request_id.to_owned(),
+            model: route.chosen.clone(),
+            served_by: served_by.to_owned(),
+            score: round_score(score),
+            mode: route.mode.clone(),
+            ts: unix_ts(),
+            cost,
+            key_id,
+        },
+    );
+}
+
+fn push_recent(state: &AppState, decision: RecentDecision) {
+    let mut recent = state.runtime.recent.lock().unwrap();
+    recent.push_front(decision);
+    while recent.len() > RECENT_LIMIT {
+        recent.pop_back();
+    }
+}
+
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn label_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn round_cost(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
 }
 
 fn round_score(score: f64) -> f64 {
@@ -1468,20 +2642,12 @@ fn sse_event(event: &str, data: JsonValue) -> Vec<u8> {
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let dry_run = if state.options.dry_run {
-        "true"
-    } else {
-        "false"
-    };
-    let body = format!(
-        "# HELP wayfinder_router_build_info Build and runtime metadata.\n\
-# TYPE wayfinder_router_build_info gauge\n\
-wayfinder_router_build_info{{version=\"{}\",dry_run=\"{}\"}} 1\n\
-# HELP wayfinder_router_recent_decisions_total Number of routing decisions retained in memory.\n\
-# TYPE wayfinder_router_recent_decisions_total gauge\n\
-wayfinder_router_recent_decisions_total 0\n",
+    let dry_run = if state.options.dry_run { true } else { false };
+    let recent_total = state.runtime.recent.lock().unwrap().len();
+    let body = state.runtime.metrics.lock().unwrap().render(
         env!("CARGO_PKG_VERSION"),
-        dry_run
+        dry_run,
+        recent_total,
     );
     (
         [(
@@ -1492,11 +2658,16 @@ wayfinder_router_recent_decisions_total 0\n",
     )
 }
 
-async fn router_recent() -> Json<serde_json::Value> {
+async fn router_recent(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let recent = state.runtime.recent.lock().unwrap();
+    let mut by_model = BTreeMap::<String, usize>::new();
+    for decision in recent.iter() {
+        *by_model.entry(decision.model.clone()).or_default() += 1;
+    }
     Json(json!({
-        "total": 0,
-        "by_model": BTreeMap::<String, usize>::new(),
-        "recent": []
+        "total": recent.len(),
+        "by_model": by_model,
+        "recent": recent.iter().cloned().collect::<Vec<_>>()
     }))
 }
 

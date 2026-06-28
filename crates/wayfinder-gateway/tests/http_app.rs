@@ -14,6 +14,7 @@ use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Notify};
 use tower::ServiceExt;
+use wayfinder_internal_core::vkeys;
 use wayfinder_internal_gateway::{build_app_from_dir, ServeOptions};
 
 async fn get_json(path: &str) -> (StatusCode, Value) {
@@ -92,6 +93,7 @@ struct UpstreamState {
     requests: Arc<Mutex<Vec<UpstreamRequest>>>,
     status: StatusCode,
     stream: bool,
+    body: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -108,11 +110,36 @@ struct FakeUpstream {
 
 impl FakeUpstream {
     async fn start(status: StatusCode, stream: bool) -> Self {
+        Self::start_with_body(
+            status,
+            stream,
+            serde_json::json!({
+                "id": "upstream-1",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "hello from upstream"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 40,
+                    "completion_tokens": 20
+                }
+            }),
+        )
+        .await
+    }
+
+    async fn start_with_body(status: StatusCode, stream: bool, body: Value) -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = UpstreamState {
             requests: requests.clone(),
             status,
             stream,
+            body,
         };
         let app = Router::new()
             .route("/chat/completions", post(fake_chat_completion))
@@ -237,19 +264,7 @@ data: [DONE]\n\n",
         )
             .into_response();
     }
-    Json(serde_json::json!({
-        "id": "upstream-1",
-        "object": "chat.completion",
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": "hello from upstream"
-            },
-            "finish_reason": "stop"
-        }]
-    }))
-    .into_response()
+    Json(state.body).into_response()
 }
 
 async fn hanging_stream_chat_completion(
@@ -1125,4 +1140,463 @@ model = "local-upstream"
     assert!(delta.contains("event: content_block_delta"));
     assert!(delta.contains("\"text\":\"hel\""));
     assert_eq!(upstream.calls()[0].body["stream"], true);
+}
+
+#[tokio::test]
+async fn cache_hit_replays_response_without_second_upstream_call() {
+    let upstream = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.cache]
+enabled = true
+ttl = 300
+max_entries = 8
+max_bytes = 1048576
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Say hello."}],
+        "temperature": 0,
+        "stream": false
+    });
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let first_headers = first.headers().clone();
+    let first_body = first.into_body().collect().await.unwrap().to_bytes();
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second_headers = second.headers().clone();
+    let second_body = second.into_body().collect().await.unwrap().to_bytes();
+
+    assert_eq!(first_headers["x-wayfinder-router-cache"], "miss");
+    assert_eq!(second_headers["x-wayfinder-router-cache"], "hit");
+    assert_eq!(second_headers["x-wayfinder-router-served-by"], "local");
+    assert_eq!(second_body, first_body);
+    assert_eq!(upstream.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn cache_skips_sampling_requests() {
+    let upstream = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.cache]
+enabled = true
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Say hello."}],
+        "temperature": 0.7
+    });
+
+    let (_, first_headers, _) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/chat/completions",
+        &[],
+        payload.clone(),
+    )
+    .await;
+    let (_, second_headers, _) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/chat/completions",
+        &[],
+        payload,
+    )
+    .await;
+
+    assert!(!first_headers.contains_key("x-wayfinder-router-cache"));
+    assert!(!second_headers.contains_key("x-wayfinder-router-cache"));
+    assert_eq!(upstream.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn rate_limit_rpm_rejects_before_upstream_and_records_metric() {
+    let upstream = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.rate_limit]
+rpm = 1
+window = 60
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Say hello."}]
+    });
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second_status = second.status();
+    let second_headers = second.headers().clone();
+    let second_body = second.into_body().collect().await.unwrap().to_bytes();
+    let metrics = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let metrics = String::from_utf8(metrics.to_vec()).unwrap();
+    let body: Value = serde_json::from_slice(&second_body).unwrap();
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.headers()["x-ratelimit-limit"], "1");
+    assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second_headers["x-wayfinder-router-rate-limit"], "rpm");
+    assert!(second_headers.contains_key("retry-after"));
+    assert_eq!(body["error"]["type"], "wayfinder_router_rate_limited");
+    assert_eq!(upstream.calls().len(), 1);
+    assert!(metrics.contains("wayfinder_router_rate_limited_total{limit=\"rpm\"} 1"));
+}
+
+#[tokio::test]
+async fn rate_limit_tpm_rejects_after_previous_usage() {
+    let upstream = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.rate_limit]
+tpm = 10
+window = 60
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Say hello."}]
+    });
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.headers()["x-wayfinder-router-rate-limit"], "tpm");
+    assert_eq!(upstream.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn metrics_and_recent_track_metadata_without_prompt_text() {
+    let upstream = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+cost_per_1k = 0.0
+
+[gateway.models.cloud]
+base_url = "{base_url}"
+model = "cloud-upstream"
+cost_per_1k = 1.0
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let payload = serde_json::json!({
+        "model": "cloud",
+        "messages": [{"role": "user", "content": "a secret prompt body"}]
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let recent = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/router/recent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let metrics = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let recent_text = String::from_utf8(recent.to_vec()).unwrap();
+    let recent: Value = serde_json::from_slice(&recent).unwrap();
+    let metrics = String::from_utf8(metrics.to_vec()).unwrap();
+
+    assert_eq!(recent["total"], 1);
+    assert_eq!(recent["by_model"]["cloud"], 1);
+    assert_eq!(recent["recent"][0]["model"], "cloud");
+    assert_eq!(recent["recent"][0]["served_by"], "cloud");
+    assert_eq!(recent["recent"][0]["cost"]["tokens"], 60);
+    assert!(!recent_text.contains("a secret prompt body"));
+    assert!(metrics.contains("wayfinder_router_requests_total{model=\"cloud\",mode=\"pinned\"} 1"));
+    assert!(metrics.contains("wayfinder_router_realized_cost_total"));
+    assert!(metrics.contains("wayfinder_router_baseline_cost_total"));
+    assert!(metrics.contains("wayfinder_router_savings_cost_total"));
+}
+
+#[tokio::test]
+async fn virtual_key_auth_requires_matching_bearer_and_attributes_request() {
+    let upstream = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    let key = "wf-test-secret";
+    let hash = vkeys::hash_key(key);
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.keys.team-a]
+hash = "{hash}"
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Say hello."}]
+    });
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let missing_status = missing.status();
+    let missing_headers = missing.headers().clone();
+    let missing_body = missing.into_body().collect().await.unwrap().to_bytes();
+    let ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer wf-test-secret")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let ok_status = ok.status();
+    let ok_headers = ok.headers().clone();
+    let metrics = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let recent = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/router/recent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let missing_body: Value = serde_json::from_slice(&missing_body).unwrap();
+    let metrics = String::from_utf8(metrics.to_vec()).unwrap();
+    let recent: Value = serde_json::from_slice(&recent).unwrap();
+
+    assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(missing_headers["www-authenticate"], "Bearer");
+    assert_eq!(
+        missing_body["error"]["type"],
+        "wayfinder_router_unauthorized"
+    );
+    assert_eq!(ok_status, StatusCode::OK);
+    assert_eq!(ok_headers["x-wayfinder-router-key"], "team-a");
+    assert!(metrics.contains("wayfinder_router_key_requests_total{key=\"team-a\"} 1"));
+    assert_eq!(recent["recent"][0]["key_id"], "team-a");
 }
