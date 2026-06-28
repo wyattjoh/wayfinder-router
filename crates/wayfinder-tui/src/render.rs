@@ -3,17 +3,16 @@
 //! `/cost` panels, `render_empty_state`, `_status_bar`, `_footer_bar`, `render_reply`).
 //!
 //! Every function here is a pure builder: it takes data plus a [`Palette`] and returns a
-//! ratatui renderable ([`Text`]/[`Line`]/[`Paragraph`]) with no terminal I/O and no event
-//! loop, so the app shell (a later task) owns the loop and these stay testable with
-//! `TestBackend`. The brand em dashes from the Python source are spelled as hyphens or the
-//! middle dot here, per the repo's no-em-dash rule.
+//! ratatui [`Text`] (panels frame their body in a rounded box, also drawn as lines) with no
+//! terminal I/O and no event loop, so the app shell owns the loop and these stay testable
+//! with `TestBackend`. The brand em dashes from the Python source are spelled as hyphens or
+//! the middle dot here, per the repo's no-em-dash rule.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Padding, Paragraph};
 
 use wayfinder_internal_core::pricing::SavingsLedger;
 use wayfinder_internal_core::threads::Thread;
@@ -63,12 +62,51 @@ fn kv_line(label: &str, value: Span<'static>, width: usize, muted: Color) -> Lin
     ])
 }
 
-fn panel(title: &'static str, body: Text<'static>, palette: &Palette) -> Paragraph<'static> {
-    let block = Block::bordered()
-        .title(title)
-        .border_style(Style::new().fg(palette.accent))
-        .padding(Padding::symmetric(2, 1));
-    Paragraph::new(body).block(block)
+/// Frame `body` in a rounded, content-width box titled `title`, drawn as plain lines.
+///
+/// The Python panels lean on rich's `Panel` (rounded border, `padding=(1, 2)`,
+/// `expand=False`); the chat shell renders the transcript as one flat list of [`Line`]s,
+/// so the border is drawn here into [`Text`] once rather than re-implemented per panel.
+/// Width is measured from the body (shrink-to-content, like `expand=False`); each line's
+/// display width is approximated by its char count, which the panels' mostly-ASCII content
+/// makes exact.
+fn panel(title: &'static str, body: Text<'static>, palette: &Palette) -> Text<'static> {
+    let accent = palette.accent;
+    let line_width = |line: &Line| -> usize {
+        line.spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum()
+    };
+
+    let content_width = body.lines.iter().map(line_width).max().unwrap_or(0);
+    // The interior between the verticals: two-space padding on each side of the content.
+    let title_min = title.chars().count() + 3; // "─ {title} "
+    let inner = (content_width + 4).max(title_min);
+
+    let border = |text: String| Span::styled(text, Style::new().fg(accent));
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(body.lines.len() + 4);
+
+    let prefix = format!("─ {title} ");
+    let fill = inner.saturating_sub(prefix.chars().count());
+    lines.push(Line::from(border(format!(
+        "╭{prefix}{}╮",
+        "─".repeat(fill)
+    ))));
+    lines.push(Line::from(border(format!("│{}│", " ".repeat(inner)))));
+    for line in body.lines {
+        let trailing = inner.saturating_sub(4 + line_width(&line));
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 3);
+        spans.push(border("│".to_owned()));
+        spans.push(Span::raw("  ".to_owned()));
+        spans.extend(line.spans);
+        spans.push(Span::raw(" ".repeat(trailing + 2)));
+        spans.push(border("│".to_owned()));
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(border(format!("│{}│", " ".repeat(inner)))));
+    lines.push(Line::from(border(format!("╰{}╯", "─".repeat(inner)))));
+    Text::from(lines)
 }
 
 fn glyph_role(is_local: bool) -> (&'static str, &'static str) {
@@ -207,7 +245,7 @@ pub fn render_decision(
 // --- settings ----------------------------------------------------------------
 
 /// A settings panel: the live routing controls and how to change them.
-pub fn render_settings(state: &TuiState, palette: &Palette) -> Paragraph<'static> {
+pub fn render_settings(state: &TuiState, palette: &Palette) -> Text<'static> {
     let (muted, text_c) = (palette.muted, palette.text);
     let rows: Vec<(&str, String)> = vec![
         (
@@ -267,10 +305,7 @@ pub fn render_settings(state: &TuiState, palette: &Palette) -> Paragraph<'static
 ///
 /// The in-chat equivalent of `wayfinder-router doctor`: keys are read from the
 /// environment, never stored (WF-ADR-0004); this only reports `set` / `not set`.
-pub fn render_models(
-    models: &BTreeMap<String, GatewayModel>,
-    palette: &Palette,
-) -> Paragraph<'static> {
+pub fn render_models(models: &BTreeMap<String, GatewayModel>, palette: &Palette) -> Text<'static> {
     let (accent, muted, text_c, cloud, warn) = (
         palette.accent,
         palette.muted,
@@ -329,7 +364,7 @@ pub fn render_keys(
     models: &BTreeMap<String, GatewayModel>,
     palette: &Palette,
     errors: Option<&BTreeMap<String, String>>,
-) -> Paragraph<'static> {
+) -> Text<'static> {
     let (accent, muted, text_c, cloud, warn) = (
         palette.accent,
         palette.muted,
@@ -424,7 +459,7 @@ pub fn render_keys(
 // --- empty state -------------------------------------------------------------
 
 /// The onboarding panel shown when no models are configured (in-process, no --dry-run).
-pub fn render_empty_state(palette: &Palette) -> Paragraph<'static> {
+pub fn render_empty_state(palette: &Palette) -> Text<'static> {
     let (accent, muted, text_c) = (palette.accent, palette.muted, palette.text);
     let preset = |cmd: &str, desc: &str| -> Line<'static> {
         Line::from(vec![
@@ -472,7 +507,7 @@ pub fn render_empty_state(palette: &Palette) -> Paragraph<'static> {
 // --- threads -----------------------------------------------------------------
 
 /// A numbered list of saved conversations (newest first); `/open <n>` reopens one.
-pub fn render_threads(entries: &[Thread], palette: &Palette) -> Paragraph<'static> {
+pub fn render_threads(entries: &[Thread], palette: &Palette) -> Text<'static> {
     let (accent, muted, text_c) = (palette.accent, palette.muted, palette.text);
     if entries.is_empty() {
         let body = Text::from(span(
@@ -529,7 +564,7 @@ pub fn render_cost(
     tally: &crate::SessionCost,
     palette: &Palette,
     ledger: Option<&SavingsLedger>,
-) -> Paragraph<'static> {
+) -> Text<'static> {
     let (accent, muted, text_c) = (palette.accent, palette.muted, palette.text);
     if tally.calls == 0 {
         let body = Text::from(span("no model calls yet this session", muted));
