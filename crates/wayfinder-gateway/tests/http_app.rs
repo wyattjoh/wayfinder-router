@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Notify};
 use tower::ServiceExt;
 use wayfinder_internal_core::vkeys;
-use wayfinder_internal_gateway::{build_app_from_dir, ServeOptions};
+use wayfinder_internal_gateway::{build_app_from_dir, load_gateway_models, ServeOptions};
 
 async fn get_json(path: &str) -> (StatusCode, Value) {
     let app = build_app_from_dir(ServeOptions::default(), std::env::current_dir().unwrap())
@@ -400,6 +400,47 @@ model = "frontier"
         ids,
         ["auto", "prefer-local", "prefer-hosted", "frontier", "small"]
     );
+}
+
+#[test]
+fn load_gateway_models_returns_public_model_map() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        r#"
+[gateway.models.local]
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
+
+[gateway.models.cloud]
+base_url = "https://api.example.com/v1"
+model = "big-model"
+api_key_env = "EXAMPLE_API_KEY"
+cost_per_1k = 0.015
+"#,
+    )
+    .unwrap();
+
+    let models = load_gateway_models(dir.path()).expect("models should load");
+
+    let local = &models["local"];
+    assert_eq!(local.base_url, "http://localhost:11434/v1");
+    assert_eq!(local.model, "llama3.2");
+    assert_eq!(local.api_key_env, None);
+    assert_eq!(local.cost_per_1k, None);
+
+    let cloud = &models["cloud"];
+    assert_eq!(cloud.base_url, "https://api.example.com/v1");
+    assert_eq!(cloud.model, "big-model");
+    assert_eq!(cloud.api_key_env.as_deref(), Some("EXAMPLE_API_KEY"));
+    assert_eq!(cloud.cost_per_1k, Some(0.015));
+}
+
+#[test]
+fn load_gateway_models_returns_empty_without_config() {
+    let dir = tempdir().unwrap();
+    let models = load_gateway_models(dir.path()).expect("models should load");
+    assert!(models.is_empty());
 }
 
 #[tokio::test]

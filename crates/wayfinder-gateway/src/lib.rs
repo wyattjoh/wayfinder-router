@@ -135,12 +135,13 @@ struct GatewayConfig {
     keys: BTreeMap<String, VirtualKeyConfig>,
 }
 
+/// An upstream endpoint a recommended model name maps to (from `[gateway.models]`).
 #[derive(Clone, Debug, PartialEq)]
-struct GatewayModel {
-    base_url: String,
-    model: String,
-    api_key_env: Option<String>,
-    cost_per_1k: Option<f64>,
+pub struct GatewayModel {
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: Option<String>,
+    pub cost_per_1k: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -383,6 +384,24 @@ fn load_config(start_dir: &Path) -> Result<LoadedConfig, GatewayError> {
         .map_err(|err| GatewayError::new(err.to_string()))?;
     let gateway = parse_gateway_config(&text, &where_)?;
     Ok(LoadedConfig { routing, gateway })
+}
+
+/// Read `[gateway.models.<name>]` from the nearest `wayfinder-router.toml`.
+///
+/// Mirrors the Python `load_gateway_config(start_dir).models`: it walks up from
+/// `start_dir` for the config file, parses the model map, and returns it for
+/// out-of-crate consumers (the TUI, bootstrap). Returns an empty map when no
+/// config file is found.
+pub fn load_gateway_models(
+    start_dir: &Path,
+) -> Result<BTreeMap<String, GatewayModel>, GatewayError> {
+    let Some(path) = find_config(start_dir) else {
+        return Ok(BTreeMap::new());
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| GatewayError::new(format!("{}: {err}", path.display())))?;
+    let where_ = path.to_string_lossy();
+    Ok(parse_gateway_config(&text, &where_)?.models)
 }
 
 fn find_config(start_dir: &Path) -> Option<PathBuf> {
