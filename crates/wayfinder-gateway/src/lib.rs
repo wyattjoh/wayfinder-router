@@ -144,6 +144,53 @@ pub struct GatewayModel {
     pub cost_per_1k: Option<f64>,
 }
 
+/// One OpenAI-style chat message handed to the in-process relay.
+///
+/// The relay (`invoke_messages` / `stream_messages`) sends these as the upstream
+/// `messages` array, so a caller that has a `Vec<{role, content}>` conversation can
+/// reach a configured model without standing up the axum server (WF-DESIGN-0001).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl RelayMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+}
+
+/// A failure relaying a call to an upstream model (the relay's public error surface).
+///
+/// `Transport` covers a connection-level failure (timeout, connection refused — the
+/// equivalent of the gateway being unavailable). `Status` carries a non-success HTTP
+/// status and the upstream's body. `Shape` means the reply could not be parsed into the
+/// expected OpenAI completion shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamError {
+    Transport(String),
+    Status { status: u16, body: String },
+    Shape(String),
+}
+
+impl fmt::Display for UpstreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(message) => write!(f, "upstream transport failed: {message}"),
+            Self::Status { status, body } => {
+                write!(f, "upstream returned {status}: {body}")
+            }
+            Self::Shape(message) => write!(f, "upstream returned an unexpected shape: {message}"),
+        }
+    }
+}
+
+impl Error for UpstreamError {}
+
 #[derive(Clone, Debug, PartialEq)]
 struct CacheConfig {
     enabled: bool,
@@ -1863,6 +1910,214 @@ fn upstream_headers(target: &GatewayModel) -> reqwest::header::HeaderMap {
 
 fn chat_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+// --- in-process relay (WF-DESIGN-0001) --------------------------------------
+// The terminal chat reuses the gateway's exact forward path in-process, so it gets
+// real, token-streamed replies without spawning the axum server. These blocking
+// entry points share the server's request building (`upstream_headers` / `chat_url`)
+// and SSE/JSON parsing (`extract_completion_text`, `drain_stream_completion`,
+// `stream_event_completion`); there is one upstream/parse code path, not two.
+
+fn relay_body(target: &GatewayModel, messages: &[RelayMessage], stream: bool) -> JsonValue {
+    let messages = messages
+        .iter()
+        .map(|message| json!({"role": message.role, "content": message.content}))
+        .collect::<Vec<_>>();
+    let mut body = json!({"model": target.model, "messages": messages});
+    if stream {
+        body["stream"] = JsonValue::Bool(true);
+    }
+    body
+}
+
+fn blocking_client(timeout: Duration) -> Result<reqwest::blocking::Client, UpstreamError> {
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|err| UpstreamError::Transport(err.to_string()))
+}
+
+/// Run a full OpenAI-style `messages` conversation through one upstream (BYO key).
+///
+/// The non-streaming relay: returns the assembled assistant reply. Blocking, so it
+/// runs off the async server. Reuses the server's `upstream_headers` / `chat_url`
+/// request building and `extract_completion_text` reply parsing, so the relay and the
+/// axum handler share one path. Must not be called from inside the gateway's Tokio
+/// runtime (the terminal chat calls it from its own thread).
+pub fn invoke_messages(
+    target: &GatewayModel,
+    messages: &[RelayMessage],
+    timeout: Duration,
+) -> Result<String, UpstreamError> {
+    let client = blocking_client(timeout)?;
+    let response = client
+        .post(chat_url(&target.base_url))
+        .headers(upstream_headers(target))
+        .json(&relay_body(target, messages, false))
+        .send()
+        .map_err(|err| UpstreamError::Transport(err.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        return Err(UpstreamError::Status {
+            status: status.as_u16(),
+            body,
+        });
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|err| UpstreamError::Transport(err.to_string()))?;
+    let parsed = serde_json::from_slice::<JsonValue>(&bytes)
+        .map_err(|err| UpstreamError::Shape(err.to_string()))?;
+    let has_content = parsed
+        .get("choices")
+        .and_then(JsonValue::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(JsonValue::as_str)
+        .is_some();
+    if !has_content {
+        return Err(UpstreamError::Shape(format!(
+            "{} returned no assistant message content",
+            target.model
+        )));
+    }
+    Ok(extract_completion_text(&parsed))
+}
+
+/// Stream assistant text deltas from one upstream over SSE (blocking; BYO key).
+///
+/// The streaming counterpart to [`invoke_messages`] for the terminal chat: sends
+/// `stream: true` and yields `delta.content` chunks as they arrive, reusing the same
+/// key/URL handling and the server's SSE parse helpers. A connection or status failure
+/// surfaces as the iterator's first (and only) `Err` item; a mid-stream transport error
+/// surfaces as a terminal `Err`. Blocking, so it must run off the async server.
+pub fn stream_messages(
+    target: &GatewayModel,
+    messages: &[RelayMessage],
+    timeout: Duration,
+) -> impl Iterator<Item = Result<String, UpstreamError>> {
+    StreamMessages::start(target, messages, timeout)
+}
+
+/// Blocking iterator backing [`stream_messages`]: reads upstream bytes and drains
+/// complete SSE events through the shared parser, yielding each event's text delta.
+struct StreamMessages {
+    state: StreamMessagesState,
+}
+
+enum StreamMessagesState {
+    /// A connection/status failure to emit once before ending.
+    Failed(Option<UpstreamError>),
+    /// A live upstream response being drained event by event.
+    Reading {
+        response: reqwest::blocking::Response,
+        buffer: String,
+        done: bool,
+    },
+    Done,
+}
+
+impl StreamMessages {
+    fn start(target: &GatewayModel, messages: &[RelayMessage], timeout: Duration) -> Self {
+        let state = match Self::open(target, messages, timeout) {
+            Ok(response) => StreamMessagesState::Reading {
+                response,
+                buffer: String::new(),
+                done: false,
+            },
+            Err(err) => StreamMessagesState::Failed(Some(err)),
+        };
+        Self { state }
+    }
+
+    fn open(
+        target: &GatewayModel,
+        messages: &[RelayMessage],
+        timeout: Duration,
+    ) -> Result<reqwest::blocking::Response, UpstreamError> {
+        let client = blocking_client(timeout)?;
+        let response = client
+            .post(chat_url(&target.base_url))
+            .headers(upstream_headers(target))
+            .json(&relay_body(target, messages, true))
+            .send()
+            .map_err(|err| UpstreamError::Transport(err.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(UpstreamError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(response)
+    }
+}
+
+impl Iterator for StreamMessages {
+    type Item = Result<String, UpstreamError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use std::io::Read;
+
+        match &mut self.state {
+            StreamMessagesState::Failed(err) => {
+                let err = err.take();
+                self.state = StreamMessagesState::Done;
+                err.map(Err)
+            }
+            StreamMessagesState::Reading {
+                response,
+                buffer,
+                done,
+            } => {
+                loop {
+                    // Drain any events already buffered before reading more bytes.
+                    let (completion, finished) = drain_stream_completion(buffer);
+                    if finished {
+                        *done = true;
+                    }
+                    if !completion.is_empty() {
+                        return Some(Ok(completion));
+                    }
+                    if *done {
+                        self.state = StreamMessagesState::Done;
+                        return None;
+                    }
+                    let mut chunk = [0u8; 8192];
+                    match response.read(&mut chunk) {
+                        Ok(0) => {
+                            // Connection closed: flush any trailing partial event.
+                            let trailing = if buffer.trim().is_empty() {
+                                String::new()
+                            } else {
+                                let text = stream_event_completion(buffer);
+                                buffer.clear();
+                                text
+                            };
+                            self.state = StreamMessagesState::Done;
+                            return if trailing.is_empty() {
+                                None
+                            } else {
+                                Some(Ok(trailing))
+                            };
+                        }
+                        Ok(read) => {
+                            buffer.push_str(&String::from_utf8_lossy(&chunk[..read]));
+                        }
+                        Err(err) => {
+                            self.state = StreamMessagesState::Done;
+                            return Some(Err(UpstreamError::Transport(err.to_string())));
+                        }
+                    }
+                }
+            }
+            StreamMessagesState::Done => None,
+        }
+    }
 }
 
 fn upstream_error(headers: HeaderMap, message: &str) -> Response<Body> {
