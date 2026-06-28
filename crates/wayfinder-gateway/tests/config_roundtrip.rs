@@ -47,3 +47,33 @@ api_key_cmd = "op read op://Private/example/credential"
         "bad.toml: 'gateway.models.cloud.api_key_cmd' needs 'api_key_env' to name the variable it fills"
     );
 }
+
+#[test]
+fn validate_gateway_toml_rejects_malformed_gateway_without_models() {
+    let bad = r#"
+[gateway.cache]
+enabled = "yes"
+"#;
+
+    let err = validate_gateway_toml(bad, "bad.toml").expect_err("config should be rejected");
+
+    assert_eq!(
+        err.to_string(),
+        "bad.toml: 'gateway.cache.enabled' must be a boolean"
+    );
+}
+
+#[test]
+fn validate_gateway_toml_rejects_non_table_models() {
+    let bad = r#"
+[gateway]
+models = "bad"
+"#;
+
+    let err = validate_gateway_toml(bad, "bad.toml").expect_err("config should be rejected");
+
+    assert_eq!(
+        err.to_string(),
+        "bad.toml: '[gateway.models]' must be a table"
+    );
+}

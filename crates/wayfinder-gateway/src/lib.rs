@@ -545,11 +545,7 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
     let data: Value = text
         .parse()
         .map_err(|err| GatewayError::new(format!("{where_}: invalid TOML: {err}")))?;
-    let Some(models) = data
-        .get("gateway")
-        .and_then(|gateway| gateway.get("models"))
-        .and_then(Value::as_table)
-    else {
+    let Some(gateway_value) = data.get("gateway") else {
         return Ok(GatewayConfig {
             models: BTreeMap::new(),
             cache: None,
@@ -557,13 +553,25 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
             keys: BTreeMap::new(),
         });
     };
-    let gateway_table = data
-        .get("gateway")
-        .and_then(Value::as_table)
+    let gateway_table = gateway_value
+        .as_table()
         .ok_or_else(|| GatewayError::new(format!("{where_}: '[gateway]' must be a table")))?;
     let cache = parse_cache_config(gateway_table.get("cache"), where_)?;
     let rate_limit = parse_rate_limit_config(gateway_table.get("rate_limit"), where_)?;
     let keys = parse_keys_config(gateway_table.get("keys"), where_)?;
+    let Some(models_value) = gateway_table.get("models") else {
+        return Ok(GatewayConfig {
+            models: BTreeMap::new(),
+            cache,
+            rate_limit,
+            keys,
+        });
+    };
+    let Some(models) = models_value.as_table() else {
+        return Err(GatewayError::new(format!(
+            "{where_}: '[gateway.models]' must be a table"
+        )));
+    };
     let mut parsed = BTreeMap::new();
     for (name, value) in models {
         let Some(table) = value.as_table() else {
