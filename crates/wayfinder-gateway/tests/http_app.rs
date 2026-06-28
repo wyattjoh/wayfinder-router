@@ -732,3 +732,230 @@ model = "local-upstream"
     assert_eq!(calls[0].body["stream"], true);
     assert_eq!(calls[0].body["model"], "local-upstream");
 }
+
+#[tokio::test]
+async fn anthropic_messages_translates_request_and_forwards_through_chat_route() {
+    let upstream = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.0
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+
+[gateway.models.cloud]
+base_url = "{base_url}"
+model = "cloud-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+
+    let (status, headers, body) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/messages",
+        &[],
+        serde_json::json!({
+            "model": "claude-3-5-haiku-latest",
+            "system": [{"type": "text", "text": "Use short answers."}],
+            "messages": [
+                {"role": "user", "content": "Plan a route."},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "I will check."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"city": "Calgary"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "clear"}]},
+                    {"type": "text", "text": "Continue."}
+                ]}
+            ],
+            "max_tokens": 128,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "stop_sequences": ["END"],
+            "tools": [{
+                "name": "lookup",
+                "description": "Find city data",
+                "input_schema": {"type": "object"}
+            }],
+            "tool_choice": {"type": "tool", "name": "lookup"}
+        }),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let calls = upstream.calls();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-wayfinder-router-model"], "cloud");
+    assert_eq!(headers["x-wayfinder-router-served-by"], "cloud");
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["role"], "assistant");
+    assert_eq!(body["model"], "claude-3-5-haiku-latest");
+    assert_eq!(body["content"][0]["text"], "hello from upstream");
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].body["model"], "cloud-upstream");
+    assert_eq!(
+        calls[0].body["messages"],
+        serde_json::json!([
+            {"role": "system", "content": "Use short answers."},
+            {"role": "user", "content": "Plan a route."},
+            {
+                "role": "assistant",
+                "content": "I will check.",
+                "tool_calls": [{
+                    "id": "toolu_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"city\":\"Calgary\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "clear"},
+            {"role": "user", "content": "Continue."}
+        ])
+    );
+    assert_eq!(calls[0].body["max_tokens"], 128);
+    assert_eq!(calls[0].body["temperature"], 0.2);
+    assert_eq!(calls[0].body["top_p"], 0.9);
+    assert_eq!(calls[0].body["stop"], serde_json::json!(["END"]));
+    assert_eq!(calls[0].body["tools"][0]["function"]["name"], "lookup");
+    assert_eq!(
+        calls[0].body["tool_choice"],
+        serde_json::json!({"type": "function", "function": {"name": "lookup"}})
+    );
+}
+
+#[tokio::test]
+async fn anthropic_messages_bare_path_dry_run_delegates_to_router() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        r#"
+[routing]
+threshold = 0.5
+"#,
+    )
+    .unwrap();
+
+    let (status, headers, body) = post_chat(
+        dir.path(),
+        ServeOptions {
+            dry_run: true,
+            ..ServeOptions::default()
+        },
+        "/messages",
+        &[],
+        serde_json::json!({
+            "model": "claude-3-5-haiku-latest",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Say hello."}]}],
+            "stream": true
+        }),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-wayfinder-router-model"], "local");
+    assert_eq!(headers["x-wayfinder-router-mode"], "scored");
+    assert_eq!(body["wayfinder"]["dry_run"], true);
+    assert_eq!(body["wayfinder"]["features"]["word_count"], 2);
+}
+
+#[tokio::test]
+async fn anthropic_messages_shapes_upstream_client_errors() {
+    let upstream = FakeUpstream::start(StatusCode::BAD_REQUEST, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+
+    let (status, headers, body) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/messages",
+        &[],
+        serde_json::json!({
+            "model": "claude-3-5-haiku-latest",
+            "messages": [{"role": "user", "content": "Say hello."}]
+        }),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(headers["x-wayfinder-router-model"], "local");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], "upstream unavailable");
+}
+
+#[tokio::test]
+async fn anthropic_messages_translates_streaming_text_sequence() {
+    let upstream = FakeUpstream::start(StatusCode::OK, true).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+
+    let (status, headers, body) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/messages",
+        &[],
+        serde_json::json!({
+            "model": "claude-3-5-haiku-latest",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "stream": true
+        }),
+    )
+    .await;
+    let body = String::from_utf8(body).unwrap();
+    let calls = upstream.calls();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    assert_eq!(headers["x-wayfinder-router-model"], "local");
+    assert_eq!(calls[0].body["stream"], true);
+    assert_eq!(calls[0].body["model"], "local-upstream");
+    assert!(body.contains("event: message_start"));
+    assert!(body.contains("event: content_block_start"));
+    assert!(body.contains("\"type\":\"text_delta\""));
+    assert!(body.contains("\"text\":\"hel\""));
+    assert!(body.contains("\"text\":\"lo\""));
+    assert!(body.contains("event: content_block_stop"));
+    assert!(body.contains("event: message_delta"));
+    assert!(body.contains("event: message_stop"));
+}

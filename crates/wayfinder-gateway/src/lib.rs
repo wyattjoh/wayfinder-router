@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use axum::body::to_bytes;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -21,6 +22,7 @@ use wayfinder_internal_core::complexity::{
     recommend_tier, score_complexity, ComplexityScore, RoutingConfig, Tier,
 };
 use wayfinder_internal_core::config::{routing_config_from_toml, CONFIG_FILE};
+use wayfinder_internal_core::pricing::{estimate_tokens, usage_tokens};
 use wayfinder_internal_core::{DEFAULT_HOST, DEFAULT_PORT};
 
 pub const COMMAND_NAME: &str = "serve";
@@ -177,6 +179,8 @@ pub fn build_app_from_dir(
         .route("/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/messages", post(anthropic_messages))
         .route("/metrics", get(metrics))
         .route("/router/recent", get(router_recent))
         .route("/router", get(router_dashboard))
@@ -354,7 +358,15 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut body): Json<JsonValue>,
+    Json(body): Json<JsonValue>,
+) -> Response<Body> {
+    chat_completions_response(state, headers, body).await
+}
+
+async fn chat_completions_response(
+    state: AppState,
+    headers: HeaderMap,
+    mut body: JsonValue,
 ) -> Response<Body> {
     let request_id = next_request_id();
     let prompt = extract_prompt(body.get("messages"));
@@ -416,6 +428,81 @@ async fn chat_completions(
         request_id,
     )
     .await
+}
+
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<JsonValue>,
+) -> Response<Body> {
+    let model = body
+        .get("model")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(AUTO_DIRECTIVE)
+        .to_owned();
+    let openai_body = anthropic_to_openai_request(&body);
+    let prompt = extract_prompt(openai_body.get("messages"));
+    let response = chat_completions_response(state, headers, openai_body).await;
+    anthropic_from_chat_response(response, &model, &prompt).await
+}
+
+async fn anthropic_from_chat_response(
+    response: Response<Body>,
+    model: &str,
+    prompt: &str,
+) -> Response<Body> {
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let content_type = parts
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let headers = parts.headers;
+    let bytes = match to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                headers,
+                anthropic_error(StatusCode::BAD_GATEWAY, "upstream response failed"),
+            );
+        }
+    };
+    let body = bytes.to_vec();
+    if !status.is_success() {
+        let message = upstream_error_message(&body).unwrap_or_else(|| {
+            status
+                .canonical_reason()
+                .unwrap_or("upstream request failed")
+                .to_owned()
+        });
+        return json_response(status, headers, anthropic_error(status, &message));
+    }
+    if content_type.starts_with("text/event-stream") {
+        return bytes_response(
+            StatusCode::OK,
+            with_content_type(headers, "text/event-stream"),
+            translate_openai_sse_to_anthropic(&body, model),
+        );
+    }
+    let Ok(parsed) = serde_json::from_slice::<JsonValue>(&body) else {
+        return json_response(
+            StatusCode::BAD_GATEWAY,
+            headers,
+            anthropic_error(StatusCode::BAD_GATEWAY, "upstream response was not JSON"),
+        );
+    };
+    if parsed.get("choices").is_none() {
+        return bytes_response(status, headers, body);
+    }
+    json_response(
+        StatusCode::OK,
+        headers,
+        openai_to_anthropic_response(&parsed, model, prompt),
+    )
 }
 
 struct RouteDecision {
@@ -843,6 +930,476 @@ fn message_text(message: &Map<String, JsonValue>) -> Option<String> {
     } else {
         Some(text)
     }
+}
+
+fn anthropic_to_openai_request(body: &JsonValue) -> JsonValue {
+    let mut out = Map::new();
+    out.insert(
+        "model".to_owned(),
+        body.get("model")
+            .cloned()
+            .unwrap_or_else(|| JsonValue::String(AUTO_DIRECTIVE.to_owned())),
+    );
+
+    let mut messages = Vec::new();
+    let system = flatten_anthropic_text(body.get("system"));
+    if !system.is_empty() {
+        messages.push(json!({"role": "system", "content": system}));
+    }
+    if let Some(input_messages) = body.get("messages").and_then(JsonValue::as_array) {
+        for message in input_messages {
+            messages.extend(translate_anthropic_message(message));
+        }
+    }
+    out.insert("messages".to_owned(), JsonValue::Array(messages));
+
+    if let Some(value) = body.get("max_tokens") {
+        out.insert("max_tokens".to_owned(), value.clone());
+    }
+    for key in ["temperature", "top_p"] {
+        if let Some(value) = body.get(key) {
+            out.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(stop) = body.get("stop_sequences") {
+        if !stop.as_array().is_some_and(Vec::is_empty) {
+            out.insert("stop".to_owned(), stop.clone());
+        }
+    }
+    if body.get("stream").and_then(JsonValue::as_bool) == Some(true) {
+        out.insert("stream".to_owned(), JsonValue::Bool(true));
+    }
+    if let Some(tools) = body.get("tools").and_then(JsonValue::as_array) {
+        let translated = tools
+            .iter()
+            .filter_map(translate_anthropic_tool)
+            .collect::<Vec<_>>();
+        if !translated.is_empty() {
+            out.insert("tools".to_owned(), JsonValue::Array(translated));
+        }
+    }
+    if let Some(choice) = body.get("tool_choice") {
+        out.insert(
+            "tool_choice".to_owned(),
+            translate_anthropic_tool_choice(choice),
+        );
+    }
+    JsonValue::Object(out)
+}
+
+fn translate_anthropic_message(message: &JsonValue) -> Vec<JsonValue> {
+    let Some(object) = message.as_object() else {
+        return Vec::new();
+    };
+    let role = object
+        .get("role")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("user");
+    let Some(content) = object.get("content") else {
+        return Vec::new();
+    };
+    if let Some(text) = content.as_str() {
+        return vec![json!({"role": role, "content": text})];
+    }
+    let Some(blocks) = content.as_array() else {
+        return Vec::new();
+    };
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    let mut tool_messages = Vec::new();
+    for block in blocks {
+        let Some(block) = block.as_object() else {
+            continue;
+        };
+        match block.get("type").and_then(JsonValue::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(JsonValue::as_str) {
+                    text_parts.push(text.to_owned());
+                }
+            }
+            Some("tool_use") => {
+                let arguments = serde_json::to_string(
+                    block.get("input").unwrap_or(&JsonValue::Object(Map::new())),
+                )
+                .unwrap_or_else(|_| "{}".to_owned());
+                tool_calls.push(json!({
+                    "id": block.get("id").and_then(JsonValue::as_str).unwrap_or(""),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name").and_then(JsonValue::as_str).unwrap_or(""),
+                        "arguments": arguments
+                    }
+                }));
+            }
+            Some("tool_result") => {
+                tool_messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": block
+                        .get("tool_use_id")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or(""),
+                    "content": flatten_anthropic_text(block.get("content"))
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    let mut messages = tool_messages;
+    if role == "assistant" {
+        if !text_parts.is_empty() || !tool_calls.is_empty() {
+            let mut assistant = Map::new();
+            assistant.insert("role".to_owned(), JsonValue::String("assistant".to_owned()));
+            assistant.insert(
+                "content".to_owned(),
+                if text_parts.is_empty() {
+                    JsonValue::Null
+                } else {
+                    JsonValue::String(text_parts.join("\n"))
+                },
+            );
+            if !tool_calls.is_empty() {
+                assistant.insert("tool_calls".to_owned(), JsonValue::Array(tool_calls));
+            }
+            messages.push(JsonValue::Object(assistant));
+        }
+    } else if !text_parts.is_empty() {
+        messages.push(json!({"role": role, "content": text_parts.join("\n")}));
+    }
+    messages
+}
+
+fn translate_anthropic_tool(tool: &JsonValue) -> Option<JsonValue> {
+    let tool = tool.as_object()?;
+    let mut function = Map::new();
+    function.insert(
+        "name".to_owned(),
+        tool.get("name")
+            .cloned()
+            .unwrap_or_else(|| JsonValue::String(String::new())),
+    );
+    function.insert(
+        "parameters".to_owned(),
+        tool.get("input_schema")
+            .cloned()
+            .unwrap_or_else(|| JsonValue::Object(Map::new())),
+    );
+    if let Some(description) = tool.get("description").and_then(JsonValue::as_str) {
+        if !description.is_empty() {
+            function.insert(
+                "description".to_owned(),
+                JsonValue::String(description.to_owned()),
+            );
+        }
+    }
+    Some(json!({"type": "function", "function": function}))
+}
+
+fn translate_anthropic_tool_choice(choice: &JsonValue) -> JsonValue {
+    if let Some(choice) = choice.as_str() {
+        return JsonValue::String(choice.to_owned());
+    }
+    let Some(object) = choice.as_object() else {
+        return JsonValue::String("auto".to_owned());
+    };
+    match object.get("type").and_then(JsonValue::as_str) {
+        Some("auto") => JsonValue::String("auto".to_owned()),
+        Some("any") => JsonValue::String("required".to_owned()),
+        Some("none") => JsonValue::String("none".to_owned()),
+        Some("tool") => {
+            let name = object.get("name").and_then(JsonValue::as_str).unwrap_or("");
+            json!({"type": "function", "function": {"name": name}})
+        }
+        _ => JsonValue::String("auto".to_owned()),
+    }
+}
+
+fn flatten_anthropic_text(value: Option<&JsonValue>) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    if let Some(text) = value.as_str() {
+        return text.to_owned();
+    }
+    let Some(blocks) = value.as_array() else {
+        return String::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|block| {
+            block
+                .as_str()
+                .or_else(|| block.get("text").and_then(JsonValue::as_str))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn openai_to_anthropic_response(response: &JsonValue, model: &str, prompt: &str) -> JsonValue {
+    let choice = response
+        .get("choices")
+        .and_then(JsonValue::as_array)
+        .and_then(|choices| choices.first());
+    let message = choice
+        .and_then(|choice| choice.get("message"))
+        .and_then(JsonValue::as_object);
+    let mut content = Vec::new();
+    let mut completion_text = String::new();
+    if let Some(text) = message
+        .and_then(|message| message.get("content"))
+        .and_then(JsonValue::as_str)
+    {
+        completion_text.push_str(text);
+        if !text.is_empty() {
+            content.push(json!({"type": "text", "text": text}));
+        }
+    }
+    if let Some(tool_calls) = message
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(JsonValue::as_array)
+    {
+        for (index, tool_call) in tool_calls.iter().enumerate() {
+            let function = tool_call.get("function").and_then(JsonValue::as_object);
+            let arguments = function
+                .and_then(|function| function.get("arguments"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("{}");
+            completion_text.push_str(arguments);
+            let input = serde_json::from_str::<JsonValue>(arguments)
+                .unwrap_or_else(|_| JsonValue::Object(Map::new()));
+            content.push(json!({
+                "type": "tool_use",
+                "id": tool_call
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("toolu_{index}")),
+                "name": function
+                    .and_then(|function| function.get("name"))
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or(""),
+                "input": input
+            }));
+        }
+    }
+    if content.is_empty() {
+        content.push(json!({"type": "text", "text": ""}));
+    }
+    let usage = usage_tokens(response, prompt, &completion_text);
+    json!({
+        "id": response
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("msg_wayfinder"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": anthropic_stop_reason(
+            choice.and_then(|choice| choice.get("finish_reason"))
+        ),
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": usage.prompt_tokens,
+            "output_tokens": usage.completion_tokens
+        }
+    })
+}
+
+fn anthropic_error(status: StatusCode, message: &str) -> JsonValue {
+    json!({
+        "type": "error",
+        "error": {
+            "type": anthropic_error_type(status),
+            "message": message
+        }
+    })
+}
+
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 | 402 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        503 => "overloaded_error",
+        _ => "api_error",
+    }
+}
+
+fn upstream_error_message(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<JsonValue>(body).ok()?;
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(JsonValue::as_str)
+        .map(str::to_owned)
+}
+
+fn anthropic_stop_reason(finish_reason: Option<&JsonValue>) -> &'static str {
+    match finish_reason.and_then(JsonValue::as_str) {
+        Some("length") => "max_tokens",
+        Some("tool_calls") | Some("function_call") => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+fn translate_openai_sse_to_anthropic(body: &[u8], model: &str) -> Vec<u8> {
+    let mut translator = AnthropicSseTranslator::new(model.to_owned());
+    let mut out = translator.start();
+    let text = String::from_utf8_lossy(body);
+    for line in text.lines() {
+        let Some(payload) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload == "[DONE]" {
+            out.extend(translator.finish());
+            return out;
+        }
+        if let Ok(chunk) = serde_json::from_str::<JsonValue>(payload) {
+            out.extend(translator.feed(&chunk));
+        }
+    }
+    out.extend(translator.finish());
+    out
+}
+
+struct AnthropicSseTranslator {
+    model: String,
+    text_started: bool,
+    text_finished: bool,
+    completion: String,
+    output_tokens: Option<usize>,
+    finish_reason: Option<JsonValue>,
+}
+
+impl AnthropicSseTranslator {
+    fn new(model: String) -> Self {
+        Self {
+            model,
+            text_started: false,
+            text_finished: false,
+            completion: String::new(),
+            output_tokens: None,
+            finish_reason: None,
+        }
+    }
+
+    fn start(&self) -> Vec<u8> {
+        sse_event(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_wayfinder_stream",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            }),
+        )
+    }
+
+    fn feed(&mut self, chunk: &JsonValue) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(usage) = chunk.get("usage").and_then(JsonValue::as_object) {
+            if let Some(tokens) = usage
+                .get("completion_tokens")
+                .and_then(JsonValue::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+            {
+                self.output_tokens = Some(tokens);
+            }
+        }
+        let Some(choices) = chunk.get("choices").and_then(JsonValue::as_array) else {
+            return out;
+        };
+        for choice in choices {
+            if let Some(text) = choice
+                .get("delta")
+                .and_then(|delta| delta.get("content"))
+                .and_then(JsonValue::as_str)
+            {
+                if !text.is_empty() {
+                    if !self.text_started {
+                        self.text_started = true;
+                        out.extend(sse_event(
+                            "content_block_start",
+                            json!({
+                                "type": "content_block_start",
+                                "index": 0,
+                                "content_block": {"type": "text", "text": ""}
+                            }),
+                        ));
+                    }
+                    self.completion.push_str(text);
+                    out.extend(sse_event(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": text}
+                        }),
+                    ));
+                }
+            }
+            if let Some(reason) = choice.get("finish_reason") {
+                if !reason.is_null() {
+                    self.finish_reason = Some(reason.clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.text_started {
+            self.text_started = true;
+            out.extend(sse_event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ));
+        }
+        if !self.text_finished {
+            self.text_finished = true;
+            out.extend(sse_event(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ));
+        }
+        let output_tokens = self
+            .output_tokens
+            .unwrap_or_else(|| estimate_tokens(&self.completion));
+        out.extend(sse_event(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": anthropic_stop_reason(self.finish_reason.as_ref()),
+                    "stop_sequence": null
+                },
+                "usage": {"output_tokens": output_tokens}
+            }),
+        ));
+        out.extend(sse_event("message_stop", json!({"type": "message_stop"})));
+        out
+    }
+}
+
+fn sse_event(event: &str, data: JsonValue) -> Vec<u8> {
+    format!("event: {event}\ndata: {}\n\n", data).into_bytes()
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
