@@ -1,13 +1,14 @@
 use std::error::Error;
 use std::fmt;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use wayfinder_internal_core::complexity::{score_complexity, ComplexityScore, RoutingConfig};
-use wayfinder_internal_core::threads::{title_from, Thread};
+use wayfinder_internal_core::threads::{
+    list_threads as core_list_threads, load_thread as core_load_thread,
+    save_thread as core_save_thread, Thread,
+};
 
 mod cost;
 mod decision;
@@ -324,47 +325,31 @@ where
     S: AsRef<str>,
 {
     validate_thread_id(id)?;
-    fs::create_dir_all(dir)?;
-    let now = timestamp();
     let messages = prompts
         .into_iter()
         .map(|prompt| json!({ "role": "user", "content": prompt.as_ref() }))
         .collect::<Vec<_>>();
-    let thread = Thread {
+    let mut thread = Thread {
         id: id.to_string(),
-        title: title_from(&messages, 50),
-        created: now.clone(),
-        updated: now,
+        title: String::new(),
+        created: String::new(),
+        updated: String::new(),
         messages,
     };
-    let encoded = serde_json::to_string_pretty(&thread)?;
-    fs::write(thread_path(dir, id), format!("{encoded}\n"))?;
+    core_save_thread(&mut thread, dir)?;
     Ok(thread)
 }
 
 pub fn load_thread(dir: &Path, id: &str) -> Result<Thread, ChatError> {
     validate_thread_id(id)?;
-    let text = fs::read_to_string(thread_path(dir, id))?;
-    Ok(serde_json::from_str(&text)?)
+    Ok(core_load_thread(&thread_path(dir, id))?)
 }
 
 pub fn list_thread_summaries(dir: &Path) -> Result<Vec<String>, ChatError> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut summaries = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        let text = fs::read_to_string(path)?;
-        let thread: Thread = serde_json::from_str(&text)?;
-        summaries.push(format!("{}\t{}", thread.id, thread.title));
-    }
-    summaries.sort();
-    Ok(summaries)
+    Ok(core_list_threads(dir)?
+        .into_iter()
+        .map(|thread| format!("{}\t{}", thread.id, thread.title))
+        .collect())
 }
 
 fn validate_thread_id(id: &str) -> Result<(), ChatError> {
@@ -390,12 +375,4 @@ fn thread_user_prompts(messages: &[Value]) -> Vec<String> {
         .filter_map(|message| message.get("content").and_then(Value::as_str))
         .map(str::to_string)
         .collect()
-}
-
-fn timestamp() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    format!("unix:{seconds}")
 }
