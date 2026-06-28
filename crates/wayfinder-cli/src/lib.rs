@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use wayfinder_internal_gateway::{serve_placeholder, ServeOptions};
+use wayfinder_internal_gateway::{serve_summary, ServeOptions};
 use wayfinder_internal_tui::{run_chat, ChatOptions};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -21,6 +21,11 @@ impl fmt::Display for CliError {
 
 impl Error for CliError {}
 
+pub enum CliCommand {
+    Serve(ServeOptions),
+    Chat(ChatOptions),
+}
+
 pub fn run<I>(args: I) -> Result<String, CliError>
 where
     I: IntoIterator,
@@ -34,15 +39,36 @@ where
     I: IntoIterator,
     I::Item: Into<String>,
 {
+    match parse_with_input(args, stdin)? {
+        CliCommand::Serve(options) => Ok(serve_summary(&options)),
+        CliCommand::Chat(options) => {
+            run_chat(&options).map_err(|err| CliError::new(err.to_string()))
+        }
+    }
+}
+
+pub fn parse<I>(args: I) -> Result<CliCommand, CliError>
+where
+    I: IntoIterator,
+    I::Item: Into<String>,
+{
+    parse_with_input(args, None)
+}
+
+pub fn parse_with_input<I>(args: I, stdin: Option<String>) -> Result<CliCommand, CliError>
+where
+    I: IntoIterator,
+    I::Item: Into<String>,
+{
     let mut args = args.into_iter().map(Into::into);
     match args.next().as_deref() {
-        Some("serve") => Ok(serve_placeholder(&parse_serve(args)?)),
+        Some("serve") => Ok(CliCommand::Serve(parse_serve(args)?)),
         Some("chat") => {
             let mut options = parse_chat(args)?;
             if options.input.is_none() {
                 options.input = stdin.and_then(non_empty);
             }
-            run_chat(&options).map_err(|err| CliError::new(err.to_string()))
+            Ok(CliCommand::Chat(options))
         }
         Some(command) => Err(CliError::new(format!(
             "unknown command '{command}' (expected 'serve' or 'chat')"

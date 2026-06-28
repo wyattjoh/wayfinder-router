@@ -2,8 +2,22 @@ use std::io::{self, IsTerminal, Read};
 
 fn main() {
     let stdin = read_piped_stdin();
-    match wayfinder_internal_cli::run_with_input(std::env::args().skip(1), stdin) {
-        Ok(message) => println!("{message}"),
+    match wayfinder_internal_cli::parse_with_input(std::env::args().skip(1), stdin) {
+        Ok(wayfinder_internal_cli::CliCommand::Serve(options)) => {
+            if let Err(err) = wayfinder_internal_gateway::serve_blocking(options) {
+                eprintln!("wayfinder-router: {err}");
+                std::process::exit(1);
+            }
+        }
+        Ok(wayfinder_internal_cli::CliCommand::Chat(options)) => {
+            match wayfinder_internal_tui::run_chat(&options) {
+                Ok(message) => println!("{message}"),
+                Err(err) => {
+                    eprintln!("wayfinder-router: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Err(err) => {
             eprintln!("wayfinder-router: {err}");
             std::process::exit(2);
