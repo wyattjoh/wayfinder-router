@@ -1,20 +1,25 @@
-# Wayfinder gateway (WF-ADR-0008): a small OpenAI-compatible proxy that
-# scores each prompt and forwards it to the chosen model with your key. Run it as
-# a sidecar or service; point your existing OpenAI-compatible client's base_url at
-# it. Keys come from the environment (the gateway model's api_key_env), never the
-# image. Mount wayfinder-router.toml and the feedback log so config + labels persist.
-FROM python:3.11-slim
+# Wayfinder gateway container.
+#
+# The current service image builds the Rust CLI and runs the Rust gateway surface.
+# The Python package remains available through PyPI for legacy CLI and API users,
+# but it is not installed in this runtime image.
+FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /app
 COPY . /app
 
-# Only the gateway extra is needed to serve; the core has no runtime deps.
-RUN pip install --no-cache-dir ".[gateway]"
+RUN cargo build --release --bin wayfinder-router
 
-# Routing config + feedback log live here; mount a volume to persist them.
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/wayfinder-router /usr/local/bin/wayfinder-router
+
+# Routing config lives here; mount a volume with wayfinder-router.toml when needed.
 WORKDIR /data
 EXPOSE 8088
 
-# 0.0.0.0 so the container is reachable; override host/port with `docker run ... \
-# wayfinder-router serve --port N` if needed.
 CMD ["wayfinder-router", "serve", "--host", "0.0.0.0", "--port", "8088"]

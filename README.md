@@ -5,9 +5,8 @@
   <img alt="Wayfinder" src="docs/banner-light.png" width="640">
 </picture>
 
-<p><strong>A fast, offline hard-or-easy call on every prompt — scored deterministically,
-with no model call. Route the easy ones to your small/local model and the hard ones to your
-big one, or compose any model-router behind it.</strong></p>
+<p><strong>Deterministic prompt-complexity routing — send each prompt to your
+local or cloud model, offline, with no model call to decide.</strong></p>
 
 <p>
   <a href="#quickstart">Quickstart</a> ·
@@ -38,12 +37,12 @@ big one, or compose any model-router behind it.</strong></p>
 </tr>
 </table>
 
-Wayfinder scores a prompt's structure (length, headings, lists, code) and wording
-(proofs, math, hard constraints) into a `0.0`–`1.0` complexity score, then routes the easy
-ones to your small/local model and the hard ones to your big one. The decision is the
-product: deterministic, sub-millisecond, and entirely offline — no API key, no network, no
-model call to make it. What you route *to* is yours: two tiers, an N-tier ladder, or a
-model-router composed behind it.
+Wayfinder looks at a prompt's structure (length, headings, lists, code) and its
+wording (proofs, math, hard constraints), then tells you whether to send it to your
+small local model or your big cloud one. It decides in microseconds, runs offline,
+and never calls another model to make the call: no API key, no network, no model
+call to decide. You get a score and a recommendation, and what you do with it is up
+to you.
 
 Cheap prompts stay local and hard ones go to the expensive model, so you stop paying
 top-tier prices for "summarize this" and "fix my typo."
@@ -69,52 +68,62 @@ Wayfinder answers *which tier a prompt deserves*: cheap vs expensive, by difficu
 decided offline. The two compose. Run Wayfinder to make the cheap-vs-expensive call,
 and a gateway underneath to reach the providers.
 
-Wayfinder isn't chasing a top accuracy number — it gives you a routing decision you
-can run offline and tune on your own traffic. By default it scores prompt
-*structure* only; it can also read lexical cues (proofs, math, constraints), but
-those ship **off by default** because a
-[double-blind test](benchmarks/blind-eval.md) showed the lift doesn't generalize
-(it caught ~20% of unseen hard prompts and lost to a plain word-count baseline). A
-prompt whose difficulty is purely semantic (a subtle code snippet, "what is the
-100th prime number?") has no structural tell, and a semantic router will beat it
-there. The [benchmark](benchmarks/README.md) (`make benchmark`) shows where it wins
-and loses against honest baselines and a perfect oracle; the [FAQ](docs/faq.md)
-gives the straight version — including that it's no better than random on
-RouterBench's short-but-hard items, and why you'd still run it.
+Wayfinder is not chasing a top accuracy number. What it gives you is a routing
+decision you can run offline, with no model call, and tune on your own traffic. By
+default it scores prompt *structure* only. It can also read lexical cues (proofs,
+math, constraints), but those ship **off by default**: a
+[double-blind test](benchmarks/blind-eval.md) on independently-authored prompts
+showed the lexical lift does *not* generalize (it catches ~20% of unseen hard
+prompts and loses to a plain word-count baseline), so they are opt-in. Raise their
+weights only if you've calibrated them to your own traffic's vocabulary. A prompt
+whose difficulty is purely semantic (a subtle code snippet, an innocent-looking
+"what is the 100th prime number?") has no structural tell, and a semantic router
+will beat it there. What holds up under the blind test is the part to rely on: a
+deterministic, sub-millisecond, offline routing decision with no model call. The
+[benchmark](benchmarks/README.md) (`make benchmark`) shows where it wins and where
+it loses, against honest baselines and a perfect oracle. Point it at RouterBench or
+RouterArena for graded numbers.
+
+New here, or weighing it up? The [FAQ](docs/faq.md) gives straight answers —
+including where it loses (it's no better than random on RouterBench's short-but-hard
+items) and why you'd still run it.
 
 ## Try the demo (no keys)
 
 Two ways to see the routing decision for yourself — no API keys, no models, nothing on the network.
 
-**In your terminal** — a decision-first chat in the Wayfinder palette. The terminal
-chat ships in the default install, so there's nothing extra to add — or run it with
-no install at all via `uvx`:
+**In your terminal**, a decision-first chat in the Wayfinder palette. The Rust port
+builds the current TUI surface from source:
 
 ```bash
-uvx wayfinder-router chat --dry-run      # zero install, zero keys
-# or:  pip install wayfinder-router && wayfinder-router chat
+cargo run --bin wayfinder-router -- chat --dry-run --why "Summarise this in one sentence."
+# or after `cargo build --release --bin wayfinder-router`:
+./target/release/wayfinder-router chat --dry-run "What is DNS?"
 ```
 
 ![Wayfinder terminal chat — a routed prompt, the decision, the reply, and the running savings](docs/tui-chat.png)
 
-Every turn shows where it routed (`● LOCAL` / `◆ CLOUD`), the structural score and *why*
-(`/why`), and the running savings vs always-cloud. `/init` sets up models without leaving
-the chat, `/route` · `/local` · `/cloud` force a turn, and conversations persist across
-sessions (`/threads`).
+The current Rust TUI prints the prompt, route, score, and mode. Add `--why` for
+the feature breakdown, pass prompt text as arguments or stdin, and use `/route`,
+`/local`, `/cloud`, `/auto`, `/threads`, `/load <id>`, and `/save <id>` in scripted
+or piped input.
 
-**In your browser** — the web chat UI with a live threshold slider:
+**In your browser**, the Rust gateway serves the same `/demo` page. Run it in
+decision-only mode when you want zero keys and no upstream calls:
 
 ```bash
-pip install "wayfinder-router[gateway]"
-wayfinder-router webchat --dry-run
-# opens http://127.0.0.1:8088/demo
+cargo run --bin wayfinder-router -- serve --host 127.0.0.1 --port 8088 --dry-run
+# open http://127.0.0.1:8088/demo
 ```
 
-`webchat` is a thin launcher over `serve` (the gateway and its `/demo` page; `--no-open`,
-`--port`, `--host 0.0.0.0`, `--dry-run`); `serve` is the headless command. With no config
-it's decision-only (`--dry-run`), so you can poke at it with zero setup; to get real
-replies, run `wayfinder-router init` to scaffold `[gateway.models]` (then
-`wayfinder-router doctor` to confirm your keys resolve) — see [Quickstart](#quickstart).
+`serve` is the supported Rust gateway command. It exposes `/healthz`,
+`/v1/chat/completions`, `/v1/messages`, `/v1/models`, `/metrics`, `/router`, and `/demo`.
+With `--dry-run`, the gateway returns routing decisions without calling upstream models.
+
+The PyPI package is still present for legacy Python API users and Python-only commands
+that have not moved to Rust yet, including `route`, `calibrate`, `init`, `doctor`, `ui`,
+`onboard`, `judge`, and `recalibrate`. The current Rust support is intentionally limited
+to the gateway service and TUI.
 
 ## Works with any OpenAI-compatible API
 
@@ -146,18 +155,7 @@ that takes a Bearer key.</sub>
 Put Wayfinder in front of your models. Your app keeps speaking the OpenAI API; you
 just change one `base_url`.
 
-1. Scaffold a config — `init` writes a starter `wayfinder-router.toml` (keyless local
-   Ollama → Anthropic cloud) plus a `.env.example`, then checks your keys:
-
-   ```bash
-   pip install "wayfinder-router[gateway]"
-   wayfinder-router init                 # starter config (hybrid preset)
-   wayfinder-router init --preset openai # two OpenAI tiers (gpt-4o-mini → gpt-4o)
-   wayfinder-router init --preset gemini # two Gemini tiers (gemini-2.5-flash → gemini-2.5-pro)
-   wayfinder-router init --interactive   # pick providers/models step by step
-   ```
-
-   Or describe your two models in `wayfinder-router.toml` by hand:
+1. Describe your two models in `wayfinder-router.toml`:
 
    ```toml
    [routing]
@@ -181,16 +179,18 @@ just change one `base_url`.
    `op read …` (1Password), `security …` (macOS Keychain), `secret-tool …` (Linux),
    `pass`/`gopass`, `vault kv get …`, `aws secretsmanager get-secret-value …`, `bw`,
    `doppler`, `gcloud secrets …`, or any command that prints the secret. The key is held
-   in memory only, still never written to disk. `wayfinder-router doctor` detects which
-   of these tools you have installed and suggests the exact line.
+   in memory only, still never written to disk.
 
-2. Set your key(s), then run the gateway. `doctor` re-checks the config and whether each
-   model's key resolves (`✓ set` / `✗ not set`) before you start:
+   Legacy Python package users can still run `wayfinder-router init` and
+   `wayfinder-router doctor` from the PyPI CLI to scaffold and inspect this file.
+
+2. Set your key(s), then run the gateway. Legacy Python package users can run
+   `wayfinder-router doctor` first to check whether each model's key resolves:
 
    ```bash
    export ANTHROPIC_API_KEY=sk-...     # or OPENAI_API_KEY, per your config
-   wayfinder-router doctor             # ✓/✗ per model — is each key set?
-   wayfinder-router serve --port 8088
+   cargo run --bin wayfinder-router -- serve --port 8088
+   # or: ./target/release/wayfinder-router serve --port 8088
    ```
 
 3. Point your existing client at it. No code change:
@@ -229,10 +229,19 @@ before wiring up real models.
 
 | command | what you get |
 | --- | --- |
+| `cargo build --release --bin wayfinder-router` | current Rust CLI binary with `serve` and `chat` |
+| `./target/release/wayfinder-router serve --port 8088` | Rust OpenAI-compatible gateway service |
+| `./target/release/wayfinder-router chat --dry-run "hello"` | Rust TUI routing preview with no keys |
+| `docker build -t wayfinder-router .` | container image that builds and runs the Rust gateway binary |
 | `pip install wayfinder-router` | scorer, CLI, Python API, **and the terminal chat** (`chat`); the scorer/library imports stay dependency-light |
 | `pip install "wayfinder-router[gateway]"` | adds the OpenAI-compatible routing gateway, the common case for serving |
 | `pip install "wayfinder-router[ui]"` | adds the local calibrate / explain / configure UI |
 | `pip install "wayfinder-router[all]"` | gateway and UI on top of the default install |
+
+The Rust CLI is not a public Rust library promise. The supported Rust surfaces are
+the gateway service (`serve`) and the TUI (`chat`). The Python/PyPI package remains
+available for the Python API and for legacy commands that are not yet implemented
+in Rust.
 
 ## How it works
 
@@ -264,6 +273,13 @@ A few things follow from this:
   (Ollama, LM Studio, vLLM, llama.cpp) speaking OpenAI's `/v1`; the hosted one is
   the same shape. The user never switches UIs and usually never knows which model
   answered.
+- **The score is computed, not a second opinion.** Asking a model how hard a
+  prompt is would be slow, non-deterministic, and would cost a model call to decide
+  whether to make a model call. Wayfinder scans the prompt instead — structure
+  (length, headings, steps, links, code, tables) and difficulty cues in the wording
+  (reasoning terms, math symbols, constraints) — into a `0.0`-`1.0` value and
+  compares it to your threshold. Same prompt, same threshold, same answer. It is a
+  proxy for difficulty, not a verdict, which is why the threshold is yours to tune.
 
 Keys are read from the environment at request time and never touch the config file
 or the scored path.
@@ -502,15 +518,15 @@ scoring core stays untouched and the log carries no secrets.
 
 ## Deploy and integrate
 
-The CLI, onboarding, and UI are for operators and bootstrapping. In production,
-prompts flow through the gateway (transparent) or the library (in-process), so
-routing happens where prompts already are.
+The gateway is the current production service surface. In production, prompts flow
+through the Rust gateway, so routing happens where prompts already are. The Python
+library remains available for in-process scoring in legacy Python integrations.
 
 Run the gateway as a service, sidecar or standalone:
 
 ```bash
 docker build -t wayfinder-router . && docker run -p 8088:8088 -v "$PWD/data:/data" wayfinder-router
-# or: docker compose up gateway   (see docker-compose.example.yml)
+# or: docker compose up gateway   # see docker-compose.example.yml
 ```
 
 Point your existing client at it with no app change. Anything that speaks the
@@ -537,9 +553,13 @@ export ANTHROPIC_API_KEY="unused"                   # the gateway uses each upst
 claude
 ```
 
-Wire feedback from wherever your users are. Your app, IDE, or chat shows a
-thumbs-up or thumbs-down and posts the judgment; the next recalibration learns from
-it:
+For the Rust gateway, wire your clients to the OpenAI-compatible or Anthropic-compatible
+routes and inspect routing through response headers, `/metrics`, `/router`, and
+`/router/recent`.
+
+Legacy Python package users can still wire feedback from wherever users are. Your
+app, IDE, or chat shows a thumbs-up or thumbs-down and posts the judgment; the next
+recalibration learns from it:
 
 ```js
 fetch("http://localhost:8088/v1/feedback", {
@@ -548,18 +568,26 @@ fetch("http://localhost:8088/v1/feedback", {
 });
 ```
 
-The gateway forwards asynchronously and streams: a request with `stream: true`
+The Rust gateway forwards asynchronously and streams: a request with `stream: true`
 comes back as Server-Sent-Events, so chat clients render tokens as they arrive. An
 upstream timeout or connection failure returns an OpenAI-shaped error instead of a
 bare 500, every response carries a request id for tracing, and routing decisions
-and reload failures are logged.
+are visible in headers and metrics. Current Rust gateway knobs:
 
-Beyond that it has the production knobs you'd expect — per-request **timeouts**,
-bounded **retries** with a per-target **circuit breaker** and **failover**, a spend
-**budget** cap, an exact-match response **cache**, **rate limiting**, and **virtual
-API keys** with per-key budgets and allowlists. They're all off or generous by
-default; see **[Gateway configuration reference](docs/gateway-config.md)** for every
-setting and the headers each one surfaces.
+| setting | effect |
+| --- | --- |
+| `serve --timeout` | upstream timeout in seconds (default 60) |
+| `serve --dry-run` | return routing decisions without calling any upstream |
+| `GET /healthz` | reports service health and configured model ids |
+| `GET /router` | read-only dashboard of recent decisions, with `X-Wayfinder-Debug: true` surfacing one in the body |
+| `GET /metrics` | Prometheus text for decisions, upstream errors, cost counters, cache, rate limits, and key usage |
+| `[gateway.cache] enabled` / `ttl` / `max_entries` / `max_bytes` | exact-match response cache. Off by default; in-memory only. A hit is surfaced via `x-wayfinder-router-cache: hit\|miss`; disabling purges it (WF-ADR-0033) |
+| `[gateway.rate_limit] rpm` / `tpm` / `window` | cap requests-per-minute and/or upstream-tokens-per-minute over a fixed `window` (default 60s); on breach returns `429` with `Retry-After`. The outermost guardrail (checked before scoring); gateway-wide. Successful responses carry `X-RateLimit-Limit`/`-Remaining`/`-Reset` so clients can self-pace; surfaced via `x-wayfinder-router-rate-limit` and `wayfinder_router_rate_limited_total` (WF-ADR-0034) |
+| `[gateway.keys.<id>] hash` | virtual API keys: when any is set, `/v1/*` requires a valid `Authorization: Bearer` token (else `401`). Store only a SHA-256 hash. Requests are attributed via `wayfinder_router_key_requests_total` (WF-ADR-0035) |
+
+Feedback, `/v1/savings`, persisted savings ledgers, failover policy, spend budgets,
+and key minting commands remain Python/PyPI surfaces until they are ported or
+retired.
 
 ## Explain and tune
 
@@ -611,20 +639,24 @@ score prompts with nothing but the standard library (WF-ADR-0001, WF-ADR-0029).
 
 ```
 wayfinder-router/
+  crates/             Rust workspace: gateway service, TUI, shared core, and CLI
   wayfinder_router/   the package: scorer, tiers + classifier, config loader/writer,
                       offline calibration (Newton/IRLS), explain, the feedback log and
                       onboarding harness, recalibration, CLI, and the optional gateway
-                      and local UI (the impure layers, behind their extras)
+                      and local UI for legacy Python/PyPI users
   tests/              scorer, config, calibration, explain, feedback, onboard,
                       recalibrate, CLI, gateway, and UI coverage
   decisions/          design notes behind the tool's own choices
   docs/               the FAQ and the lexical-routing guide
-  Dockerfile, docker-compose.example.yml   deploy the gateway as a service
+  Dockerfile, docker-compose.example.yml   build and run the Rust gateway service
 ```
 
 ## Test
 
 ```bash
+cargo fmt --check
+cargo clippy --all-targets --no-deps
+cargo test
 pip install -e .[dev]   # or: pip install pytest
 make test
 ```

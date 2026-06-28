@@ -55,12 +55,12 @@ own traffic's difficulty lives in its vocabulary. See [lexical-routing.md](lexic
 
 ## How fast is the decision?
 
-It's a pure-Python text scan on one core, so the number is machine- and prompt-length dependent — run
-`python -m benchmarks.run` to measure it on your hardware. Roughly tens of microseconds on short/medium
-prompts, up to ~200µs on very long ones, always sub-millisecond. Latency grows with prompt length (it
+It's a deterministic text scan on one core, so the number is machine- and prompt-length dependent. Run
+`cargo test` for the Rust contracts and `python -m benchmarks.run` for the legacy Python benchmark
+harness. Roughly tens of microseconds on short/medium prompts, up to ~200µs on very long ones, always sub-millisecond. Latency grows with prompt length (it
 scans the text), so cap or sample if you have pathological inputs. The point isn't a throughput record:
 the decision is negligible next to the inference it gates, it's CPU-only, and there's no network in the
-path — so it never becomes the bottleneck, a dependency, or an outage surface.
+path, so it never becomes the bottleneck, a dependency, or an outage surface.
 
 ## Do my prompts or keys leave the machine?
 
@@ -249,12 +249,11 @@ result as config ([WF-ADR-0023](../decisions/WF-ADR-0023-in-demo-scoring-overrid
 
 ## Is it production-ready? Who maintains it? What are the dependencies?
 
-It's early and largely a solo project, built to be boring on purpose. The core is stdlib-only (zero
-runtime dependencies), so there's no supply-chain surface and nothing to rot as the ecosystem churns;
-it's deterministic, so it's fully tested and the benchmarks reproduce byte-for-byte; it's Apache-2.0 and
-small enough to read in a sitting. The upside of "boring and deterministic" is that there's no service
-to go down and no API to deprecate — it's a pure function plus a thin gateway, and worst case you vendor
-the file. Python 3.11+.
+It's early and largely a solo project, built to be boring on purpose. The Rust gateway and TUI are the
+current service surfaces, and the Python/PyPI package remains available for the Python API and legacy
+commands. The decision layer is deterministic and small enough to audit; there is no hosted service to
+go down and no model call in the routing decision. Apache-2.0. Rust source builds for the gateway and
+TUI, Python 3.11+ for the legacy package.
 
 ## How do I tune it to my own traffic?
 

@@ -9,16 +9,15 @@ tags: [v0.3.0, packaging, distribution, cli, gateway, demo, desktop]
 
 ## Status
 
-Planned
+In progress
 
 ## Context
 
 v0.2.0 shipped the decision-first `/demo` UI and the `wayfinder-router webchat`
-launcher (WF-ADR-0020), so the product is finally *visible* — but launching it
-still assumes a Python environment and a manual `pip install "wayfinder-router[gateway]"`.
-WF-ADR-0008 packaged the gateway as a container and named the library/CLI/UI
-surfaces, yet stopped short of friction-free distribution to people who do not
-already have a Python toolchain.
+launcher (WF-ADR-0020), so the product is finally visible. The Rust port now
+provides buildable gateway and TUI binaries (`serve` and `chat`), and the current
+Dockerfile runs the Rust gateway. The Python/PyPI package remains available for
+the Python API and Python-only commands that have not moved to Rust.
 
 This roadmap closes that gap. It is the "next version" follow-on deliberately
 deferred during the chat-demo work: turn "clone the repo and install" into "run
@@ -30,8 +29,8 @@ cheap wins land first and the heavier desktop work never blocks them.
 ## Outcomes
 
 - Anyone can run the Wayfinder demo with **one command**, regardless of toolchain:
-  `uvx`/`pipx` for Python users, a container for operators, a single binary or a
-  native window for everyone else.
+  `uvx`/`pipx` for legacy Python users, a Rust container for operators, a Rust
+  binary or a native window for everyone else.
 - The "boring on purpose, vendor-the-file" ethos survives distribution: the base
   install stays zero-dependency; every heavier packaging path is **opt-in and
   additive**, never a tax on the core.
@@ -56,19 +55,18 @@ the demo" with it. Ship first.
 
 ### Initiative 2 — Polish the container path (`v0.3.0`, low risk)
 
-Build on WF-ADR-0008's Dockerfile + compose. Make `docker run -p 8088:8088 <image>
-chat --host 0.0.0.0` serve `/demo` out of the box; add a `HEALTHCHECK` against
-`/healthz`; publish the image to GHCR on tag via the existing release workflow; and
-document the one-liner. Turns the existing "build it yourself" container into a
-pull-and-run artifact.
+Partially complete. The current Dockerfile builds the Rust `wayfinder-router`
+binary and runs `wayfinder-router serve --host 0.0.0.0 --port 8088`. Remaining
+work: add an image healthcheck, publish the image to GHCR on tag, and document the
+pull-and-run image once it exists.
 
-### Initiative 3 — Standalone single-file binary (`v0.3.x`, medium risk)
+### Initiative 3: Rust standalone binaries (`v0.3.x`, medium risk)
 
-For users with no Python at all: produce a self-contained executable (PyInstaller,
-or shiv/pex) that bundles the `[gateway]` extra (FastAPI/uvicorn) and runs
-`wayfinder-router webchat`. A CI matrix builds per-OS artifacts (Linux/macOS/Windows)
-and attaches them to the GitHub release. The deterministic core remains importable
-exactly as today; only the distribution wrapper is new.
+Partially complete. For users with no Python at all, the Rust workspace builds a
+`wayfinder-router` executable that supports the gateway service (`serve`) and TUI
+(`chat`). The tag workflow builds and smoke-tests a Linux artifact. Remaining
+work: publish a cross-platform Linux/macOS/Windows artifact matrix on GitHub
+Releases and decide signing/notarization posture.
 
 ### Initiative 4 — Native desktop window (`v0.3.x`, highest scope; evaluate Pake)
 
@@ -89,14 +87,13 @@ than binary size. The decision (and the trade-off that drove it) becomes a new A
 
 ## Constraints
 
-- **WF-ADR-0001 boundary preserved.** Packaging is distribution-layer only; the
-  stdlib-only deterministic scorer is never bundled onto the scored path with model
-  or UI code. The base wheel stays zero-dependency; gateway/desktop dependencies
-  remain opt-in extras.
+- **WF-ADR-0001 boundary preserved.** Packaging is distribution-layer only. The
+  Rust gateway and TUI are supported runtime surfaces, while the Python/PyPI
+  package remains the legacy Python API and command surface.
 - **Secrets stay in the environment** (WF-ADR-0008): no API keys baked into images
   or binaries.
-- **No CLI regressions.** `serve` stays the raw/headless gateway; `chat` stays the
-  demo launcher (WF-ADR-0020). Packaging wraps these, it does not change them.
+- **No CLI regressions.** `serve` stays the raw/headless gateway and `chat` stays
+  the terminal TUI. Packaging wraps these, it does not change them.
 
 ## Non-Goals
 
@@ -110,11 +107,12 @@ than binary size. The decision (and the trade-off that drove it) becomes a new A
 
 ## Assumptions
 
-- The thing being packaged is the OpenAI-compatible gateway + the `/demo` UI; **no
-  API or routing changes are required** — `wayfinder-router webchat` already provides
-  the launch path.
-- Users fall into three buckets — Python (pip/uvx), operators (Docker), and
-  non-technical/desktop (binary/app) — and the four initiatives cover them.
+- The thing being packaged is the OpenAI-compatible gateway plus the `/demo` UI.
+  No API or routing changes are required. The Rust launch path is
+  `wayfinder-router serve`; the legacy Python browser launcher remains
+  `wayfinder-router webchat`.
+- Users fall into three buckets: Python (pip/uvx), operators (Docker), and
+  non-technical/desktop (binary/app). The four initiatives cover them.
 - `uvx`/`pipx` can resolve the `[gateway]` extra for ephemeral runs.
 - A thin webview/URL wrapper is sufficient for the "native app" feel; a bespoke
   desktop shell is not needed for the demo.
@@ -123,25 +121,26 @@ than binary size. The decision (and the trade-off that drove it) becomes a new A
 
 - **I1:** on a clean machine with only `uv` installed,
   `uvx --from "wayfinder-router[gateway]" wayfinder-router webchat` opens the demo.
-- **I2:** `docker run -p 8088:8088 <image> webchat --host 0.0.0.0` serves `/demo`, the
+- **I2:** `docker run -p 8088:8088 <image>` serves the Rust gateway, the
   `HEALTHCHECK` reports healthy, and the image is published on tag.
-- **I3:** a downloaded single binary runs `wayfinder-router webchat` on each target OS
-  with no Python present.
+- **I3:** a downloaded Rust binary runs `wayfinder-router serve` and
+  `wayfinder-router chat` on each target OS with no Python present.
 - **I4:** a double-clicked app opens the demo in a native window, and the chosen
   approach (Pake vs pywebview) is recorded in an ADR with binary-size and
   build-complexity rationale.
 
 ## Risks
 
-- **Toolchain creep (I3/I4).** PyInstaller and Tauri each pull build complexity and
-  a per-OS CI matrix. Mitigation: keep every initiative independent and shippable
-  alone; pip/uvx remains the supported default, binary/app are additive.
+- **Toolchain creep (I3/I4).** Rust release targets and Tauri each pull build
+  complexity and a per-OS CI matrix. Mitigation: keep every initiative independent
+  and shippable alone; source builds, PyPI, and Docker remain available while
+  binary/app artifacts mature.
 - **Extra-resolution surprises (I1).** `uvx`/`pipx` may not surface the `[gateway]`
   extra cleanly. Mitigation: test on a clean env in CI; document the explicit
   `--from "wayfinder-router[gateway]"` form.
-- **Bundle bloat (I3).** FastAPI/uvicorn/anyio inflate binary size. Mitigation:
-  measure; consider a slimmer ASGI server if needed; the core stays importable
-  without the gateway extra.
+- **Artifact polish (I3).** A raw workflow artifact is not a signed,
+  cross-platform release. Mitigation: publish the current Linux artifact only as a
+  smoke path until the release matrix, naming, and signing posture are settled.
 - **Desktop maintenance tail (I4).** A native app is one more surface to keep
   working across OS updates. Mitigation: prefer the thinnest wrapper (Pake/pywebview)
   over a bespoke shell; treat it as a demo accelerator, not a second product — the
@@ -151,8 +150,8 @@ than binary size. The decision (and the trade-off that drove it) becomes a new A
 
 - WF-ADR-0008 (packaging & integration — this roadmap delivers its "Deployment"
   line beyond the build-it-yourself container)
-- WF-ADR-0020 (decision-first demo UI and the `wayfinder-router webchat` launcher — the
-  thing being packaged)
+- WF-ADR-0020 (decision-first demo UI; the Rust gateway now serves the same `/demo`
+  page)
 - WF-ADR-0004 (the OpenAI-compatible gateway being shipped)
 - WF-ADR-0001 (the deterministic boundary preserved throughout)
 - WF-ROADMAP-0002 (core hardening — the engine work this distribution effort sits on)

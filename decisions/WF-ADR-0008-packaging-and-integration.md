@@ -36,17 +36,18 @@ State the integration surfaces and package the gateway for deployment.
   (LangChain/LlamaIndex), IDE assistants that accept a custom endpoint (Cursor,
   Continue), or a gateway like LiteLLM. Wayfinder scores the incoming prompt and
   forwards to the chosen model with the user's key.
-- **The library is the in-process surface.** `from wayfinder-router import
-  score_complexity` for apps that own their model calls and want the recommendation
-  without a network hop.
+- **The Python library is the legacy in-process surface.** `from wayfinder_router import score_complexity`
+  remains available for apps that own their model calls and want the recommendation
+  without a network hop. This is not a public Rust library promise.
 - **The CLI / onboarding / UI are operator/bootstrap surfaces**, not the request
   path: they calibrate and inspect the config that the gateway and library then use.
-- **Deployment:** ship a container that runs `wayfinder-router serve` as a sidecar or
-  small service, plus a compose example that persists `wayfinder-router.toml` and the
-  feedback log on a volume and shows the `recalibrate` one-shot (the CronJob analog).
-- **Feedback wiring is the host surface's responsibility.** The host (app, IDE,
-  chat) decides how to surface a 👍/👎 and POSTs it to `/v1/feedback`; Wayfinder
-  provides the endpoint and the recording, not the judgment UI.
+- **Deployment:** ship a container that builds and runs the Rust
+  `wayfinder-router serve` gateway as a sidecar or small service, plus a compose
+  example that persists `wayfinder-router.toml` on a volume.
+- **Feedback wiring is the host surface's responsibility.** The legacy Python
+  gateway exposes `/v1/feedback`; the Rust gateway has not ported that endpoint
+  yet. The host (app, IDE, chat) still decides how to surface a thumbs-up or
+  thumbs-down.
 - **Secrets stay in the environment** (the gateway model's `api_key_env`), never in
   the image, the config file, or the scored path.
 - **Framework-specific adapters** (a LangChain/LiteLLM-style hook) are recorded as
@@ -57,12 +58,14 @@ State the integration surfaces and package the gateway for deployment.
 
 ### Positive
 
-- The honest answer to "how does this reach real surfaces" is concrete: a
-  container in front of OpenAI-compatible traffic, or the library embedded in-process.
-- The base package stays zero-dependency; only the deployed gateway pulls the
-  `[gateway]` extra.
-- The feedback loop reaches production: the host app wires 👍/👎, the gateway
-  records it, recalibration (WF-ADR-0007) closes the loop.
+- The honest answer to "how does this reach real surfaces" is concrete: a Rust
+  gateway container in front of OpenAI-compatible traffic, or the legacy Python
+  library embedded in-process.
+- The Rust container no longer installs the Python gateway extra. The PyPI
+  package remains available for legacy Python API and CLI users.
+- The feedback loop remains available to legacy Python gateway users: the host app
+  wires the judgment, the gateway records it, and recalibration (WF-ADR-0007)
+  closes the loop.
 
 ### Negative
 
@@ -90,10 +93,10 @@ Ship LangChain/LlamaIndex hooks first.
 
 ## Success Measures
 
-- `docker build` produces an image that serves the gateway; an OpenAI SDK client
-  pointed at it routes with no app code change.
-- The README shows, end to end, pointing a client, wiring `/v1/feedback`, and
-  scheduling `recalibrate`.
+- `docker build` produces an image that serves the Rust gateway; an OpenAI SDK
+  client pointed at it routes with no app code change.
+- The README shows, end to end, pointing a client at the Rust gateway while
+  clearly marking feedback and `recalibrate` as legacy Python/PyPI surfaces.
 - No secret appears in the image or the config; keys are read from the environment.
 
 ## Related

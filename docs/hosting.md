@@ -16,8 +16,9 @@ core of the product — "no model call to decide."
 
 ## The recipe (dry-run container)
 
-The repo ships a `Dockerfile` (the `[gateway]` extra) and a `docker-compose.example.yml`.
-For a public demo, run `serve` (or `webchat`) with `--dry-run`:
+The repo ships a `Dockerfile` that builds the Rust `wayfinder-router` binary and a
+`docker-compose.example.yml` that runs the Rust gateway. For a public demo, run
+`serve` with `--dry-run`:
 
 ```bash
 # Build
@@ -33,6 +34,9 @@ docker run --rm -p 8088:8088 wayfinder-demo \
 - `/healthz` is a cheap health check for the platform.
 - It's **stateless** — demo threads live in the browser's localStorage (WF-ADR-0026) — so a
   single small instance is enough and restarts/scale-out are free.
+
+The Python/PyPI package remains available for legacy commands and the Python API,
+but the current container image does not install Python gateway dependencies.
 
 Deploy that container to anything that runs one: Fly.io, Render, Railway, Cloud Run, or a
 small VPS. The dry-run scorer is microseconds of pure CPU and `/demo` is one small HTML page,

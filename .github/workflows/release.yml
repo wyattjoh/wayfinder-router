@@ -1,6 +1,6 @@
 name: Release
 
-# Publish to PyPI via Trusted Publishing (OIDC) when a version tag is pushed —
+# Publish to PyPI via Trusted Publishing (OIDC) when a version tag is pushed,
 # either v-prefixed (v2026.6.3) or a bare CalVer tag (2026.6.3). No API token or
 # password is stored: PyPI verifies the workflow's identity (owner/repo/workflow +
 # the `pypi` environment) against its trusted publisher.
@@ -53,3 +53,17 @@ jobs:
           path: dist/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  rust-binary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Rust CLI artifact
+        run: cargo build --release --bin wayfinder-router
+      - name: Smoke-test Rust TUI command
+        run: ./target/release/wayfinder-router chat --dry-run "hello"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wayfinder-router-linux-x86_64
+          path: target/release/wayfinder-router
