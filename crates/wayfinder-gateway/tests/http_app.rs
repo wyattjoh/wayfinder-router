@@ -609,6 +609,84 @@ model = "local-upstream"
 }
 
 #[tokio::test]
+async fn chat_completions_passes_through_upstream_client_errors() {
+    let upstream = FakeUpstream::start(StatusCode::BAD_REQUEST, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+
+    let (status, headers, body) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/chat/completions",
+        &[],
+        serde_json::json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "stream": false
+        }),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(headers["x-wayfinder-router-model"], "local");
+    assert_eq!(body["error"]["type"], "upstream_error");
+}
+
+#[tokio::test]
+async fn chat_completions_passes_through_streaming_upstream_client_errors() {
+    let upstream = FakeUpstream::start(StatusCode::UNAUTHORIZED, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+
+    let (status, headers, body) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/chat/completions",
+        &[],
+        serde_json::json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "stream": true
+        }),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers["x-wayfinder-router-model"], "local");
+    assert_eq!(body["error"]["type"], "upstream_error");
+}
+
+#[tokio::test]
 async fn chat_completions_relays_streaming_sse() {
     let upstream = FakeUpstream::start(StatusCode::OK, true).await;
     let dir = tempdir().unwrap();

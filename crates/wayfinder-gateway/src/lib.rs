@@ -567,6 +567,13 @@ async fn forward_upstream(
         Ok(bytes) => bytes,
         Err(_) => return upstream_error(headers, "upstream response failed"),
     };
+    if status.is_client_error() {
+        return bytes_response(
+            status,
+            with_content_type(headers, &content_type),
+            bytes.to_vec(),
+        );
+    }
     if !status.is_success() {
         return upstream_error(headers, &format!("upstream returned {status}"));
     }
@@ -609,8 +616,26 @@ async fn stream_upstream(
     let Ok(response) = response else {
         return upstream_error(headers, "upstream stream request failed");
     };
-    if !response.status().is_success() {
-        return upstream_error(headers, &format!("upstream returned {}", response.status()));
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_owned();
+    if status.is_client_error() {
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(_) => return upstream_error(headers, "upstream response failed"),
+        };
+        return bytes_response(
+            status,
+            with_content_type(headers, &content_type),
+            bytes.to_vec(),
+        );
+    }
+    if !status.is_success() {
+        return upstream_error(headers, &format!("upstream returned {status}"));
     }
     let stream = response
         .bytes_stream()
