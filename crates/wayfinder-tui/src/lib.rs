@@ -10,8 +10,10 @@ use wayfinder_internal_core::complexity::{score_complexity, ComplexityScore, Rou
 use wayfinder_internal_core::threads::{title_from, Thread};
 
 mod decision;
+mod remote;
 
 pub use decision::{decide, pin_label, resolve_target, Decision, TuiState};
+pub use remote::{decision_from_debug, friendly_error, remote_reply};
 
 pub const COMMAND_NAME: &str = "chat";
 

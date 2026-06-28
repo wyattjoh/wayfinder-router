@@ -15,4 +15,5 @@ path = "src/main.rs"
 
 [dependencies]
 wayfinder-internal-core = { path = "../wayfinder-core" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1"

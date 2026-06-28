@@ -1515,6 +1515,7 @@ dependencies = [
 name = "wayfinder-internal-tui"
 version = "0.0.0"
 dependencies = [
+ "reqwest",
  "serde_json",
  "wayfinder-internal-core",
 ]
