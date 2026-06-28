@@ -1,6 +1,7 @@
 pub mod complexity;
 pub mod config;
 pub mod feedback;
+pub mod judge;
 pub mod pricing;
 pub mod profiles;
 pub mod threads;
