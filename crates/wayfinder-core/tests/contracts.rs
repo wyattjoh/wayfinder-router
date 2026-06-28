@@ -166,6 +166,11 @@ fn parse_dataset_rejects_malformed_rows_with_python_messages() {
             "{\"text\": \"hi\", \"label\": \"local\"} garbage\n",
         ),
         ("missing_comma", "{\"text\": \"hi\" \"label\": \"local\"}\n"),
+        ("missing_colon", "{\"text\" \"hi\", \"label\": \"local\"}\n"),
+        (
+            "trailing_comma",
+            "{\"text\": \"hi\", \"label\": \"local\",}\n",
+        ),
     ];
 
     for (name, text) in inputs {

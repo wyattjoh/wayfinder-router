@@ -857,11 +857,22 @@ fn classifier_toml(classifier: &ClassifierModel) -> String {
 
 fn fmt_float(value: f64) -> String {
     let rounded = round_to(value, 6);
-    let mut text = format!("{rounded:?}");
+    let mut text = python_exponent_format(format!("{rounded:?}"));
     if !text.contains('.') && !text.contains('e') {
         text.push_str(".0");
     }
     text
+}
+
+fn python_exponent_format(text: String) -> String {
+    let Some((mantissa, exponent)) = text.split_once('e') else {
+        return text;
+    };
+    let exponent = exponent
+        .parse::<i32>()
+        .expect("Rust float debug exponent should be an integer");
+    let sign = if exponent < 0 { '-' } else { '+' };
+    format!("{mantissa}e{sign}{:02}", exponent.abs())
 }
 
 fn round_to(value: f64, places: i32) -> f64 {
@@ -910,6 +921,18 @@ fn python_json_error(line: &str, err: &serde_json::Error) -> String {
         let column = err.column().max(1);
         let char_index = column.saturating_sub(1);
         return format!("Expecting ',' delimiter: line 1 column {column} (char {char_index})");
+    }
+    if message.starts_with("expected `:`") {
+        let column = err.column().max(1);
+        let char_index = column.saturating_sub(1);
+        return format!("Expecting ':' delimiter: line 1 column {column} (char {char_index})");
+    }
+    if message.starts_with("trailing comma") {
+        let column = err.column().max(1);
+        let char_index = column.saturating_sub(1);
+        return format!(
+            "Expecting property name enclosed in double quotes: line 1 column {column} (char {char_index})"
+        );
     }
     if err.is_syntax() || err.is_eof() {
         let column = python_error_column(line, err);
@@ -960,6 +983,26 @@ mod tests {
         };
         let expected: JsonValue =
             serde_json::from_str(&fixture("calibrate/classifier-negative-zero-emitter.json"))
+                .expect("fixture should be JSON");
+
+        assert_eq!(
+            classifier_toml(&classifier),
+            expected["toml"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn classifier_toml_uses_python_exponent_formatting() {
+        let mut weights = ClassifierWeights::zeros(2);
+        weights.word_count = vec![0.000001, -0.000001];
+        weights.heading_count = vec![1e20, -1e20];
+        let classifier = ClassifierModel {
+            models: vec!["local".to_string(), "cloud".to_string()],
+            weights,
+            intercepts: vec![0.000001, 1e20],
+        };
+        let expected: JsonValue =
+            serde_json::from_str(&fixture("calibrate/classifier-exponent-emitter.json"))
                 .expect("fixture should be JSON");
 
         assert_eq!(
