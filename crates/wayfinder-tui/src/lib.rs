@@ -9,9 +9,11 @@ use serde_json::{json, Value};
 use wayfinder_internal_core::complexity::{score_complexity, ComplexityScore, RoutingConfig};
 use wayfinder_internal_core::threads::{title_from, Thread};
 
+mod cost;
 mod decision;
 mod remote;
 
+pub use cost::{account_turn, cost_summary, fold_turn, load_ledger, savings_path, SessionCost};
 pub use decision::{decide, pin_label, resolve_target, Decision, TuiState};
 pub use remote::{decision_from_debug, friendly_error, remote_reply};
 
