@@ -1,5 +1,7 @@
 use std::env;
 use std::fmt;
+use std::fs;
+use std::path::Path;
 
 use toml::Value;
 
@@ -84,6 +86,29 @@ pub fn routing_config_from_toml(
         tiers: binary_tiers(apply_env_threshold(threshold)?),
         classifier: None,
         lexicon,
+    })
+}
+
+pub fn load_routing_config(start_dir: &Path) -> Result<RoutingConfig, WayfinderConfigError> {
+    let Some(path) = find_config_file(start_dir) else {
+        return Ok(RoutingConfig {
+            tiers: binary_tiers(apply_env_threshold(DEFAULT_THRESHOLD)?),
+            ..RoutingConfig::default()
+        });
+    };
+    let text = fs::read_to_string(&path).map_err(|err| {
+        WayfinderConfigError::new(format!("cannot read {}: {err}", path.display()))
+    })?;
+    routing_config_from_toml(&text, &path.to_string_lossy())
+}
+
+fn find_config_file(start_dir: &Path) -> Option<std::path::PathBuf> {
+    let current = start_dir
+        .canonicalize()
+        .unwrap_or_else(|_| start_dir.to_path_buf());
+    current.ancestors().find_map(|directory| {
+        let candidate = directory.join(CONFIG_FILE);
+        candidate.is_file().then_some(candidate)
     })
 }
 
@@ -501,4 +526,73 @@ fn quoted_terms(terms: &[String]) -> String {
 
 fn quote(value: &str) -> String {
     format!("{value:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn unique_temp_dir() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "wayfinder-core-config-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be creatable");
+        dir
+    }
+
+    #[test]
+    fn load_routing_config_parses_present_file() {
+        let dir = unique_temp_dir();
+        fs::write(dir.join(CONFIG_FILE), "[routing]\nthreshold = 0.8\n")
+            .expect("config file should be writable");
+
+        let config = load_routing_config(&dir).expect("present config should parse");
+        assert_eq!(config.tiers[1].min_score, 0.8);
+
+        fs::remove_dir_all(&dir).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn load_routing_config_finds_config_in_parent_directory() {
+        let parent = unique_temp_dir();
+        fs::write(parent.join(CONFIG_FILE), "[routing]\nthreshold = 0.8\n")
+            .expect("config file should be writable");
+        let child = parent.join("nested/deeper");
+        fs::create_dir_all(&child).expect("child dirs should be creatable");
+
+        let config =
+            load_routing_config(&child).expect("ancestor config should be found from a subdir");
+        assert_eq!(config.tiers[1].min_score, 0.8);
+
+        fs::remove_dir_all(&parent).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn load_routing_config_returns_default_when_absent() {
+        let dir = unique_temp_dir();
+
+        let config = load_routing_config(&dir).expect("missing config should fall back");
+        assert_eq!(config, RoutingConfig::default());
+
+        fs::remove_dir_all(&dir).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn load_routing_config_surfaces_invalid_toml() {
+        let dir = unique_temp_dir();
+        fs::write(dir.join(CONFIG_FILE), "this is not = = toml\n")
+            .expect("config file should be writable");
+
+        let err = load_routing_config(&dir).expect_err("invalid TOML should error");
+        assert!(err.to_string().contains("invalid TOML"));
+
+        fs::remove_dir_all(&dir).expect("temp dir should be removable");
+    }
 }
