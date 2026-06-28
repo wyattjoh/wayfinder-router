@@ -1,0 +1,33 @@
+{
+  "description": "Current Python score_complexity output for markdown, code, list, link, and table structure.",
+  "prompt": "# Plan\n\n## Steps\n\n- inspect the config\n- preserve the headers\n- add tests\n\n```py\nprint(\"hello\")\n```\n\n| key | value |\n| --- | --- |\n| route | auto |\n\n[docs](https://example.com)",
+  "expected": {
+    "schema_version": "3",
+    "score": 0.2,
+    "recommendation": "local",
+    "mode": "tiered",
+    "features": {
+      "word_count": 34,
+      "heading_count": 2,
+      "max_heading_depth": 2,
+      "list_item_count": 3,
+      "link_count": 1,
+      "code_block_count": 1,
+      "table_row_count": 3,
+      "reasoning_term_count": 0,
+      "math_symbol_count": 0,
+      "constraint_term_count": 1,
+      "question_count": 0
+    },
+    "tiers": [
+      {
+        "min_score": 0.0,
+        "model": "local"
+      },
+      {
+        "min_score": 0.5,
+        "model": "cloud"
+      }
+    ]
+  }
+}

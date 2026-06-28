@@ -1,0 +1,33 @@
+{
+  "description": "Current Python score_complexity output for a short prompt.",
+  "prompt": "Say hello.",
+  "expected": {
+    "schema_version": "3",
+    "score": 0.0,
+    "recommendation": "local",
+    "mode": "tiered",
+    "features": {
+      "word_count": 2,
+      "heading_count": 0,
+      "max_heading_depth": 0,
+      "list_item_count": 0,
+      "link_count": 0,
+      "code_block_count": 0,
+      "table_row_count": 0,
+      "reasoning_term_count": 0,
+      "math_symbol_count": 0,
+      "constraint_term_count": 0,
+      "question_count": 0
+    },
+    "tiers": [
+      {
+        "min_score": 0.0,
+        "model": "local"
+      },
+      {
+        "min_score": 0.5,
+        "model": "cloud"
+      }
+    ]
+  }
+}

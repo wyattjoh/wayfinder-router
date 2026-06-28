@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/wayfinder-cli",
+    "crates/wayfinder-core",
+    "crates/wayfinder-gateway",
+    "crates/wayfinder-tui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+publish = false

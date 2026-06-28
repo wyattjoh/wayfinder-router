@@ -1,0 +1,35 @@
+{
+  "description": "Initial Rust port command surfaces mirrored from the current Python CLI.",
+  "commands": [
+    {
+      "name": "serve",
+      "surface": "gateway",
+      "argv": [
+        "serve",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8088",
+        "--dry-run",
+        "--timeout",
+        "60"
+      ]
+    },
+    {
+      "name": "chat",
+      "surface": "tui",
+      "argv": [
+        "chat",
+        "--theme",
+        "auto",
+        "--threshold",
+        "0.5",
+        "--why",
+        "--dry-run",
+        "--no-stream",
+        "--base-url",
+        "http://127.0.0.1:8088"
+      ]
+    }
+  ]
+}

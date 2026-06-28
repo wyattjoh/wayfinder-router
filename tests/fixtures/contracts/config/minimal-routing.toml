@@ -1,0 +1,11 @@
+[routing]
+threshold = 0.2
+
+[gateway.models.local]
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
+
+[gateway.models.cloud]
+base_url = "https://api.example.com/v1"
+model = "big-model"
+api_key_env = "EXAMPLE_API_KEY"

@@ -1,0 +1,18 @@
+[package]
+name = "wayfinder-internal-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "wayfinder_internal_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wayfinder-router"
+path = "src/main.rs"
+
+[dependencies]
+wayfinder-internal-gateway = { path = "../wayfinder-gateway" }
+wayfinder-internal-tui = { path = "../wayfinder-tui" }
