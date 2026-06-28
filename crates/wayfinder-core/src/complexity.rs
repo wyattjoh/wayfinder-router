@@ -161,6 +161,25 @@ pub struct FeatureCounts {
     pub question_count: usize,
 }
 
+impl FeatureCounts {
+    pub fn get(self, name: &str) -> Option<usize> {
+        match name {
+            "word_count" => Some(self.word_count),
+            "heading_count" => Some(self.heading_count),
+            "max_heading_depth" => Some(self.max_heading_depth),
+            "list_item_count" => Some(self.list_item_count),
+            "link_count" => Some(self.link_count),
+            "code_block_count" => Some(self.code_block_count),
+            "table_row_count" => Some(self.table_row_count),
+            "reasoning_term_count" => Some(self.reasoning_term_count),
+            "math_symbol_count" => Some(self.math_symbol_count),
+            "constraint_term_count" => Some(self.constraint_term_count),
+            "question_count" => Some(self.question_count),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Tier {
     pub min_score: f64,
@@ -424,6 +443,42 @@ pub fn score_complexity(text: &str, config: &RoutingConfig) -> ComplexityScore {
         tiers: Some(config.tiers.clone()),
         models: None,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FeatureContribution {
+    pub name: String,
+    pub value: usize,
+    pub normalized: f64,
+    pub weight: f64,
+    pub contribution: f64,
+}
+
+pub fn explain_score(
+    features: &FeatureCounts,
+    weights: FeatureWeights,
+) -> Vec<FeatureContribution> {
+    let normalized = normalized_features(features);
+    let total_weight = weights.sum();
+    FEATURE_ORDER
+        .iter()
+        .map(|&name| {
+            let weight = weights.get(name).unwrap_or(0.0);
+            let norm = normalized.get(name).unwrap_or(0.0);
+            let contribution = if total_weight == 0.0 {
+                0.0
+            } else {
+                weight * norm / total_weight
+            };
+            FeatureContribution {
+                name: name.to_string(),
+                value: features.get(name).unwrap_or(0),
+                normalized: round_to(norm, 4),
+                weight,
+                contribution: round_to(contribution, 4),
+            }
+        })
+        .collect()
 }
 
 impl FeatureWeights {

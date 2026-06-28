@@ -2,8 +2,8 @@ use serde_json::{json, Value as JsonValue};
 use std::path::{Path, PathBuf};
 
 use wayfinder_internal_core::complexity::{
-    extract_features, score_complexity, ClassifierModel, ClassifierWeights, RoutingConfig,
-    DEFAULT_THRESHOLD, DEFAULT_WEIGHTS, FEATURE_ORDER,
+    explain_score, extract_features, score_complexity, ClassifierModel, ClassifierWeights,
+    RoutingConfig, DEFAULT_THRESHOLD, DEFAULT_WEIGHTS, FEATURE_ORDER,
 };
 use wayfinder_internal_core::config::{
     dump_routing_toml, routing_config_from_toml, WayfinderConfigError, THRESHOLD_ENV,
@@ -305,6 +305,41 @@ fn thread_json_shape_round_trips_and_title_matches_python() {
     let decoded: threads::Thread = serde_json::from_str(&encoded).expect("thread should parse");
 
     assert_eq!(decoded, thread);
+}
+
+#[test]
+fn explain_score_breaks_down_contributions_matching_python() {
+    // Ground truth from wayfinder_router.complexity.explain_score with DEFAULT_WEIGHTS.
+    let prompt = "# Task\n\nProve that the square root of 2 is irrational.\n\n## Steps\n\n- derive a contradiction\n- show it must be exact\n\nSee [proof](http://example.com/proof). Is it optimal?\n";
+    // (name, value, normalized, weight, contribution) in FEATURE_ORDER order.
+    let expected: [(&str, usize, f64, f64, f64); 11] = [
+        ("word_count", 28, 0.07, 3.0, 0.0191),
+        ("heading_count", 2, 0.25, 1.5, 0.0341),
+        ("max_heading_depth", 2, 0.5, 1.0, 0.0455),
+        ("list_item_count", 2, 0.1333, 2.0, 0.0242),
+        ("link_count", 1, 0.1, 1.0, 0.0091),
+        ("code_block_count", 0, 0.0, 1.5, 0.0),
+        ("table_row_count", 0, 0.0, 1.0, 0.0),
+        ("reasoning_term_count", 7, 1.0, 0.0, 0.0),
+        ("math_symbol_count", 0, 0.0, 0.0, 0.0),
+        ("constraint_term_count", 1, 0.3333, 0.0, 0.0),
+        ("question_count", 1, 0.3333, 0.0, 0.0),
+    ];
+
+    let contributions = explain_score(&extract_features(prompt), DEFAULT_WEIGHTS);
+    assert_eq!(contributions.len(), FEATURE_ORDER.len());
+    for (actual, (name, value, normalized, weight, contribution)) in
+        contributions.iter().zip(expected)
+    {
+        assert_eq!(actual.name, name);
+        assert_eq!(actual.value, value);
+        assert!((actual.normalized - normalized).abs() < 1e-9);
+        assert!((actual.weight - weight).abs() < 1e-9);
+        assert!((actual.contribution - contribution).abs() < 1e-9);
+    }
+    // The breakdown spans every weighted feature, in order.
+    let names: Vec<&str> = contributions.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, FEATURE_ORDER);
 }
 
 #[test]
