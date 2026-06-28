@@ -10,12 +10,14 @@ use wayfinder_internal_core::threads::{
     save_thread as core_save_thread, Thread,
 };
 
+mod app;
 mod cost;
 mod decision;
 mod remote;
 mod render;
 pub mod theme;
 
+pub use app::run_interactive_chat;
 pub use cost::{account_turn, cost_summary, fold_turn, load_ledger, savings_path, SessionCost};
 pub use decision::{decide, pin_label, resolve_target, Decision, TuiState};
 pub use remote::{decision_from_debug, friendly_error, remote_reply};
