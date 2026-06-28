@@ -2,6 +2,7 @@ pub mod complexity;
 pub mod config;
 pub mod feedback;
 pub mod pricing;
+pub mod profiles;
 pub mod threads;
 pub mod vkeys;
 
