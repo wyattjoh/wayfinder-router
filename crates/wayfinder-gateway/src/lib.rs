@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{stream, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Map, Value as JsonValue};
 use sha2::{Digest, Sha256};
@@ -1210,7 +1210,19 @@ async fn chat_completions_response(
     }
     body["model"] = JsonValue::String(target.model.clone());
     if body.get("stream").and_then(JsonValue::as_bool) == Some(true) {
-        return stream_upstream(state, target, body, response_headers, &route.chosen).await;
+        return stream_upstream(
+            state,
+            target,
+            body,
+            response_headers,
+            decision,
+            route,
+            request_id,
+            prompt,
+            key_id,
+            decision_latency,
+        )
+        .await;
     }
     forward_upstream(
         state,
@@ -1300,6 +1312,7 @@ async fn anthropic_from_chat_response(
     )
 }
 
+#[derive(Clone)]
 struct RouteDecision {
     chosen: String,
     mode: String,
@@ -1570,10 +1583,16 @@ async fn stream_upstream(
     target: GatewayModel,
     body: JsonValue,
     headers: HeaderMap,
-    served_by: &str,
+    decision: ComplexityScore,
+    route: RouteDecision,
+    request_id: String,
+    prompt: String,
+    key_id: Option<String>,
+    decision_latency: Duration,
 ) -> Response<Body> {
     let client = upstream_client(&state.options);
     let url = chat_url(&target.base_url);
+    let upstream_started = Instant::now();
     let response = client
         .post(url)
         .headers(upstream_headers(&target))
@@ -1586,7 +1605,7 @@ async fn stream_upstream(
             .metrics
             .lock()
             .unwrap()
-            .observe_upstream_error(served_by);
+            .observe_upstream_error(&route.chosen);
         return upstream_error(headers, "upstream stream request failed");
     };
     let status = response.status();
@@ -1613,12 +1632,46 @@ async fn stream_upstream(
             .metrics
             .lock()
             .unwrap()
-            .observe_upstream_error(served_by);
+            .observe_upstream_error(&route.chosen);
         return upstream_error(headers, &format!("upstream returned {status}"));
     }
-    let stream = response
-        .bytes_stream()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
+    let stream = Box::pin(response.bytes_stream());
+    let accounting = StreamAccounting {
+        state,
+        route,
+        request_id,
+        prompt,
+        key_id,
+        score: decision.score,
+        decision_latency,
+        upstream_started,
+        completion: String::new(),
+        buffer: String::new(),
+        failed: false,
+        finished: false,
+    };
+    let stream = futures_util::stream::unfold(
+        (stream, accounting),
+        |(mut stream, mut accounting)| async move {
+            match stream.as_mut().next().await {
+                Some(Ok(bytes)) => {
+                    accounting.observe_chunk(&bytes);
+                    Some((Ok(bytes), (stream, accounting)))
+                }
+                Some(Err(err)) => {
+                    accounting.observe_error();
+                    Some((
+                        Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+                        (stream, accounting),
+                    ))
+                }
+                None => {
+                    accounting.finish();
+                    None
+                }
+            }
+        },
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/event-stream")
@@ -1634,6 +1687,116 @@ async fn stream_upstream(
                 b"response build failed".to_vec(),
             )
         })
+}
+
+struct StreamAccounting {
+    state: AppState,
+    route: RouteDecision,
+    request_id: String,
+    prompt: String,
+    key_id: Option<String>,
+    score: f64,
+    decision_latency: Duration,
+    upstream_started: Instant,
+    completion: String,
+    buffer: String,
+    failed: bool,
+    finished: bool,
+}
+
+impl StreamAccounting {
+    fn observe_chunk(&mut self, bytes: &[u8]) {
+        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        self.completion
+            .push_str(&drain_stream_completion(&mut self.buffer));
+    }
+
+    fn observe_error(&mut self) {
+        self.failed = true;
+        self.state
+            .runtime
+            .metrics
+            .lock()
+            .unwrap()
+            .observe_upstream_error(&self.route.chosen);
+    }
+
+    fn finish(&mut self) {
+        if self.failed || self.finished {
+            return;
+        }
+        self.finished = true;
+        if !self.buffer.trim().is_empty() {
+            self.completion
+                .push_str(&stream_event_completion(&self.buffer));
+            self.buffer.clear();
+        }
+        let usage = usage_tokens(&JsonValue::Null, &self.prompt, &self.completion);
+        let cost = recent_cost_from_tokens(
+            &self.state,
+            &self.route.chosen,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.estimated,
+        );
+        self.state
+            .runtime
+            .rate_limiter
+            .lock()
+            .unwrap()
+            .add_tokens(usage.prompt_tokens + usage.completion_tokens);
+        observe_decision(
+            &self.state,
+            &self.route,
+            &self.route.chosen,
+            &self.request_id,
+            self.score,
+            self.decision_latency,
+            Some(self.upstream_started.elapsed()),
+            cost,
+            self.key_id.clone(),
+        );
+    }
+}
+
+fn drain_stream_completion(buffer: &mut String) -> String {
+    let mut completion = String::new();
+    while let Some(index) = buffer.find("\n\n") {
+        let event = buffer.drain(..index + 2).collect::<String>();
+        completion.push_str(&stream_event_completion(&event));
+    }
+    completion
+}
+
+fn stream_event_completion(event: &str) -> String {
+    event
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "[DONE]")
+        .filter_map(|line| serde_json::from_str::<JsonValue>(line).ok())
+        .map(|event| {
+            event
+                .get("choices")
+                .and_then(JsonValue::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|choice| {
+                    choice
+                        .get("delta")
+                        .and_then(|delta| delta.get("content"))
+                        .or_else(|| {
+                            choice
+                                .get("message")
+                                .and_then(|message| message.get("content"))
+                        })
+                        .and_then(JsonValue::as_str)
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn upstream_client(options: &ServeOptions) -> reqwest::Client {
