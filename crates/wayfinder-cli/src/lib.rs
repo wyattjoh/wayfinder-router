@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 use wayfinder_internal_gateway::{serve_placeholder, ServeOptions};
-use wayfinder_internal_tui::{chat_placeholder, ChatOptions};
+use wayfinder_internal_tui::{run_chat, ChatOptions};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CliError(String);
@@ -26,10 +26,24 @@ where
     I: IntoIterator,
     I::Item: Into<String>,
 {
+    run_with_input(args, None)
+}
+
+pub fn run_with_input<I>(args: I, stdin: Option<String>) -> Result<String, CliError>
+where
+    I: IntoIterator,
+    I::Item: Into<String>,
+{
     let mut args = args.into_iter().map(Into::into);
     match args.next().as_deref() {
         Some("serve") => Ok(serve_placeholder(&parse_serve(args)?)),
-        Some("chat") => Ok(chat_placeholder(&parse_chat(args)?)),
+        Some("chat") => {
+            let mut options = parse_chat(args)?;
+            if options.input.is_none() {
+                options.input = stdin.and_then(non_empty);
+            }
+            run_chat(&options).map_err(|err| CliError::new(err.to_string()))
+        }
         Some(command) => Err(CliError::new(format!(
             "unknown command '{command}' (expected 'serve' or 'chat')"
         ))),
@@ -71,6 +85,7 @@ where
 {
     let mut options = ChatOptions::default();
     let mut args = args.into_iter();
+    let mut prompt_parts = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--theme" => options.theme = next_value(&mut args, "--theme")?,
@@ -85,8 +100,21 @@ where
             "--dry-run" => options.dry_run = true,
             "--no-stream" => options.stream = false,
             "--base-url" => options.base_url = Some(next_value(&mut args, "--base-url")?),
-            other => return Err(CliError::new(format!("unknown chat option '{other}'"))),
+            "--thread-dir" => {
+                options.thread_dir = Some(next_value(&mut args, "--thread-dir")?.into())
+            }
+            "--" => {
+                prompt_parts.extend(args);
+                break;
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!("unknown chat option '{other}'")));
+            }
+            text => prompt_parts.push(text.to_string()),
         }
+    }
+    if !prompt_parts.is_empty() {
+        options.input = Some(prompt_parts.join(" "));
     }
     Ok(options)
 }
@@ -97,6 +125,15 @@ where
 {
     args.next()
         .ok_or_else(|| CliError::new(format!("{flag} requires a value")))
+}
+
+fn non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -138,8 +175,30 @@ mod tests {
         ])
         .expect("chat args should parse");
 
-        assert!(output.contains("chat"));
-        assert!(output.contains("theme=dark"));
+        assert!(output.contains("wayfinder-router chat"));
+        assert!(output.contains("theme: dark"));
         assert!(output.contains("dry-run"));
+    }
+
+    #[test]
+    fn run_chat_accepts_prompt_text_from_args() {
+        let output = run(["chat", "--dry-run", "What", "is", "DNS?"])
+            .expect("chat prompt args should parse");
+
+        assert!(output.contains("prompt: What is DNS?"));
+        assert!(output.contains("route: local"));
+        assert!(output.contains("gateway: skipped"));
+    }
+
+    #[test]
+    fn run_chat_accepts_prompt_text_from_stdin() {
+        let output = super::run_with_input(
+            ["chat", "--dry-run", "--why"],
+            Some("What is DNS?\n".to_string()),
+        )
+        .expect("chat stdin should parse");
+
+        assert!(output.contains("prompt: What is DNS?"));
+        assert!(output.contains("why:"));
     }
 }

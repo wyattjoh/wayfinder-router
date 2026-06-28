@@ -1,9 +1,27 @@
+use std::io::{self, IsTerminal, Read};
+
 fn main() {
-    match wayfinder_internal_cli::run(std::env::args().skip(1)) {
+    let stdin = read_piped_stdin();
+    match wayfinder_internal_cli::run_with_input(std::env::args().skip(1), stdin) {
         Ok(message) => println!("{message}"),
         Err(err) => {
             eprintln!("wayfinder-router: {err}");
             std::process::exit(2);
         }
+    }
+}
+
+fn read_piped_stdin() -> Option<String> {
+    let mut stdin = io::stdin();
+    if stdin.is_terminal() {
+        return None;
+    }
+    let mut input = String::new();
+    stdin.read_to_string(&mut input).ok()?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }

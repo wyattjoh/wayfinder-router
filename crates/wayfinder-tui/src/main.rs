@@ -1,3 +1,5 @@
+use std::io::{self, IsTerminal, Read};
+
 fn main() {
     let mut options = wayfinder_internal_tui::ChatOptions::default();
     let mut args = std::env::args().skip(1);
@@ -12,9 +14,44 @@ fn main() {
                 "--dry-run" => options.dry_run = true,
                 "--no-stream" => options.stream = false,
                 "--base-url" => options.base_url = args.next(),
+                "--thread-dir" => options.thread_dir = args.next().map(Into::into),
+                "--" => {
+                    options.input = Some(args.collect::<Vec<_>>().join(" "));
+                    break;
+                }
+                text if !text.starts_with('-') => {
+                    let mut parts = vec![text.to_string()];
+                    parts.extend(args);
+                    options.input = Some(parts.join(" "));
+                    break;
+                }
                 _ => {}
             }
         }
     }
-    println!("{}", wayfinder_internal_tui::chat_placeholder(&options));
+    if options.input.is_none() {
+        options.input = read_piped_stdin();
+    }
+    match wayfinder_internal_tui::run_chat(&options) {
+        Ok(output) => println!("{output}"),
+        Err(err) => {
+            eprintln!("wayfinder-router-tui: {err}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn read_piped_stdin() -> Option<String> {
+    let mut stdin = io::stdin();
+    if stdin.is_terminal() {
+        return None;
+    }
+    let mut input = String::new();
+    stdin.read_to_string(&mut input).ok()?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }

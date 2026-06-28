@@ -15,3 +15,4 @@ path = "src/main.rs"
 
 [dependencies]
 wayfinder-internal-core = { path = "../wayfinder-core" }
+serde_json = "1"
