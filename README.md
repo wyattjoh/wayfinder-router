@@ -17,14 +17,22 @@ local or cloud model, offline, with no model call to decide.</strong></p>
 </p>
 
 <p>
-  <a href="https://pypi.org/project/wayfinder-router/"><img src="https://img.shields.io/pypi/v/wayfinder-router.svg" alt="PyPI"></a>
-  <a href="https://pypi.org/project/wayfinder-router/"><img src="https://img.shields.io/pypi/pyversions/wayfinder-router.svg" alt="Python versions"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/pypi/l/wayfinder-router.svg" alt="License"></a>
-  <a href="https://github.com/itsthelore/wayfinder-router/actions/workflows/ci.yml"><img src="https://github.com/itsthelore/wayfinder-router/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://mypy-lang.org/"><img src="https://img.shields.io/badge/types-Mypy-blue.svg" alt="Typed"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
+  <a href="https://github.com/wyattjoh/wayfinder-router/actions/workflows/ci.yml"><img src="https://github.com/wyattjoh/wayfinder-router/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/core-Rust-dea584.svg?logo=rust&logoColor=white" alt="Rust core">
+  <a href="https://pypi.org/project/wayfinder-router/"><img src="https://img.shields.io/pypi/v/wayfinder-router.svg?label=upstream%20pypi" alt="Upstream PyPI"></a>
 </p>
 
 </div>
+
+> **Fork notice.** This is a Rust-focused fork of
+> [`itsthelore/wayfinder-router`](https://github.com/itsthelore/wayfinder-router). The routing
+> and scoring core, the OpenAI/Anthropic gateway, and the terminal chat are reimplemented in
+> Rust (under [`crates/`](crates)). The original Python package
+> ([`wayfinder_router/`](wayfinder_router)) stays in the tree for the parts not yet ported:
+> the calibration toolchain (`calibrate` / `recalibrate` / `onboard` / `judge`), the local web
+> UI, the upstream PyPI library API, and the CLI commands that have not moved to Rust. See
+> [Repository layout](#repository-layout) for the split.
 
 <table align="center">
 <tr>
@@ -637,15 +645,23 @@ score prompts with nothing but the standard library (WF-ADR-0001, WF-ADR-0029).
 
 ## Repository layout
 
+This fork's product is the Rust workspace. The Python package is upstream's, kept for the
+toolchain that has not been ported yet (see the Fork notice at the top).
+
 ```
 wayfinder-router/
-  crates/             Rust workspace: gateway service, TUI, shared core, and CLI
-  wayfinder_router/   the package: scorer, tiers + classifier, config loader/writer,
-                      offline calibration (Newton/IRLS), explain, the feedback log and
-                      onboarding harness, recalibration, CLI, and the optional gateway
-                      and local UI for legacy Python/PyPI users
-  tests/              scorer, config, calibration, explain, feedback, onboard,
-                      recalibrate, CLI, gateway, and UI coverage
+  crates/             Rust workspace (the shipped product): the routing/scoring core,
+                      the OpenAI/Anthropic gateway service, the terminal chat (TUI), and
+                      the `wayfinder-router` CLI (serve + chat)
+  wayfinder_router/   upstream Python package: scorer, tiers + classifier, config
+                      loader/writer, offline calibration (Newton/IRLS), explain, the
+                      feedback log and onboarding harness, recalibration, CLI, and the
+                      local web UI. Still the PyPI library API and the parity oracle the
+                      Rust contract tests check against
+  crates/wayfinder-core/tests/contracts.rs   asserts the Rust core matches the Python
+                      golden snapshots in tests/fixtures/contracts/
+  tests/              Python coverage: scorer, config, calibration, explain, feedback,
+                      onboard, recalibrate, CLI, gateway, and UI
   decisions/          design notes behind the tool's own choices
   docs/               the FAQ and the lexical-routing guide
   Dockerfile, docker-compose.example.yml   build and run the Rust gateway service
