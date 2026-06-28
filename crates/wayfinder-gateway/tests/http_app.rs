@@ -4,11 +4,15 @@ use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use futures_util::stream;
 use http_body_util::BodyExt;
 use serde_json::Value;
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
+use tokio::sync::{mpsc, Notify};
 use tower::ServiceExt;
 use wayfinder_internal_gateway::{build_app_from_dir, ServeOptions};
 
@@ -136,6 +140,70 @@ impl Drop for FakeUpstream {
     }
 }
 
+#[derive(Clone, Default)]
+struct HangingStreamState {
+    requests: Arc<Mutex<Vec<UpstreamRequest>>>,
+    sender: Arc<Mutex<Option<mpsc::Sender<Result<String, Infallible>>>>>,
+    notify_sender: Arc<Notify>,
+}
+
+struct HangingStreamUpstream {
+    base_url: String,
+    requests: Arc<Mutex<Vec<UpstreamRequest>>>,
+    sender: Arc<Mutex<Option<mpsc::Sender<Result<String, Infallible>>>>>,
+    notify_sender: Arc<Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HangingStreamUpstream {
+    async fn start() -> Self {
+        let state = HangingStreamState::default();
+        let requests = state.requests.clone();
+        let sender = state.sender.clone();
+        let notify_sender = state.notify_sender.clone();
+        let app = Router::new()
+            .route("/chat/completions", post(hanging_stream_chat_completion))
+            .with_state(state);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            requests,
+            sender,
+            notify_sender,
+            task,
+        }
+    }
+
+    async fn wait_for_stream(&self) {
+        loop {
+            if self.sender.lock().unwrap().is_some() {
+                return;
+            }
+            self.notify_sender.notified().await;
+        }
+    }
+
+    async fn send_chunk(&self, chunk: &str) {
+        self.wait_for_stream().await;
+        let sender = self.sender.lock().unwrap().clone().unwrap();
+        sender.send(Ok(chunk.to_owned())).await.unwrap();
+    }
+
+    fn calls(&self) -> Vec<UpstreamRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for HangingStreamUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn fake_chat_completion(
     State(state): State<UpstreamState>,
     headers: HeaderMap,
@@ -182,6 +250,27 @@ data: [DONE]\n\n",
         }]
     }))
     .into_response()
+}
+
+async fn hanging_stream_chat_completion(
+    State(state): State<HangingStreamState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state.requests.lock().unwrap().push(UpstreamRequest {
+        body,
+        authorization: headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+    });
+    let (sender, receiver) = mpsc::channel::<Result<String, Infallible>>(8);
+    *state.sender.lock().unwrap() = Some(sender);
+    state.notify_sender.notify_waiters();
+    let body = Body::from_stream(stream::unfold(receiver, |mut receiver| async {
+        receiver.recv().await.map(|item| (item, receiver))
+    }));
+    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
 }
 
 #[tokio::test]
@@ -958,4 +1047,82 @@ model = "local-upstream"
     assert!(body.contains("event: content_block_stop"));
     assert!(body.contains("event: message_delta"));
     assert!(body.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn anthropic_messages_streaming_starts_before_upstream_finishes() {
+    let upstream = HangingStreamUpstream::start().await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "model": "claude-3-5-haiku-latest",
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response_task = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+
+    upstream.wait_for_stream().await;
+    let mut response = tokio::time::timeout(Duration::from_millis(250), response_task)
+        .await
+        .expect("streaming response should start before upstream EOF")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+
+    let start = tokio::time::timeout(Duration::from_millis(250), response.body_mut().frame())
+        .await
+        .expect("message_start should be emitted immediately")
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let start = String::from_utf8(start.to_vec()).unwrap();
+    assert!(start.contains("event: message_start"));
+
+    upstream
+        .send_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n")
+        .await;
+    let mut delta = String::new();
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(Duration::from_millis(250), response.body_mut().frame())
+            .await
+            .expect("text delta should arrive while upstream remains open")
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        delta.push_str(&String::from_utf8(frame.to_vec()).unwrap());
+        if delta.contains("event: content_block_delta") && delta.contains("\"text\":\"hel\"") {
+            break;
+        }
+    }
+    assert!(delta.contains("event: content_block_delta"));
+    assert!(delta.contains("\"text\":\"hel\""));
+    assert_eq!(upstream.calls()[0].body["stream"], true);
 }

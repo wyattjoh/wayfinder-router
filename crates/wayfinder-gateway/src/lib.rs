@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::TryStreamExt;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde_json::{json, Map, Value as JsonValue};
 use tokio::net::TcpListener;
@@ -461,6 +462,9 @@ async fn anthropic_from_chat_response(
         .unwrap_or_default()
         .to_owned();
     let headers = parts.headers;
+    if status.is_success() && content_type.starts_with("text/event-stream") {
+        return anthropic_stream_response(body, headers, model);
+    }
     let bytes = match to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -480,13 +484,6 @@ async fn anthropic_from_chat_response(
                 .to_owned()
         });
         return json_response(status, headers, anthropic_error(status, &message));
-    }
-    if content_type.starts_with("text/event-stream") {
-        return bytes_response(
-            StatusCode::OK,
-            with_content_type(headers, "text/event-stream"),
-            translate_openai_sse_to_anthropic(&body, model),
-        );
     }
     let Ok(parsed) = serde_json::from_slice::<JsonValue>(&body) else {
         return json_response(
@@ -1246,25 +1243,93 @@ fn anthropic_stop_reason(finish_reason: Option<&JsonValue>) -> &'static str {
     }
 }
 
-fn translate_openai_sse_to_anthropic(body: &[u8], model: &str) -> Vec<u8> {
-    let mut translator = AnthropicSseTranslator::new(model.to_owned());
-    let mut out = translator.start();
-    let text = String::from_utf8_lossy(body);
-    for line in text.lines() {
-        let Some(payload) = line.trim().strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload == "[DONE]" {
-            out.extend(translator.finish());
-            return out;
-        }
-        if let Ok(chunk) = serde_json::from_str::<JsonValue>(payload) {
-            out.extend(translator.feed(&chunk));
-        }
+fn anthropic_stream_response(body: Body, headers: HeaderMap, model: &str) -> Response<Body> {
+    let stream = openai_sse_to_anthropic_stream(body, model.to_owned());
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from_stream(stream))
+        .map(|mut response| {
+            *response.headers_mut() = with_content_type(headers, "text/event-stream");
+            response
+        })
+        .unwrap_or_else(|_| {
+            bytes_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                HeaderMap::new(),
+                b"response build failed".to_vec(),
+            )
+        })
+}
+
+fn openai_sse_to_anthropic_stream(
+    body: Body,
+    model: String,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, std::io::Error>> {
+    let upstream = body.into_data_stream();
+    let translator = AnthropicSseTranslator::new(model);
+    let buffer = String::new();
+    let pending = VecDeque::from([translator.start()]);
+    stream::unfold(
+        (upstream, translator, buffer, pending, false),
+        |(mut upstream, mut translator, mut buffer, mut pending, mut finished)| async move {
+            loop {
+                if let Some(event) = pending.pop_front() {
+                    return Some((Ok(event), (upstream, translator, buffer, pending, finished)));
+                }
+                if finished {
+                    return None;
+                }
+                match upstream.next().await {
+                    Some(Ok(bytes)) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(index) = buffer.find('\n') {
+                            let line = buffer[..index].to_owned();
+                            buffer = buffer[index + 1..].to_owned();
+                            let (events, done) =
+                                openai_sse_line_events(&mut translator, line.trim());
+                            pending.extend(events);
+                            if done {
+                                pending.push_back(translator.finish());
+                                finished = true;
+                                break;
+                            }
+                        }
+                    }
+                    Some(Err(err)) => {
+                        return Some((
+                            Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+                            (upstream, translator, buffer, pending, finished),
+                        ));
+                    }
+                    None => {
+                        pending.push_back(translator.finish());
+                        finished = true;
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn openai_sse_line_events(
+    translator: &mut AnthropicSseTranslator,
+    line: &str,
+) -> (Vec<Vec<u8>>, bool) {
+    let Some(payload) = line.strip_prefix("data:") else {
+        return (Vec::new(), false);
+    };
+    let payload = payload.trim();
+    if payload == "[DONE]" {
+        return (Vec::new(), true);
     }
-    out.extend(translator.finish());
-    out
+    if let Ok(chunk) = serde_json::from_str::<JsonValue>(payload) {
+        let events = translator.feed(&chunk);
+        if events.is_empty() {
+            return (Vec::new(), false);
+        }
+        return (vec![events], false);
+    }
+    (Vec::new(), false)
 }
 
 struct AnthropicSseTranslator {
