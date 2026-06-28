@@ -3,9 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use wayfinder_internal_core::calibrate::{
+    calibrate, load_dataset, parse_dataset, CalibrationOptions, Sample,
+};
 use wayfinder_internal_core::complexity::{
     explain_score, extract_features, score_complexity, ClassifierModel, ClassifierWeights,
-    RoutingConfig, DEFAULT_THRESHOLD, DEFAULT_WEIGHTS, FEATURE_ORDER,
+    FeatureCounts, RoutingConfig, DEFAULT_THRESHOLD, DEFAULT_WEIGHTS, FEATURE_ORDER,
 };
 use wayfinder_internal_core::config::{
     dump_routing_toml, routing_config_from_toml, WayfinderConfigError, THRESHOLD_ENV,
@@ -37,6 +40,14 @@ fn unique_temp_dir(name: &str) -> PathBuf {
     ))
 }
 
+fn calibration_fixture(name: &str) -> JsonValue {
+    let path = fixture(&format!("calibrate/{name}"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("fixture {} should be readable: {err}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("fixture {} should be JSON: {err}", path.display()))
+}
+
 #[test]
 fn scoring_contract_fixtures_match_python_outputs() {
     for name in ["scoring/simple.json", "scoring/markdown-structure.json"] {
@@ -51,6 +62,118 @@ fn scoring_contract_fixtures_match_python_outputs() {
 
         assert_eq!(actual, parsed["expected"]);
     }
+}
+
+#[test]
+fn calibration_contract_fixtures_match_python_outputs() {
+    let cases = [
+        (
+            "threshold-accuracy.json",
+            "threshold",
+            CalibrationOptions::default(),
+        ),
+        (
+            "threshold-cost-quality.json",
+            "threshold",
+            CalibrationOptions {
+                objective: "cost-quality".to_string(),
+                target_savings: Some(0.4),
+                ..CalibrationOptions::default()
+            },
+        ),
+        ("tiers.json", "tiers", CalibrationOptions::default()),
+        (
+            "classifier.json",
+            "classifier",
+            CalibrationOptions {
+                iterations: 400,
+                ..CalibrationOptions::default()
+            },
+        ),
+    ];
+
+    for (name, mode, options) in cases {
+        let expected = calibration_fixture(name);
+        let samples = parse_dataset(expected["dataset"].as_str().unwrap(), "dataset.jsonl")
+            .unwrap_or_else(|err| panic!("{name} dataset should parse: {err}"));
+        let actual = calibrate(&samples, mode, options)
+            .unwrap_or_else(|err| panic!("{name} should calibrate: {err}"));
+
+        assert_eq!(actual.toml, expected["toml"], "{name} TOML changed");
+        assert_eq!(
+            serde_json::to_value(actual.summary).unwrap(),
+            expected["summary"],
+            "{name} summary changed"
+        );
+    }
+}
+
+#[test]
+fn calibration_knee_contract_fixture_matches_python_output() {
+    let expected = calibration_fixture("threshold-knee.json");
+    let samples = expected["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|raw| Sample {
+            features: FeatureCounts::default(),
+            label: raw["label"].as_str().unwrap().to_string(),
+            score: raw["score"].as_f64().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let actual = calibrate(
+        &samples,
+        "threshold",
+        CalibrationOptions {
+            objective: "knee".to_string(),
+            ..CalibrationOptions::default()
+        },
+    )
+    .expect("knee calibration should succeed");
+
+    assert_eq!(actual.toml, expected["toml"]);
+    assert_eq!(
+        serde_json::to_value(actual.summary).unwrap(),
+        expected["summary"]
+    );
+}
+
+#[test]
+fn parse_dataset_rejects_malformed_rows_with_python_messages() {
+    let expected = calibration_fixture("parse-errors.json");
+    let inputs = [
+        ("empty", "\n"),
+        ("missing_label", "{\"text\":\"hi\"}\n"),
+        ("empty_label", "{\"text\":\"hi\",\"label\":\"\"}\n"),
+        ("non_string_text", "{\"text\":1,\"label\":\"local\"}\n"),
+        ("invalid_json", "not-json\n"),
+    ];
+
+    for (name, text) in inputs {
+        let err = match parse_dataset(text, "dataset.jsonl") {
+            Ok(_) => panic!("{name} should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), expected[name].as_str().unwrap(), "{name}");
+    }
+}
+
+#[test]
+fn load_dataset_reads_jsonl_rows_from_disk() {
+    let expected = calibration_fixture("threshold-accuracy.json");
+    let path = std::env::temp_dir().join(format!(
+        "wayfinder-core-calibrate-{}-data.jsonl",
+        std::process::id()
+    ));
+    std::fs::write(&path, expected["dataset"].as_str().unwrap())
+        .expect("dataset fixture should be writable");
+
+    let samples = load_dataset(&path).expect("dataset should load");
+    let actual = calibrate(&samples, "threshold", CalibrationOptions::default())
+        .expect("loaded samples should calibrate");
+
+    assert_eq!(actual.toml, expected["toml"]);
+    std::fs::remove_file(path).expect("temp dataset should be removable");
 }
 
 #[test]

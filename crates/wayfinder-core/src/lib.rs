@@ -1,3 +1,4 @@
+pub mod calibrate;
 pub mod complexity;
 pub mod config;
 pub mod feedback;
