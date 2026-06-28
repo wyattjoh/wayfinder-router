@@ -1,4 +1,5 @@
 use serde_json::{json, Value as JsonValue};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -81,6 +82,19 @@ fn calibration_contract_fixtures_match_python_outputs() {
                 ..CalibrationOptions::default()
             },
         ),
+        (
+            "threshold-cost-quality-inverted-costs.json",
+            "threshold",
+            CalibrationOptions {
+                objective: "cost-quality".to_string(),
+                costs: Some(BTreeMap::from([
+                    ("local".to_string(), 1.0),
+                    ("cloud".to_string(), 0.1),
+                ])),
+                target_savings: Some(0.3),
+                ..CalibrationOptions::default()
+            },
+        ),
         ("tiers.json", "tiers", CalibrationOptions::default()),
         (
             "classifier.json",
@@ -147,6 +161,11 @@ fn parse_dataset_rejects_malformed_rows_with_python_messages() {
         ("empty_label", "{\"text\":\"hi\",\"label\":\"\"}\n"),
         ("non_string_text", "{\"text\":1,\"label\":\"local\"}\n"),
         ("invalid_json", "not-json\n"),
+        (
+            "extra_data",
+            "{\"text\": \"hi\", \"label\": \"local\"} garbage\n",
+        ),
+        ("missing_comma", "{\"text\": \"hi\" \"label\": \"local\"}\n"),
     ];
 
     for (name, text) in inputs {

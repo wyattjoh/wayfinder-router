@@ -1,0 +1,3 @@
+{
+  "toml": "[routing.classifier]\nmodels = [\"local\", \"cloud\"]\nintercepts = [-0.0, 0.0]\n\n[routing.classifier.weights]\nword_count = [-0.0, 0.0]\nheading_count = [-0.0, 0.0]\nmax_heading_depth = [0.0, 0.0]\nlist_item_count = [0.0, 0.0]\nlink_count = [0.0, 0.0]\ncode_block_count = [0.0, 0.0]\ntable_row_count = [0.0, 0.0]\nreasoning_term_count = [0.0, 0.0]\nmath_symbol_count = [0.0, 0.0]\nconstraint_term_count = [0.0, 0.0]\nquestion_count = [0.0, 0.0]\n"
+}

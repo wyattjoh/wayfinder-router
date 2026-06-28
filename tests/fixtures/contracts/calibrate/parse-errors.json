@@ -1,7 +1,9 @@
 {
   "empty": "dataset.jsonl: no labeled rows found",
   "empty_label": "dataset.jsonl:1: each row needs string 'text' and non-empty 'label'",
+  "extra_data": "dataset.jsonl:1: invalid JSON: Extra data: line 1 column 34 (char 33)",
   "invalid_json": "dataset.jsonl:1: invalid JSON: Expecting value: line 1 column 1 (char 0)",
+  "missing_comma": "dataset.jsonl:1: invalid JSON: Expecting ',' delimiter: line 1 column 15 (char 14)",
   "missing_label": "dataset.jsonl:1: each row needs string 'text' and non-empty 'label'",
   "non_string_text": "dataset.jsonl:1: each row needs string 'text' and non-empty 'label'"
 }

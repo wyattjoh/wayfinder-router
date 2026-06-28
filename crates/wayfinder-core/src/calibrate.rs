@@ -880,7 +880,12 @@ fn round_to(value: f64, places: i32) -> f64 {
     } else {
         floor + 1.0
     };
-    rounded / factor
+    let rounded = rounded / factor;
+    if rounded == 0.0 && value.is_sign_negative() {
+        -0.0
+    } else {
+        rounded
+    }
 }
 
 fn py_list(items: &[String]) -> String {
@@ -895,12 +900,23 @@ fn py_list(items: &[String]) -> String {
 }
 
 fn python_json_error(line: &str, err: &serde_json::Error) -> String {
+    let message = err.to_string();
+    if message.starts_with("trailing characters") {
+        let column = err.column().max(1);
+        let char_index = column.saturating_sub(1);
+        return format!("Extra data: line 1 column {column} (char {char_index})");
+    }
+    if message.starts_with("expected `,` or `}`") {
+        let column = err.column().max(1);
+        let char_index = column.saturating_sub(1);
+        return format!("Expecting ',' delimiter: line 1 column {column} (char {char_index})");
+    }
     if err.is_syntax() || err.is_eof() {
         let column = python_error_column(line, err);
         let char_index = column.saturating_sub(1);
         return format!("Expecting value: line 1 column {column} (char {char_index})");
     }
-    err.to_string()
+    message
 }
 
 fn python_error_column(line: &str, err: &serde_json::Error) -> usize {
@@ -914,5 +930,41 @@ fn python_error_column(line: &str, err: &serde_json::Error) -> usize {
         err.column().max(1)
     } else {
         leading + 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(path: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("core crate lives under crates/wayfinder-core")
+            .join("tests/fixtures/contracts")
+            .join(path);
+        fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("fixture {} should be readable: {err}", path.display()))
+    }
+
+    #[test]
+    fn classifier_toml_preserves_python_negative_zero_formatting() {
+        let mut weights = ClassifierWeights::zeros(2);
+        weights.word_count = vec![-1e-8, 1e-8];
+        weights.heading_count = vec![-4e-7, 4e-7];
+        let classifier = ClassifierModel {
+            models: vec!["local".to_string(), "cloud".to_string()],
+            weights,
+            intercepts: vec![-1e-8, 1e-8],
+        };
+        let expected: JsonValue =
+            serde_json::from_str(&fixture("calibrate/classifier-negative-zero-emitter.json"))
+                .expect("fixture should be JSON");
+
+        assert_eq!(
+            classifier_toml(&classifier),
+            expected["toml"].as_str().unwrap()
+        );
     }
 }
