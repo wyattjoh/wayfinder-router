@@ -1251,6 +1251,113 @@ cost_per_1k = 1.0
 }
 
 #[tokio::test]
+async fn anthropic_streaming_messages_update_metrics_recent_cost_and_tpm() {
+    let upstream = FakeUpstream::start(StatusCode::OK, true).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.rate_limit]
+tpm = 1
+window = 60
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+cost_per_1k = 1.0
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let payload = serde_json::json!({
+        "model": "claude-3-5-haiku-latest",
+        "messages": [{"role": "user", "content": "anthropic streaming prompt should stay private"}],
+        "stream": true
+    });
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = first.into_body().collect().await.unwrap().to_bytes();
+    let first_body = String::from_utf8(first_body.to_vec()).unwrap();
+    assert!(first_body.contains("event: message_stop"));
+
+    let metrics = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let recent = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/router/recent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let metrics = String::from_utf8(metrics.to_vec()).unwrap();
+    let recent_text = String::from_utf8(recent.to_vec()).unwrap();
+    let recent: Value = serde_json::from_slice(&recent).unwrap();
+
+    assert!(metrics.contains("wayfinder_router_requests_total{model=\"local\",mode=\"scored\"} 1"));
+    assert!(metrics.contains("wayfinder_router_upstream_latency_seconds_count{model=\"local\"} 1"));
+    assert!(metrics.contains("wayfinder_router_realized_cost_total"));
+    assert_eq!(recent["total"], 1);
+    assert_eq!(recent["recent"][0]["model"], "local");
+    assert_eq!(recent["recent"][0]["cost"]["estimated"], true);
+    assert!(recent["recent"][0]["cost"]["tokens"].as_u64().unwrap() > 0);
+    assert!(!recent_text.contains("anthropic streaming prompt should stay private"));
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.headers()["x-wayfinder-router-rate-limit"], "tpm");
+}
+
+#[tokio::test]
 async fn cache_hit_replays_response_without_second_upstream_call() {
     let upstream = FakeUpstream::start(StatusCode::OK, false).await;
     let dir = tempdir().unwrap();

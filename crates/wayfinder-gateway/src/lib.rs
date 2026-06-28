@@ -1707,8 +1707,11 @@ struct StreamAccounting {
 impl StreamAccounting {
     fn observe_chunk(&mut self, bytes: &[u8]) {
         self.buffer.push_str(&String::from_utf8_lossy(bytes));
-        self.completion
-            .push_str(&drain_stream_completion(&mut self.buffer));
+        let (completion, done) = drain_stream_completion(&mut self.buffer);
+        self.completion.push_str(&completion);
+        if done {
+            self.finish();
+        }
     }
 
     fn observe_error(&mut self) {
@@ -1759,13 +1762,23 @@ impl StreamAccounting {
     }
 }
 
-fn drain_stream_completion(buffer: &mut String) -> String {
+fn drain_stream_completion(buffer: &mut String) -> (String, bool) {
     let mut completion = String::new();
+    let mut done = false;
     while let Some(index) = buffer.find("\n\n") {
         let event = buffer.drain(..index + 2).collect::<String>();
+        done |= stream_event_done(&event);
         completion.push_str(&stream_event_completion(&event));
     }
-    completion
+    (completion, done)
+}
+
+fn stream_event_done(event: &str) -> bool {
+    event
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("data:"))
+        .map(str::trim)
+        .any(|line| line == "[DONE]")
 }
 
 fn stream_event_completion(event: &str) -> String {
