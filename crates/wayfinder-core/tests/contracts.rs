@@ -1,5 +1,7 @@
 use serde_json::{json, Value as JsonValue};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use wayfinder_internal_core::complexity::{
     explain_score, extract_features, score_complexity, ClassifierModel, ClassifierWeights,
@@ -8,7 +10,7 @@ use wayfinder_internal_core::complexity::{
 use wayfinder_internal_core::config::{
     dump_routing_toml, routing_config_from_toml, WayfinderConfigError, THRESHOLD_ENV,
 };
-use wayfinder_internal_core::{pricing, threads, vkeys};
+use wayfinder_internal_core::{feedback, pricing, threads, vkeys};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -20,6 +22,19 @@ fn repo_root() -> PathBuf {
 
 fn fixture(path: &str) -> PathBuf {
     repo_root().join("tests/fixtures/contracts").join(path)
+}
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "wayfinder-core-contract-{name}-{}-{seq}-{nanos}",
+        std::process::id()
+    ))
 }
 
 #[test]
@@ -305,6 +320,73 @@ fn thread_json_shape_round_trips_and_title_matches_python() {
     let decoded: threads::Thread = serde_json::from_str(&encoded).expect("thread should parse");
 
     assert_eq!(decoded, thread);
+}
+
+#[test]
+fn feedback_log_round_trips_rows_in_append_order() {
+    let dir = unique_temp_dir("feedback-round-trip");
+    std::fs::create_dir_all(&dir).expect("temp dir should be created");
+    let log = dir.join("feedback.jsonl");
+
+    feedback::record_label(&log, "hi", "local").expect("label should record");
+    feedback::record_label(&log, "Prove theorem ∑", "cloud").expect("label should record");
+
+    let rows = feedback::read_labels(&log).expect("labels should read");
+
+    assert_eq!(
+        rows,
+        vec![
+            feedback::LabelRow {
+                text: "hi".to_string(),
+                label: "local".to_string(),
+            },
+            feedback::LabelRow {
+                text: "Prove theorem ∑".to_string(),
+                label: "cloud".to_string(),
+            },
+        ]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn feedback_absent_log_is_empty() {
+    let dir = unique_temp_dir("feedback-absent");
+    let rows = feedback::read_labels(dir.join("missing.jsonl")).expect("absent log should read");
+
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn feedback_rejects_empty_text_or_label_with_python_messages() {
+    let dir = unique_temp_dir("feedback-invalid");
+    std::fs::create_dir_all(&dir).expect("temp dir should be created");
+    let log = dir.join("feedback.jsonl");
+
+    let err = feedback::record_label(&log, "", "local").expect_err("empty text should fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(err.to_string(), "feedback needs a non-empty prompt text");
+
+    let err = feedback::record_label(&log, "hi", "").expect_err("empty label should fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(err.to_string(), "feedback needs a non-empty label");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn feedback_json_line_matches_python_format_and_preserves_non_ascii() {
+    let dir = unique_temp_dir("feedback-json-line");
+    std::fs::create_dir_all(&dir).expect("temp dir should be created");
+    let log = dir.join(feedback::DEFAULT_LOG);
+
+    feedback::record_label(&log, "café ∑", "cloud").expect("label should record");
+
+    let text = std::fs::read_to_string(&log).expect("log should read");
+    assert_eq!(text, "{\"text\": \"café ∑\", \"label\": \"cloud\"}\n");
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
