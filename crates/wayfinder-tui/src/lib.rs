@@ -9,6 +9,10 @@ use serde_json::{json, Value};
 use wayfinder_internal_core::complexity::{score_complexity, ComplexityScore, RoutingConfig};
 use wayfinder_internal_core::threads::{title_from, Thread};
 
+mod decision;
+
+pub use decision::{decide, pin_label, resolve_target, Decision, TuiState};
+
 pub const COMMAND_NAME: &str = "chat";
 
 #[derive(Debug, Clone, PartialEq)]
