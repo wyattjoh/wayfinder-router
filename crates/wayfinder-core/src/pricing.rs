@@ -26,7 +26,7 @@ pub fn estimate_tokens(text: &str) -> usize {
     if text.is_empty() {
         0
     } else {
-        (text.len() / CHARS_PER_TOKEN).max(1)
+        (text.chars().count() / CHARS_PER_TOKEN).max(1)
     }
 }
 

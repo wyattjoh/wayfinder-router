@@ -140,14 +140,8 @@ pub struct Lexicon {
 impl Default for Lexicon {
     fn default() -> Self {
         Self {
-            reasoning_terms: REASONING_TERMS
-                .iter()
-                .map(|term| term.to_string())
-                .collect(),
-            constraint_terms: CONSTRAINT_TERMS
-                .iter()
-                .map(|term| term.to_string())
-                .collect(),
+            reasoning_terms: canonical_terms(REASONING_TERMS),
+            constraint_terms: canonical_terms(CONSTRAINT_TERMS),
         }
     }
 }
@@ -553,6 +547,16 @@ impl ClassifierModel {
 
 fn normalize(value: usize, saturation: f64) -> f64 {
     (value as f64 / saturation).min(1.0)
+}
+
+fn canonical_terms(terms: &[&str]) -> Vec<String> {
+    let mut terms = terms
+        .iter()
+        .map(|term| term.trim().to_lowercase())
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    terms
 }
 
 fn round_to(value: f64, places: i32) -> f64 {

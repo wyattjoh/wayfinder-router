@@ -168,10 +168,30 @@ word_count = [0.0, 2.0]
 }
 
 #[test]
+fn explicit_default_lexicon_terms_do_not_dump_as_custom() {
+    let mut terms = RoutingConfig::default().lexicon.reasoning_terms;
+    terms.reverse();
+    let quoted = terms
+        .iter()
+        .map(|term| format!("{term:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let config = routing_config_from_toml(
+        &format!("[routing.lexicon]\nreasoning_terms = [{quoted}]\n"),
+        "inline",
+    )
+    .expect("config");
+
+    assert_eq!(config.lexicon, RoutingConfig::default().lexicon);
+    assert!(!dump_routing_toml(&config).contains("[routing.lexicon]"));
+}
+
+#[test]
 fn pricing_math_matches_python_cost_contracts() {
     assert_eq!(pricing::estimate_tokens(""), 0);
     assert_eq!(pricing::estimate_tokens("a"), 1);
     assert_eq!(pricing::estimate_tokens(&"x".repeat(40)), 10);
+    assert_eq!(pricing::estimate_tokens("🙂🙂🙂🙂"), 1);
 
     let (fallback, priced) =
         pricing::price_table([("local", None), ("cloud", None)], ["local", "cloud"]);
@@ -215,6 +235,14 @@ fn usage_tokens_prefers_upstream_usage_then_estimates() {
         pricing::UsageTokens {
             prompt_tokens: 10,
             completion_tokens: 20,
+            estimated: true,
+        }
+    );
+    assert_eq!(
+        pricing::usage_tokens(&json!({}), "🙂🙂🙂🙂", "éééééééé"),
+        pricing::UsageTokens {
+            prompt_tokens: 1,
+            completion_tokens: 2,
             estimated: true,
         }
     );
