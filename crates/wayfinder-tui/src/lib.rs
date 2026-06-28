@@ -13,10 +13,17 @@ use wayfinder_internal_core::threads::{
 mod cost;
 mod decision;
 mod remote;
+mod render;
+pub mod theme;
 
 pub use cost::{account_turn, cost_summary, fold_turn, load_ledger, savings_path, SessionCost};
 pub use decision::{decide, pin_label, resolve_target, Decision, TuiState};
 pub use remote::{decision_from_debug, friendly_error, remote_reply};
+pub use render::{
+    footer_bar, render_cost, render_decision, render_empty_state, render_keys, render_models,
+    render_reply, render_settings, render_threads, render_welcome, status_bar,
+};
+pub use theme::{palette_for, resolve_theme, Palette};
 
 pub const COMMAND_NAME: &str = "chat";
 
