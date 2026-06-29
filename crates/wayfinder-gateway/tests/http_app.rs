@@ -14,6 +14,8 @@ use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Notify};
 use tower::ServiceExt;
+use wayfinder_internal_core::feedback::DEFAULT_LOG;
+use wayfinder_internal_core::profiles::PROFILES;
 use wayfinder_internal_core::vkeys;
 use wayfinder_internal_gateway::{build_app_from_dir, load_gateway_models, ServeOptions};
 
@@ -86,6 +88,74 @@ async fn post_chat(
     let headers = response.headers().clone();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     (status, headers, body.to_vec())
+}
+
+async fn app_get_json(app: Router, path: &str) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+async fn get_text_from_app(app: Router, path: &str) -> (StatusCode, String) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+async fn app_post_json(app: Router, path: &str, body: Value) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json");
+    if path == "/v1/feedback" {
+        if let Ok(token) = std::env::var("WAYFINDER_ROUTER_FEEDBACK_TOKEN") {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+    }
+    let response = app
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+async fn app_post_text(app: Router, path: &str, body: &str) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
 }
 
 #[derive(Clone, Default)]
@@ -399,6 +469,141 @@ model = "frontier"
     assert_eq!(
         ids,
         ["auto", "prefer-local", "prefer-hosted", "frontier", "small"]
+    );
+}
+
+#[tokio::test]
+async fn gateway_operator_endpoints_are_wired() {
+    let upstream = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    let config_path = dir.path().join("wayfinder-router.toml");
+    let initial_config = format!(
+        r#"
+[routing]
+threshold = 1.0
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+cost_per_1k = 0.0
+
+[gateway.models.cloud]
+base_url = "{base_url}"
+model = "cloud-upstream"
+api_key_env = "WAYFINDER_ROUTER_TEST_MISSING_KEY_09"
+cost_per_1k = 0.01
+"#,
+        base_url = upstream.base_url
+    );
+    std::fs::write(&config_path, &initial_config).unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+
+    let (feedback_status, feedback) = app_post_json(
+        app.clone(),
+        "/v1/feedback",
+        serde_json::json!({"text": "a prompt", "label": "local"}),
+    )
+    .await;
+    let (bad_feedback_status, _) = app_post_json(
+        app.clone(),
+        "/v1/feedback",
+        serde_json::json!({"text": "missing label"}),
+    )
+    .await;
+    let feedback_log = std::fs::read_to_string(dir.path().join(DEFAULT_LOG)).unwrap();
+
+    assert_eq!(feedback_status, StatusCode::OK);
+    assert_eq!(feedback["count"], 1);
+    assert_eq!(bad_feedback_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        feedback_log.trim(),
+        r#"{"text": "a prompt", "label": "local"}"#
+    );
+
+    let (profiles_status, profiles) = app_get_json(app.clone(), "/router/profiles").await;
+    let profile_ids = profiles["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|profile| profile["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(profiles_status, StatusCode::OK);
+    assert_eq!(profile_ids.len(), PROFILES.len());
+    for profile in PROFILES {
+        assert!(profile_ids.contains(&profile.id));
+    }
+
+    let (models_status, models) = app_get_json(app.clone(), "/router/models").await;
+    let by_name = models["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| (model["name"].as_str().unwrap(), model))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    assert_eq!(models_status, StatusCode::OK);
+    assert_eq!(by_name["local"]["key_ok"], true);
+    assert_eq!(
+        by_name["cloud"]["api_key_env"],
+        "WAYFINDER_ROUTER_TEST_MISSING_KEY_09"
+    );
+    assert_eq!(by_name["cloud"]["key_ok"], false);
+    assert!(!models.to_string().contains("secret"));
+
+    let (chat_status, _, _) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/chat/completions",
+        &[],
+        serde_json::json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "stream": false
+        }),
+    )
+    .await;
+    assert_eq!(chat_status, StatusCode::OK);
+    let savings_app =
+        build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should rebuild");
+    let (savings_status, savings) = app_get_json(savings_app, "/v1/savings").await;
+
+    assert_eq!(savings_status, StatusCode::OK);
+    assert_eq!(savings["requests"], 1);
+    assert_eq!(savings["priced"], true);
+    assert_eq!(savings["unit"], "usd");
+    assert!(savings["price_table_version"].as_str().is_some());
+
+    let (config_status, config_body) = get_text_from_app(app.clone(), "/router/config").await;
+    assert_eq!(config_status, StatusCode::OK);
+    assert!(config_body.contains("[gateway.models.local]"));
+
+    let (invalid_status, invalid_body) =
+        app_post_text(app.clone(), "/router/config", "not = = toml").await;
+    assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
+    assert!(invalid_body["error"]
+        .as_str()
+        .unwrap()
+        .contains("invalid TOML"));
+
+    let replacement_config = format!(
+        r#"[routing]
+threshold = 0.2
+
+[gateway.models.small]
+base_url = "{base_url}"
+model = "small-upstream"
+"#,
+        base_url = upstream.base_url
+    );
+    let (write_status, write_body) =
+        app_post_text(app.clone(), "/router/config", &replacement_config).await;
+
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write_body["ok"], true);
+    assert_eq!(
+        std::fs::read_to_string(config_path).unwrap(),
+        replacement_config
     );
 }
 

@@ -8,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::to_bytes;
 use axum::body::Body;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::Query;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, Response, StatusCode};
@@ -15,7 +17,7 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{stream, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -23,8 +25,13 @@ use toml::Value;
 use wayfinder_internal_core::complexity::{
     recommend_tier, score_complexity, ComplexityScore, RoutingConfig, Tier,
 };
-use wayfinder_internal_core::config::{routing_config_from_toml, CONFIG_FILE};
-use wayfinder_internal_core::pricing::{estimate_tokens, price_table, turn_cost, usage_tokens};
+use wayfinder_internal_core::config::{dump_routing_toml, routing_config_from_toml, CONFIG_FILE};
+use wayfinder_internal_core::feedback::{read_labels, record_label, DEFAULT_LOG};
+use wayfinder_internal_core::pricing::{
+    estimate_tokens, price_table, table_version, turn_cost, usage_tokens, Date, SavingsLedger,
+    TurnCost,
+};
+use wayfinder_internal_core::profiles::PROFILES;
 use wayfinder_internal_core::vkeys;
 use wayfinder_internal_core::{DEFAULT_HOST, DEFAULT_PORT};
 
@@ -44,6 +51,10 @@ const DEFAULT_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_WINDOW: f64 = 60.0;
 const RECENT_LIMIT: usize = 200;
+const FEEDBACK_TOKEN_ENV: &str = "WAYFINDER_ROUTER_FEEDBACK_TOKEN";
+const SAVINGS_FILE_ENV: &str = "WAYFINDER_ROUTER_SAVINGS_FILE";
+const SAVINGS_FILE: &str = "wayfinder-savings.json";
+const CONFIG_BODY_LIMIT: usize = 1024 * 1024;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const DASHBOARD_HTML: &str = r#"<!doctype html>
@@ -122,6 +133,8 @@ impl From<std::io::Error> for GatewayError {
 #[derive(Clone)]
 struct AppState {
     options: ServeOptions,
+    config_path: PathBuf,
+    feedback_path: PathBuf,
     routing: RoutingConfig,
     gateway: GatewayConfig,
     model_ids: Vec<String>,
@@ -220,6 +233,8 @@ struct GatewayRuntime {
     rate_limiter: Mutex<RateLimiter>,
     metrics: Mutex<Metrics>,
     recent: Mutex<VecDeque<RecentDecision>>,
+    ledger: Mutex<SavingsLedger>,
+    savings_path: PathBuf,
 }
 
 #[derive(Default)]
@@ -327,6 +342,26 @@ struct ModelEntry {
     owned_by: &'static str,
 }
 
+#[derive(Deserialize)]
+struct SavingsQuery {
+    period: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FeedbackRequest {
+    text: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RouterModelEntry {
+    name: String,
+    endpoint: String,
+    model: String,
+    api_key_env: Option<String>,
+    key_ok: bool,
+}
+
 pub fn serve_summary(options: &ServeOptions) -> String {
     let mode = if options.dry_run {
         "dry-run"
@@ -356,15 +391,23 @@ pub fn build_app_from_dir(
         .route("/healthz", get(healthz))
         .route("/v1/models", get(list_models))
         .route("/models", get(list_models))
+        .route("/v1/feedback", post(record_feedback))
+        .route("/v1/savings", get(savings))
+        .route("/savings", get(savings))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/chat/completions", post(chat_completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/messages", post(anthropic_messages))
         .route("/metrics", get(metrics))
         .route("/router/recent", get(router_recent))
+        .route("/router/profiles", get(router_profiles))
+        .route("/router/models", get(router_models))
         .route("/router", get(router_dashboard))
         .route("/demo", get(demo_page))
-        .route("/router/config", post(router_config_stub))
+        .route(
+            "/router/config",
+            get(router_config).post(write_router_config),
+        )
         .with_state(state))
 }
 
@@ -398,9 +441,19 @@ impl AppState {
             .iter()
             .map(|(name, model)| (name.as_str(), model.cost_per_1k));
         let (costs, priced) = price_table(model_costs, tier_ladder);
-        let runtime = Arc::new(GatewayRuntime::new(&loaded.gateway));
+        let feedback_path = start_dir.join(DEFAULT_LOG);
+        let savings_path = std::env::var_os(SAVINGS_FILE_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| start_dir.join(SAVINGS_FILE));
+        let runtime = Arc::new(GatewayRuntime::new(
+            &loaded.gateway,
+            priced,
+            savings_path.clone(),
+        ));
         Ok(Self {
             options,
+            config_path: loaded.config_path,
+            feedback_path,
             routing: loaded.routing,
             gateway: loaded.gateway,
             model_ids,
@@ -412,6 +465,7 @@ impl AppState {
 }
 
 struct LoadedConfig {
+    config_path: PathBuf,
     routing: RoutingConfig,
     gateway: GatewayConfig,
 }
@@ -419,6 +473,7 @@ struct LoadedConfig {
 fn load_config(start_dir: &Path) -> Result<LoadedConfig, GatewayError> {
     let Some(path) = find_config(start_dir) else {
         return Ok(LoadedConfig {
+            config_path: start_dir.join(CONFIG_FILE),
             routing: RoutingConfig::default(),
             gateway: GatewayConfig {
                 models: BTreeMap::new(),
@@ -434,7 +489,11 @@ fn load_config(start_dir: &Path) -> Result<LoadedConfig, GatewayError> {
     let routing = routing_config_from_toml(&text, &where_)
         .map_err(|err| GatewayError::new(err.to_string()))?;
     let gateway = parse_gateway_config(&text, &where_)?;
-    Ok(LoadedConfig { routing, gateway })
+    Ok(LoadedConfig {
+        config_path: path,
+        routing,
+        gateway,
+    })
 }
 
 /// Read `[gateway.models.<name>]` from the nearest `wayfinder-router.toml`.
@@ -833,12 +892,20 @@ fn model_ids(routing: &RoutingConfig, gateway: &GatewayConfig) -> Vec<String> {
 }
 
 impl GatewayRuntime {
-    fn new(gateway: &GatewayConfig) -> Self {
+    fn new(gateway: &GatewayConfig, priced: bool, savings_path: PathBuf) -> Self {
+        let ledger = SavingsLedger::load(&savings_path)
+            .map(|mut ledger| {
+                ledger.priced = priced;
+                ledger
+            })
+            .unwrap_or_else(|_| SavingsLedger::new(priced));
         Self {
             cache: Mutex::new(ResponseCache::new(gateway.cache.clone())),
             rate_limiter: Mutex::new(RateLimiter::new(gateway.rate_limit.clone())),
             metrics: Mutex::new(Metrics::default()),
             recent: Mutex::new(VecDeque::new()),
+            ledger: Mutex::new(ledger),
+            savings_path,
         }
     }
 }
@@ -1210,6 +1277,94 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
             })
             .collect(),
     })
+}
+
+async fn record_feedback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<FeedbackRequest>, JsonRejection>,
+) -> Response<Body> {
+    let expected_token = std::env::var(FEEDBACK_TOKEN_ENV).ok();
+    if let Some(expected_token) = expected_token {
+        let authorized = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value == format!("Bearer {expected_token}"))
+            .unwrap_or(false);
+        if !authorized {
+            return json_response(
+                StatusCode::UNAUTHORIZED,
+                HeaderMap::new(),
+                json!({"error": "unauthorized"}),
+            );
+        }
+    }
+    let Ok(Json(payload)) = payload else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            json!({"error": "invalid JSON body"}),
+        );
+    };
+    let Some(text) = payload.text.filter(|text| !text.is_empty()) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            json!({"error": "missing 'text'"}),
+        );
+    };
+    let Some(label) = payload.label.filter(|label| !label.is_empty()) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            json!({"error": "missing 'label'"}),
+        );
+    };
+    if let Err(err) = record_label(&state.feedback_path, &text, &label) {
+        let status = if err.kind() == std::io::ErrorKind::InvalidInput {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return json_response(status, HeaderMap::new(), json!({"error": err.to_string()}));
+    }
+    let count = read_labels(&state.feedback_path)
+        .map(|labels| labels.len())
+        .unwrap_or(0);
+    json_response(
+        StatusCode::OK,
+        HeaderMap::new(),
+        json!({"ok": true, "count": count}),
+    )
+}
+
+async fn savings(
+    State(state): State<AppState>,
+    Query(query): Query<SavingsQuery>,
+) -> Json<JsonValue> {
+    let period = query.period.as_deref().unwrap_or("all");
+    let days = match period {
+        "today" => Some(1),
+        "7d" => Some(7),
+        "30d" => Some(30),
+        _ => None,
+    };
+    let report = state.runtime.ledger.lock().unwrap().period(days, None);
+    Json(json!({
+        "period_days": report.period_days,
+        "priced": report.priced,
+        "unit": if report.priced { "usd" } else { "relative" },
+        "requests": report.requests,
+        "estimated_requests": report.estimated_requests,
+        "tokens": report.tokens,
+        "realized": report.realized,
+        "baseline": report.baseline,
+        "saved": report.saved,
+        "saved_pct": report.saved_pct,
+        "price_table_version": table_version(
+            state.price_table.iter().map(|(model, cost)| (model.as_str(), *cost))
+        )
+    }))
 }
 
 async fn chat_completions(
@@ -1678,24 +1833,26 @@ async fn forward_upstream(
         .as_ref()
         .map(|parsed| usage_tokens(parsed, &prompt, &completion))
         .unwrap_or_else(|| usage_tokens(&JsonValue::Null, &prompt, &completion));
-    let cost = recent_cost_from_tokens(
+    let turn_cost = turn_cost_from_tokens(
         &state,
         &route.chosen,
         usage.prompt_tokens,
         usage.completion_tokens,
         usage.estimated,
     );
+    let cost = recent_cost_from_turn(&state, &turn_cost);
     state
         .runtime
         .rate_limiter
         .lock()
         .unwrap()
         .add_tokens(usage.prompt_tokens + usage.completion_tokens);
+    record_savings(&state, &turn_cost);
     {
         let mut metrics = state.runtime.metrics.lock().unwrap();
         metrics.observe_decision(&route.chosen, &route.mode, decision_latency);
         metrics.observe_upstream(&route.chosen, upstream_latency);
-        metrics.observe_cost(cost.realized, cost.baseline);
+        metrics.observe_cost(turn_cost.realized, turn_cost.baseline);
     }
     push_recent(
         &state,
@@ -1906,19 +2063,21 @@ impl StreamAccounting {
             self.buffer.clear();
         }
         let usage = usage_tokens(&JsonValue::Null, &self.prompt, &self.completion);
-        let cost = recent_cost_from_tokens(
+        let turn_cost = turn_cost_from_tokens(
             &self.state,
             &self.route.chosen,
             usage.prompt_tokens,
             usage.completion_tokens,
             usage.estimated,
         );
+        let cost = recent_cost_from_turn(&self.state, &turn_cost);
         self.state
             .runtime
             .rate_limiter
             .lock()
             .unwrap()
             .add_tokens(usage.prompt_tokens + usage.completion_tokens);
+        record_savings(&self.state, &turn_cost);
         observe_decision(
             &self.state,
             &self.route,
@@ -2503,7 +2662,18 @@ fn recent_cost_from_tokens(
     completion_tokens: usize,
     estimated: bool,
 ) -> RecentCost {
-    let cost = turn_cost(
+    let cost = turn_cost_from_tokens(state, route, prompt_tokens, completion_tokens, estimated);
+    recent_cost_from_turn(state, &cost)
+}
+
+fn turn_cost_from_tokens(
+    state: &AppState,
+    route: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    estimated: bool,
+) -> TurnCost {
+    turn_cost(
         route,
         prompt_tokens,
         completion_tokens,
@@ -2513,14 +2683,29 @@ fn recent_cost_from_tokens(
             .map(|(model, cost)| (model.as_str(), *cost)),
         estimated,
         None,
-    );
+    )
+}
+
+fn recent_cost_from_turn(state: &AppState, cost: &TurnCost) -> RecentCost {
     RecentCost {
         realized: cost.realized,
         baseline: cost.baseline,
         saved: cost.savings,
-        tokens: prompt_tokens + completion_tokens,
+        tokens: cost.prompt_tokens + cost.completion_tokens,
         unit: if state.priced { "usd" } else { "relative" },
         estimated: cost.estimated || !state.priced,
+    }
+}
+
+fn record_savings(state: &AppState, cost: &TurnCost) {
+    let save_result = {
+        let mut ledger = state.runtime.ledger.lock().unwrap();
+        ledger.priced = state.priced;
+        ledger.record(cost, Date::today_utc());
+        ledger.save(&state.runtime.savings_path)
+    };
+    if save_result.is_err() {
+        // Savings persistence is best effort; request handling and metrics still succeed.
     }
 }
 
@@ -3226,6 +3411,35 @@ async fn router_recent(State(state): State<AppState>) -> Json<serde_json::Value>
     }))
 }
 
+async fn router_profiles() -> Json<JsonValue> {
+    Json(json!({
+        "profiles": PROFILES.iter().map(|profile| profile.to_dict()).collect::<Vec<_>>()
+    }))
+}
+
+async fn router_models(State(state): State<AppState>) -> Json<JsonValue> {
+    let models = state
+        .gateway
+        .models
+        .iter()
+        .map(|(name, model)| RouterModelEntry {
+            name: name.clone(),
+            endpoint: model.base_url.clone(),
+            model: model.model.clone(),
+            api_key_env: model.api_key_env.clone(),
+            key_ok: model
+                .api_key_env
+                .as_ref()
+                .map(|env| std::env::var_os(env).is_some())
+                .unwrap_or(true),
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "models": models,
+        "dry_run": state.options.dry_run
+    }))
+}
+
 async fn router_dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
@@ -3234,12 +3448,116 @@ async fn demo_page() -> Html<&'static str> {
     Html(DEMO_HTML)
 }
 
-async fn router_config_stub() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "status": "stub",
-            "message": "Rust gateway config export is reserved for a later task"
-        })),
+async fn router_config(State(state): State<AppState>) -> Response<Body> {
+    match std::fs::read_to_string(&state.config_path) {
+        Ok(text) => text_response(StatusCode::OK, HeaderMap::new(), text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => text_response(
+            StatusCode::OK,
+            HeaderMap::new(),
+            current_config_text(&state),
+        ),
+        Err(err) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            HeaderMap::new(),
+            json!({"error": err.to_string()}),
+        ),
+    }
+}
+
+async fn write_router_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response<Body> {
+    let bytes = match to_bytes(body, CONFIG_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                json!({"error": err.to_string()}),
+            );
+        }
+    };
+    let Ok(text) = String::from_utf8(bytes.to_vec()) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            json!({"error": "config body must be UTF-8"}),
+        );
+    };
+    let Some(config_text) = posted_config_text(&headers, &text, &state) else {
+        return text_response(
+            StatusCode::OK,
+            HeaderMap::new(),
+            dump_routing_toml(&state.routing),
+        );
+    };
+    if let Err(err) = validate_full_config(&config_text, &state.config_path) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            json!({"error": err.to_string()}),
+        );
+    }
+    if let Err(err) = std::fs::write(&state.config_path, &config_text) {
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            HeaderMap::new(),
+            json!({"error": err.to_string()}),
+        );
+    }
+    json_response(
+        StatusCode::OK,
+        HeaderMap::new(),
+        json!({"ok": true, "path": state.config_path.display().to_string()}),
     )
+}
+
+fn posted_config_text(headers: &HeaderMap, text: &str, state: &AppState) -> Option<String> {
+    let is_json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        return Some(text.to_owned());
+    }
+    let Ok(value) = serde_json::from_str::<JsonValue>(text) else {
+        return Some(text.to_owned());
+    };
+    if let Some(toml) = value.get("toml").and_then(JsonValue::as_str) {
+        return Some(toml.to_owned());
+    }
+    if value.as_object().is_some() {
+        return None;
+    }
+    Some(current_config_text(state))
+}
+
+fn current_config_text(state: &AppState) -> String {
+    let routing = dump_routing_toml(&state.routing);
+    let gateway = dump_gateway_toml(&state.gateway);
+    if gateway.is_empty() {
+        routing
+    } else {
+        format!("{}\n\n{}\n", routing.trim_end(), gateway.trim_end())
+    }
+}
+
+fn validate_full_config(text: &str, path: &Path) -> Result<(), GatewayError> {
+    let where_ = path.to_string_lossy();
+    routing_config_from_toml(text, &where_).map_err(|err| GatewayError::new(err.to_string()))?;
+    validate_gateway_toml(text, &where_)
+}
+
+fn text_response(status: StatusCode, mut headers: HeaderMap, body: String) -> Response<Body> {
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
 }
