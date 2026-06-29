@@ -1,0 +1,49 @@
+use wayfinder_internal_ui::{serve_blocking, UiOptions, COMMAND_NAME};
+
+fn main() {
+    match parse_args(std::env::args().skip(1)) {
+        Ok(options) => {
+            if let Err(err) = serve_blocking(options) {
+                eprintln!("wayfinder-router-ui: {err}");
+                std::process::exit(1);
+            }
+        }
+        Err(err) => {
+            eprintln!("wayfinder-router-ui: {err}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_args<I>(args: I) -> Result<UiOptions, String>
+where
+    I: IntoIterator,
+    I::Item: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into).peekable();
+    if matches!(args.peek().map(String::as_str), Some(COMMAND_NAME)) {
+        args.next();
+    }
+
+    let mut options = UiOptions::default();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--host" => options.host = next_value(&mut args, "--host")?,
+            "--port" => {
+                options.port = next_value(&mut args, "--port")?
+                    .parse()
+                    .map_err(|_| "--port must be an integer".to_owned())?;
+            }
+            other => return Err(format!("unknown ui option '{other}'")),
+        }
+    }
+    Ok(options)
+}
+
+fn next_value<I>(args: &mut I, flag: &str) -> Result<String, String>
+where
+    I: Iterator<Item = String>,
+{
+    args.next()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}

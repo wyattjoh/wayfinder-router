@@ -4,6 +4,7 @@ members = [
     "crates/wayfinder-core",
     "crates/wayfinder-gateway",
     "crates/wayfinder-tui",
+    "crates/wayfinder-ui",
 ]
 resolver = "2"
 
