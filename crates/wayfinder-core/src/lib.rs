@@ -6,6 +6,7 @@ pub mod judge;
 pub mod onboard;
 pub mod pricing;
 pub mod profiles;
+pub mod sufficiency;
 pub mod threads;
 pub mod vkeys;
 

@@ -14,6 +14,9 @@ use wayfinder_internal_core::complexity::{
 use wayfinder_internal_core::config::{
     dump_routing_toml, routing_config_from_toml, WayfinderConfigError, THRESHOLD_ENV,
 };
+use wayfinder_internal_core::sufficiency::{
+    cohens_kappa, confusion_matrix, cross_validated_accuracy, evaluate, majority_baseline,
+};
 use wayfinder_internal_core::{feedback, onboard, pricing, threads, vkeys};
 
 fn repo_root() -> PathBuf {
@@ -47,6 +50,48 @@ fn calibration_fixture(name: &str) -> JsonValue {
         .unwrap_or_else(|err| panic!("fixture {} should be readable: {err}", path.display()));
     serde_json::from_str(&text)
         .unwrap_or_else(|err| panic!("fixture {} should be JSON: {err}", path.display()))
+}
+
+fn scored_sample(label: &str, score: f64) -> Sample {
+    Sample {
+        features: FeatureCounts::default(),
+        label: label.to_string(),
+        score,
+    }
+}
+
+fn separable_sufficiency_samples() -> Vec<Sample> {
+    vec![
+        scored_sample("local", 0.10),
+        scored_sample("local", 0.15),
+        scored_sample("local", 0.20),
+        scored_sample("local", 0.25),
+        scored_sample("cloud", 0.75),
+        scored_sample("cloud", 0.80),
+        scored_sample("cloud", 0.85),
+        scored_sample("cloud", 0.90),
+    ]
+}
+
+fn noisy_sufficiency_samples() -> Vec<Sample> {
+    vec![
+        scored_sample("local", 0.40),
+        scored_sample("cloud", 0.40),
+        scored_sample("local", 0.50),
+        scored_sample("cloud", 0.50),
+        scored_sample("local", 0.60),
+        scored_sample("cloud", 0.60),
+        scored_sample("local", 0.45),
+        scored_sample("cloud", 0.55),
+    ]
+}
+
+fn assert_float_eq(actual: f64, expected: f64) {
+    let delta = (actual - expected).abs();
+    assert!(
+        delta < 1e-12,
+        "expected {expected}, got {actual}, delta {delta}"
+    );
 }
 
 #[test]
@@ -149,6 +194,132 @@ fn calibration_knee_contract_fixture_matches_python_output() {
     assert_eq!(
         serde_json::to_value(actual.summary).unwrap(),
         expected["summary"]
+    );
+}
+
+#[test]
+fn sufficiency_scalar_helpers_match_python_outputs() {
+    assert_float_eq(
+        cohens_kappa(&[
+            ("local", "local"),
+            ("local", "cloud"),
+            ("cloud", "cloud"),
+            ("cloud", "local"),
+            ("cloud", "cloud"),
+        ]),
+        0.1666666666666666,
+    );
+    assert_float_eq(cohens_kappa(&[("a", "a"), ("a", "a")]), 1.0);
+    assert_float_eq(cohens_kappa(&[("a", "a"), ("a", "a"), ("b", "a")]), 0.0);
+
+    let matrix = confusion_matrix(&[("local", "local"), ("local", "cloud"), ("cloud", "cloud")]);
+    assert_eq!(matrix["local"]["local"], 1);
+    assert_eq!(matrix["local"]["cloud"], 1);
+    assert_eq!(matrix["cloud"]["cloud"], 1);
+    assert_eq!(matrix["cloud"]["local"], 0);
+
+    let separable = separable_sufficiency_samples();
+    assert_float_eq(majority_baseline(&separable), 0.5);
+    assert_float_eq(cross_validated_accuracy(&separable, 4), 0.875);
+
+    let noise = noisy_sufficiency_samples();
+    assert_float_eq(majority_baseline(&noise), 0.5);
+    assert_float_eq(cross_validated_accuracy(&noise, 4), 0.25);
+}
+
+#[test]
+fn sufficiency_evaluate_matches_python_verdicts_and_failures() {
+    let pass_gold = [
+        ("local", "local"),
+        ("local", "local"),
+        ("local", "local"),
+        ("local", "local"),
+        ("local", "local"),
+        ("cloud", "cloud"),
+        ("cloud", "cloud"),
+        ("cloud", "cloud"),
+        ("cloud", "cloud"),
+        ("cloud", "cloud"),
+    ];
+    let separable = separable_sufficiency_samples();
+    let pass = evaluate(&pass_gold, &separable);
+    assert!(pass.passed);
+    assert_eq!(pass.failures, Vec::<String>::new());
+    assert_float_eq(pass.kappa, 1.0);
+    assert_float_eq(pass.cv_accuracy, 0.8);
+    assert_float_eq(pass.majority_baseline, 0.5);
+    assert_float_eq(pass.lift, 0.30000000000000004);
+
+    let low_kappa_gold = [
+        ("local", "cloud"),
+        ("cloud", "local"),
+        ("local", "cloud"),
+        ("cloud", "local"),
+        ("local", "cloud"),
+        ("cloud", "local"),
+        ("local", "cloud"),
+        ("cloud", "local"),
+        ("local", "cloud"),
+        ("cloud", "local"),
+    ];
+    let low_kappa = evaluate(&low_kappa_gold, &separable);
+    assert!(!low_kappa.passed);
+    assert_eq!(
+        low_kappa.failures,
+        vec!["judge-vs-gold kappa -1.00 < floor 0.60".to_string()]
+    );
+
+    let degenerate_samples = vec![scored_sample("local", 0.1); 8];
+    let degenerate = evaluate(&pass_gold, &degenerate_samples);
+    assert!(!degenerate.passed);
+    assert_eq!(
+        degenerate.failures,
+        vec![format!(
+            "labels degenerate \u{2014} need both arms meaningfully represented, not ~all one arm"
+        )]
+    );
+
+    let noise = noisy_sufficiency_samples();
+    let no_lift = evaluate(&pass_gold, &noise);
+    assert!(!no_lift.passed);
+    assert_eq!(
+        no_lift.failures,
+        vec![
+            "no out-of-fold lift \u{2014} cv accuracy 0.20 does not beat majority baseline 0.50"
+                .to_string()
+        ]
+    );
+}
+
+#[test]
+fn sufficiency_report_render_matches_python_layout() {
+    let gold = [
+        ("local", "local"),
+        ("local", "local"),
+        ("local", "local"),
+        ("local", "local"),
+        ("local", "local"),
+        ("cloud", "cloud"),
+        ("cloud", "cloud"),
+        ("cloud", "cloud"),
+        ("cloud", "cloud"),
+        ("cloud", "cloud"),
+    ];
+    let samples = separable_sufficiency_samples();
+    let report = evaluate(&gold, &samples);
+
+    assert_eq!(
+        report.render(),
+        concat!(
+            "judge-vs-gold kappa: 1.00 (floor 0.60, n=10, abstained=0)\n",
+            "out-of-fold accuracy: 0.80 vs majority baseline 0.50 (lift +0.30)\n",
+            "label distribution: {'local': 4, 'cloud': 4}\n",
+            "confusion (rows=judge, cols=gold):\n",
+            "                 cloud       local\n",
+            "     cloud           5           0\n",
+            "     local           0           5\n",
+            "trust gates: PASS",
+        )
     );
 }
 
