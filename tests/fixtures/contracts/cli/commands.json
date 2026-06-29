@@ -1,5 +1,5 @@
 {
-  "description": "Initial Rust port command surfaces mirrored from the current Python CLI.",
+  "description": "Static Python-derived CLI command surface contracts.",
   "commands": [
     {
       "name": "serve",
@@ -13,7 +13,13 @@
         "--dry-run",
         "--timeout",
         "60"
-      ]
+      ],
+      "expected": {
+        "ok": true,
+        "stdout_contains": ["serve", "127.0.0.1:8088", "dry-run"],
+        "stderr_contains": [],
+        "stderr_empty": true
+      }
     },
     {
       "name": "chat",
@@ -29,7 +35,71 @@
         "--no-stream",
         "--base-url",
         "http://127.0.0.1:8088"
-      ]
+      ],
+      "expected": {
+        "ok": true,
+        "stdout_contains": ["wayfinder-router chat", "theme: auto", "dry-run"],
+        "stderr_contains": [],
+        "stderr_empty": true
+      }
+    },
+    {
+      "name": "route-json",
+      "surface": "route",
+      "argv": ["route", "-", "--json"],
+      "stdin": "Say hello.",
+      "expected": {
+        "ok": true,
+        "stdout_contains": ["\"schema_version\": \"3\"", "\"recommendation\": \"local\"", "\"word_count\": 2"],
+        "stderr_contains": [],
+        "stderr_empty": true
+      }
+    },
+    {
+      "name": "calibrate-threshold",
+      "surface": "calibrate",
+      "dataset_fixture": "calibrate/threshold-accuracy.json",
+      "argv": ["calibrate", "<dataset>", "--mode", "threshold"],
+      "expected": {
+        "ok": true,
+        "stdout_contains": ["[[routing.tiers]]", "model = \"local\"", "model = \"cloud\""],
+        "stderr_contains": ["wayfinder-router:", "accuracy=1.0"]
+      }
+    },
+    {
+      "name": "init-print",
+      "surface": "init",
+      "argv": ["init", "--preset", "openai", "--print"],
+      "expected": {
+        "ok": true,
+        "stdout_contains": ["[gateway.models.small]", "[gateway.models.large]", "OPENAI_API_KEY"],
+        "stderr_contains": [],
+        "stderr_empty": true
+      }
+    },
+    {
+      "name": "doctor-keyless",
+      "surface": "doctor",
+      "argv": ["doctor", "--dir", "<tempdir>"],
+      "config": "[routing]\nthreshold = 0.08\n\n[gateway.models.local]\nbase_url = \"http://localhost:11434/v1\"\nmodel = \"llama3.1\"\n",
+      "expected": {
+        "ok": true,
+        "stdout_contains": ["routing:", "models", "local", "keyless", "ready:"],
+        "stderr_contains": [],
+        "stderr_empty": true
+      }
+    },
+    {
+      "name": "keys-new",
+      "surface": "keys",
+      "argv": ["keys", "new", "--id", "team-a", "--tag", "prod"],
+      "expected": {
+        "ok": true,
+        "stdout_contains": ["[gateway.keys.team-a]", "hash = \"", "tags = [\"prod\"]", "wf-"],
+        "stderr_contains": [],
+        "stderr_empty": true,
+        "verify_generated_key": true
+      }
     }
   ]
 }

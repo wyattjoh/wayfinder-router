@@ -1,0 +1,42 @@
+{
+  "description": "Static Python-derived UI onboarding and recalibration endpoint contracts.",
+  "gateway_config": "[gateway.models.cloud]\nbase_url = \"http://cloud.example/v1\"\nmodel = \"cloud-model\"\n\n[gateway.models.local]\nbase_url = \"http://local.example/v1\"\nmodel = \"local-model\"\n",
+  "onboard_state": {
+    "status": 200,
+    "body": {
+      "arms": ["cloud", "local"],
+      "count": 0
+    }
+  },
+  "onboard_run": {
+    "status": 200,
+    "request": { "prompt": "hi" },
+    "body": {
+      "outputs": {
+        "cloud": "reply:cloud-model:hi",
+        "local": "reply:local-model:hi"
+      }
+    }
+  },
+  "onboard_record": {
+    "status": 200,
+    "request": { "prompt": "hi", "label": "local" },
+    "body": { "ok": true, "count": 1 }
+  },
+  "onboard_dataset": {
+    "status": 200,
+    "body": {
+      "dataset": "{\"text\":\"hi\",\"label\":\"local\"}"
+    }
+  },
+  "recalibrate": {
+    "status": 200,
+    "request": { "mode": "threshold" },
+    "body": {
+      "written": true,
+      "label_count": 8,
+      "summary": { "accuracy": 1.0 },
+      "reason": null
+    }
+  }
+}

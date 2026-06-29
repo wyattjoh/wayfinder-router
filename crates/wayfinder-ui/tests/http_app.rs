@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value as JsonValue};
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wayfinder_internal_core::complexity::FEATURE_ORDER;
@@ -11,6 +12,22 @@ use wayfinder_internal_ui::{build_app_from_dir, build_app_from_dir_with_invoker}
 
 const TRIVIAL: &str = "hi";
 const COMPLEX: &str = "# Plan\n\n## Steps\n\n- step 0\n- step 1\n- step 2\n- step 3\n- step 4\n- step 5\n- step 6\n- step 7\n- step 8\n- step 9\n- step 10\n- step 11\n\n## Refs\n\n[a](https://x) [b](https://y)\n\n```py\nx=1\n```\n| a | b |\n| - | - |\n";
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("ui crate lives under crates/wayfinder-ui")
+        .to_path_buf()
+}
+
+fn contract_fixture(path: &str) -> JsonValue {
+    let path = repo_root().join("tests/fixtures/contracts").join(path);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("fixture {} should be readable: {err}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("fixture {} should be JSON: {err}", path.display()))
+}
 
 fn dataset() -> String {
     let local = format!(r#"{{"text":{TRIVIAL:?},"label":"local"}}"#);
@@ -98,6 +115,14 @@ model = "cloud-model"
 base_url = "http://local.example/v1"
 model = "local-model"
 "#,
+    )
+    .expect("gateway config should be writable");
+}
+
+fn write_gateway_config_from_fixture(dir: &TempDir, fixture: &JsonValue) {
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        fixture["gateway_config"].as_str().unwrap(),
     )
     .expect("gateway config should be writable");
 }
@@ -377,4 +402,81 @@ async fn api_recalibrate_skips_empty_log() {
     assert_eq!(body["label_count"], 0);
     assert_eq!(body["summary"], JsonValue::Null);
     assert_eq!(body["reason"], "need >= 2 labels, have 0");
+}
+
+#[tokio::test]
+async fn api_onboard_and_recalibrate_match_static_contract_fixture() {
+    let expected = contract_fixture("ui/onboard-recalibrate.json");
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_gateway_config_from_fixture(&dir, &expected);
+
+    let (status, state) = get_json(&dir, "/api/onboard").await;
+    assert_eq!(
+        status.as_u16(),
+        expected["onboard_state"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(state, expected["onboard_state"]["body"]);
+
+    let app = build_app_from_dir_with_invoker(dir.path(), |model, prompt| {
+        Ok(format!("reply:{}:{prompt}", model.model))
+    })
+    .expect("app should build");
+    let (status, run_body) = post_json_app(
+        app,
+        "/api/onboard/run",
+        expected["onboard_run"]["request"].clone(),
+    )
+    .await;
+    assert_eq!(
+        status.as_u16(),
+        expected["onboard_run"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(run_body, expected["onboard_run"]["body"]);
+
+    let (status, record_body) = post_json(
+        &dir,
+        "/api/onboard/record",
+        expected["onboard_record"]["request"].clone(),
+    )
+    .await;
+    assert_eq!(
+        status.as_u16(),
+        expected["onboard_record"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(record_body, expected["onboard_record"]["body"]);
+
+    let (status, dataset_body) = get_json(&dir, "/api/onboard/dataset").await;
+    assert_eq!(
+        status.as_u16(),
+        expected["onboard_dataset"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(dataset_body, expected["onboard_dataset"]["body"]);
+
+    std::fs::write(dir.path().join(DEFAULT_LOG), dataset()).expect("feedback log should write");
+    let (status, recalibrate_body) = post_json(
+        &dir,
+        "/api/recalibrate",
+        expected["recalibrate"]["request"].clone(),
+    )
+    .await;
+    assert_eq!(
+        status.as_u16(),
+        expected["recalibrate"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(
+        recalibrate_body["written"],
+        expected["recalibrate"]["body"]["written"]
+    );
+    assert_eq!(
+        recalibrate_body["label_count"],
+        expected["recalibrate"]["body"]["label_count"]
+    );
+    assert_eq!(
+        recalibrate_body["summary"]["accuracy"],
+        expected["recalibrate"]["body"]["summary"]["accuracy"]
+    );
+    assert_eq!(
+        recalibrate_body["reason"],
+        expected["recalibrate"]["body"]["reason"]
+    );
 }

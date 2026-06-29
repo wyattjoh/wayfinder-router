@@ -1,0 +1,27 @@
+{
+  "description": "Static Python-derived onboarding session summary, labels, and arm execution order.",
+  "prompts": ["easy", "hard"],
+  "arms": ["local", "cloud"],
+  "labels": [
+    { "text": "easy", "label": "local" },
+    { "text": "hard", "label": "cloud" }
+  ],
+  "summary": {
+    "judged": 2,
+    "abstained": 0,
+    "label_counts": {
+      "cloud": 1,
+      "local": 1
+    }
+  },
+  "runs": [
+    ["local", "easy"],
+    ["cloud", "easy"],
+    ["local", "hard"],
+    ["cloud", "hard"]
+  ],
+  "errors": {
+    "one_arm": "onboarding needs at least two arms (e.g. a local and a hosted model)",
+    "unknown_arm": "judge returned an unknown arm: \"c\""
+  }
+}

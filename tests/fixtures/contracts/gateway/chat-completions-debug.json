@@ -24,8 +24,7 @@
       "x-wayfinder-router-model": "local",
       "x-wayfinder-router-score": "0.00",
       "x-wayfinder-router-mode": "scored",
-      "x-wayfinder-router-request-id": "<opaque-request-id>",
-      "x-wayfinder-router-served-by": "local"
+      "x-wayfinder-router-request-id": "<opaque-request-id>"
     },
     "body": {
       "id": "resp-1",

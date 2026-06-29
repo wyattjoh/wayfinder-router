@@ -1,0 +1,24 @@
+{
+  "description": "Static Python-derived reliability retry, failover, and context precheck cases.",
+  "retryable": [null, 429, 500, 502, 503, 504],
+  "not_retryable": [200, 400, 401, 403, 404, 422],
+  "retry_delay_case": {
+    "retries": 4,
+    "base_ms": 200,
+    "cap_ms": 1000,
+    "expected_ms": [200, 400, 800, 1000]
+  },
+  "failover_cases": [
+    { "chosen": "mid", "ladder": ["local", "mid", "cloud"], "policy": "same-tier", "expected": [] },
+    { "chosen": "mid", "ladder": ["local", "mid", "cloud"], "policy": "degrade", "expected": ["local"] },
+    { "chosen": "mid", "ladder": ["local", "mid", "cloud"], "policy": "escalate", "expected": ["cloud"] },
+    { "chosen": "local", "ladder": ["local", "mid", "cloud"], "policy": "escalate", "expected": ["mid", "cloud"] },
+    { "chosen": "cloud", "ladder": ["local", "mid", "cloud"], "policy": "degrade", "expected": ["mid", "local"] },
+    { "chosen": "ghost", "ladder": ["local", "cloud"], "policy": "degrade", "expected": [] }
+  ],
+  "precheck_cases": [
+    { "estimated_tokens": 500, "context_window": null, "expected": true },
+    { "estimated_tokens": 500, "context_window": 1000, "expected": true },
+    { "estimated_tokens": 1500, "context_window": 1000, "expected": false }
+  ]
+}

@@ -14,6 +14,7 @@ use wayfinder_internal_core::complexity::{
 use wayfinder_internal_core::config::{
     dump_routing_toml, routing_config_from_toml, WayfinderConfigError, THRESHOLD_ENV,
 };
+use wayfinder_internal_core::judge::{HeuristicJudge, Judge};
 use wayfinder_internal_core::sufficiency::{
     cohens_kappa, confusion_matrix, cross_validated_accuracy, evaluate, majority_baseline,
 };
@@ -46,6 +47,14 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 
 fn calibration_fixture(name: &str) -> JsonValue {
     let path = fixture(&format!("calibrate/{name}"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("fixture {} should be readable: {err}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("fixture {} should be JSON: {err}", path.display()))
+}
+
+fn json_fixture(path: &str) -> JsonValue {
+    let path = fixture(path);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("fixture {} should be readable: {err}", path.display()));
     serde_json::from_str(&text)
@@ -92,6 +101,10 @@ fn assert_float_eq(actual: f64, expected: f64) {
         delta < 1e-12,
         "expected {expected}, got {actual}, delta {delta}"
     );
+}
+
+fn assert_json_float_eq(actual: f64, expected: &JsonValue) {
+    assert_float_eq(actual, expected.as_f64().expect("expected fixture float"));
 }
 
 #[test]
@@ -321,6 +334,70 @@ fn sufficiency_report_render_matches_python_layout() {
             "trust gates: PASS",
         )
     );
+}
+
+#[test]
+fn sufficiency_static_fixture_matches_python_outputs() {
+    let expected = json_fixture("sufficiency/evaluate.json");
+
+    for case in expected["kappa_cases"].as_array().unwrap() {
+        let pairs = case["pairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pair| {
+                (
+                    pair[0].as_str().unwrap().to_owned(),
+                    pair[1].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_json_float_eq(cohens_kappa(&pairs), &case["expected"]);
+    }
+
+    let samples = expected["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|sample| {
+            scored_sample(
+                sample["label"].as_str().unwrap(),
+                sample["score"].as_f64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let gold = expected["gold_pairs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| {
+            (
+                pair[0].as_str().unwrap().to_owned(),
+                pair[1].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let report = evaluate(&gold, &samples);
+    let expected_report = &expected["report"];
+    assert_eq!(report.passed, expected_report["passed"].as_bool().unwrap());
+    assert_eq!(
+        report.failures,
+        expected_report["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    );
+    assert_json_float_eq(report.kappa, &expected_report["kappa"]);
+    assert_json_float_eq(report.cv_accuracy, &expected_report["cv_accuracy"]);
+    assert_json_float_eq(
+        report.majority_baseline,
+        &expected_report["majority_baseline"],
+    );
+    assert_json_float_eq(report.lift, &expected_report["lift"]);
+    assert_eq!(report.render(), expected_report["render"].as_str().unwrap());
 }
 
 #[test]
@@ -708,6 +785,49 @@ fn feedback_json_line_matches_python_format_and_preserves_non_ascii() {
 }
 
 #[test]
+fn feedback_static_fixture_matches_python_log_contract() {
+    let expected = json_fixture("feedback/log.json");
+    let dir = unique_temp_dir("feedback-fixture");
+    std::fs::create_dir_all(&dir).expect("temp dir should be created");
+    let log = dir.join(feedback::DEFAULT_LOG);
+
+    for row in expected["rows"].as_array().unwrap() {
+        feedback::record_label(
+            &log,
+            row["text"].as_str().unwrap(),
+            row["label"].as_str().unwrap(),
+        )
+        .expect("fixture label should record");
+    }
+
+    let rows = feedback::read_labels(&log).expect("labels should read");
+    let actual = serde_json::to_value(&rows).expect("rows should serialize");
+    assert_eq!(actual, expected["rows"]);
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("log should read"),
+        expected["jsonl"].as_str().unwrap()
+    );
+
+    for (text, label, error) in [
+        (
+            "",
+            "local",
+            expected["errors"]["empty_text"].as_str().unwrap(),
+        ),
+        (
+            "hi",
+            "",
+            expected["errors"]["empty_label"].as_str().unwrap(),
+        ),
+    ] {
+        let err = feedback::record_label(&log, text, label).expect_err("invalid row should fail");
+        assert_eq!(err.to_string(), error);
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn onboarding_records_judged_arms_and_runs_every_arm() {
     let dir = unique_temp_dir("onboard-records");
     std::fs::create_dir_all(&dir).expect("temp dir should be created");
@@ -843,6 +963,86 @@ fn onboarding_rejects_unknown_judge_arm() {
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(err.to_string(), "judge returned an unknown arm: \"c\"");
+}
+
+#[test]
+fn onboarding_static_fixture_matches_python_session_contract() {
+    let expected = json_fixture("onboard/session.json");
+    let dir = unique_temp_dir("onboard-fixture");
+    std::fs::create_dir_all(&dir).expect("temp dir should be created");
+    let log = dir.join("feedback.jsonl");
+    let prompts = expected["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let arms = expected["arms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let mut ran = Vec::new();
+
+    let summary = onboard::run_onboarding(
+        prompts.iter().map(String::as_str),
+        &arms.iter().map(String::as_str).collect::<Vec<_>>(),
+        |arm, prompt| {
+            ran.push(vec![arm.to_string(), prompt.to_string()]);
+            format!("{arm}:{prompt}")
+        },
+        |prompt, _| {
+            expected["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["text"].as_str() == Some(prompt))
+                .map(|row| row["label"].as_str().unwrap().to_owned())
+        },
+        &log,
+    )
+    .expect("fixture onboarding should run");
+
+    assert_eq!(
+        summary.judged,
+        expected["summary"]["judged"].as_u64().unwrap() as usize
+    );
+    assert_eq!(
+        summary.abstained,
+        expected["summary"]["abstained"].as_u64().unwrap() as usize
+    );
+    assert_eq!(
+        serde_json::to_value(summary.label_counts).unwrap(),
+        expected["summary"]["label_counts"]
+    );
+    assert_eq!(
+        serde_json::to_value(feedback::read_labels(&log).unwrap()).unwrap(),
+        expected["labels"]
+    );
+    assert_eq!(serde_json::to_value(ran).unwrap(), expected["runs"]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn judge_static_fixture_matches_python_verdicts() {
+    let expected = json_fixture("judge/heuristic.json");
+    let judge = HeuristicJudge::default();
+
+    for case in expected["cases"].as_array().unwrap() {
+        let verdict = judge.judge(
+            case["prompt"].as_str().unwrap(),
+            case["cheap"].as_str().unwrap(),
+            case["expensive"].as_str().unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(verdict.sufficient).unwrap(),
+            case["sufficient"]
+        );
+        assert_eq!(verdict.reason, case["reason"].as_str().unwrap());
+        assert_eq!(verdict.comparator, case["comparator"].as_str().unwrap());
+    }
 }
 
 #[test]

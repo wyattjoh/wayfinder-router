@@ -1,0 +1,48 @@
+{
+  "description": "Static Python-derived sufficiency gate scalar and report outputs.",
+  "kappa_cases": [
+    {
+      "pairs": [["local", "local"], ["local", "cloud"], ["cloud", "cloud"], ["cloud", "local"], ["cloud", "cloud"]],
+      "expected": 0.1666666666666666
+    },
+    {
+      "pairs": [["a", "a"], ["a", "a"]],
+      "expected": 1.0
+    },
+    {
+      "pairs": [["a", "a"], ["a", "a"], ["b", "a"]],
+      "expected": 0.0
+    }
+  ],
+  "samples": [
+    { "label": "local", "score": 0.1 },
+    { "label": "local", "score": 0.15 },
+    { "label": "local", "score": 0.2 },
+    { "label": "local", "score": 0.25 },
+    { "label": "cloud", "score": 0.75 },
+    { "label": "cloud", "score": 0.8 },
+    { "label": "cloud", "score": 0.85 },
+    { "label": "cloud", "score": 0.9 }
+  ],
+  "gold_pairs": [
+    ["local", "local"],
+    ["local", "local"],
+    ["local", "local"],
+    ["local", "local"],
+    ["local", "local"],
+    ["cloud", "cloud"],
+    ["cloud", "cloud"],
+    ["cloud", "cloud"],
+    ["cloud", "cloud"],
+    ["cloud", "cloud"]
+  ],
+  "report": {
+    "passed": true,
+    "failures": [],
+    "kappa": 1.0,
+    "cv_accuracy": 0.8,
+    "majority_baseline": 0.5,
+    "lift": 0.30000000000000004,
+    "render": "judge-vs-gold kappa: 1.00 (floor 0.60, n=10, abstained=0)\nout-of-fold accuracy: 0.80 vs majority baseline 0.50 (lift +0.30)\nlabel distribution: {'local': 4, 'cloud': 4}\nconfusion (rows=judge, cols=gold):\n                 cloud       local\n     cloud           5           0\n     local           0           5\ntrust gates: PASS"
+  }
+}

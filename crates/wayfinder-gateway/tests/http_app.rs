@@ -9,6 +9,7 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::tempdir;
@@ -22,6 +23,22 @@ use wayfinder_internal_gateway::{
     build_app_from_dir, dump_gateway_toml, gateway_config_from_toml, load_gateway_models,
     ServeOptions,
 };
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("gateway crate lives under crates/wayfinder-gateway")
+        .to_path_buf()
+}
+
+fn contract_fixture(path: &str) -> Value {
+    let path = repo_root().join("tests/fixtures/contracts").join(path);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("fixture {} should be readable: {err}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("fixture {} should be JSON: {err}", path.display()))
+}
 
 async fn get_json(path: &str) -> (StatusCode, Value) {
     let app = build_app_from_dir(ServeOptions::default(), std::env::current_dir().unwrap())
@@ -748,6 +765,7 @@ fn load_gateway_models_returns_empty_without_config() {
 
 #[tokio::test]
 async fn chat_completions_dry_run_returns_decision_headers_and_debug_payload() {
+    let expected = contract_fixture("gateway/chat-completions-debug.json");
     let dir = tempdir().unwrap();
     std::fs::write(
         dir.path().join("wayfinder-router.toml"),
@@ -766,23 +784,35 @@ threshold = 0.5
         },
         "/v1/chat/completions",
         &[("X-Wayfinder-Debug", "true")],
-        serde_json::json!({
-            "model": "auto",
-            "messages": [{"role": "user", "content": "Say hello."}],
-            "stream": false
-        }),
+        expected["request"]["body"].clone(),
     )
     .await;
     let body: Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers["x-wayfinder-router-model"], "local");
-    assert_eq!(headers["x-wayfinder-router-mode"], "scored");
-    assert_eq!(headers["x-wayfinder-router-score"], "0.00");
+    assert_eq!(
+        status.as_u16(),
+        expected["expected_response"]["status"].as_u64().unwrap() as u16
+    );
+    for (name, value) in expected["expected_response"]["headers"]
+        .as_object()
+        .unwrap()
+    {
+        if value.as_str() == Some("<opaque-request-id>") {
+            assert!(headers.contains_key(name));
+        } else {
+            assert_eq!(headers[name.as_str()], value.as_str().unwrap());
+        }
+    }
     assert!(headers.contains_key("x-wayfinder-router-request-id"));
-    assert_eq!(body["wayfinder"]["model"], "local");
+    assert_eq!(
+        body["wayfinder"]["model"],
+        expected["expected_response"]["body"]["wayfinder"]["model"]
+    );
     assert_eq!(body["wayfinder"]["dry_run"], true);
-    assert_eq!(body["wayfinder"]["features"]["word_count"], 2);
+    assert_eq!(
+        body["wayfinder"]["features"],
+        expected["expected_response"]["body"]["wayfinder"]["features"]
+    );
 }
 
 #[tokio::test]

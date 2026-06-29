@@ -1,37 +1,60 @@
 use std::cell::Cell;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde_json::Value as JsonValue;
 use wayfinder_internal_gateway::reliability::{
     delivery_plan, failover_candidates, is_retryable, precheck_ok, retry_delays, CircuitBreaker,
 };
 
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("gateway crate lives under crates/wayfinder-gateway")
+        .to_path_buf()
+}
+
+fn fixture(path: &str) -> JsonValue {
+    let path = repo_root().join("tests/fixtures/contracts").join(path);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("fixture {} should be readable: {err}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("fixture {} should be JSON: {err}", path.display()))
+}
+
 #[test]
 fn is_retryable_matches_python_classification() {
-    assert!(is_retryable(None));
-    for status in [429, 500, 502, 503, 504] {
-        assert!(is_retryable(Some(status)));
+    let expected = fixture("reliability/retry-failover.json");
+
+    for status in expected["retryable"].as_array().unwrap() {
+        let status = status.as_u64().map(|value| value as u16);
+        assert!(is_retryable(status));
     }
-    for status in [200, 400, 401, 403, 404, 422] {
-        assert!(!is_retryable(Some(status)));
+    for status in expected["not_retryable"].as_array().unwrap() {
+        assert!(!is_retryable(Some(status.as_u64().unwrap() as u16)));
     }
 }
 
 #[test]
 fn retry_delays_match_python_backoff_schedule() {
+    let expected = fixture("reliability/retry-failover.json");
     let full = retry_delays(
-        4,
-        Duration::from_millis(200),
-        Duration::from_secs(1),
+        expected["retry_delay_case"]["retries"].as_u64().unwrap() as usize,
+        Duration::from_millis(expected["retry_delay_case"]["base_ms"].as_u64().unwrap()),
+        Duration::from_millis(expected["retry_delay_case"]["cap_ms"].as_u64().unwrap()),
         || 1.0,
     );
     assert_eq!(
-        full,
-        vec![
-            Duration::from_millis(200),
-            Duration::from_millis(400),
-            Duration::from_millis(800),
-            Duration::from_secs(1),
-        ]
+        full.iter()
+            .map(|duration| duration.as_millis() as u64)
+            .collect::<Vec<_>>(),
+        expected["retry_delay_case"]["expected_ms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap())
+            .collect::<Vec<_>>()
     );
     let zero = retry_delays(
         3,
@@ -111,24 +134,35 @@ fn delivery_plan_orders_dedups_and_filters_targets() {
 
 #[test]
 fn failover_candidates_and_precheck_match_python() {
-    let ladder = ["local", "mid", "cloud"];
-    assert!(failover_candidates("mid", ladder, "same-tier").is_empty());
-    assert_eq!(failover_candidates("mid", ladder, "degrade"), vec!["local"]);
-    assert_eq!(
-        failover_candidates("mid", ladder, "escalate"),
-        vec!["cloud"]
-    );
-    assert_eq!(
-        failover_candidates("local", ladder, "escalate"),
-        vec!["mid", "cloud"]
-    );
-    assert_eq!(
-        failover_candidates("cloud", ladder, "degrade"),
-        vec!["mid", "local"]
-    );
-    assert!(failover_candidates("ghost", ["local", "cloud"], "degrade").is_empty());
+    let expected = fixture("reliability/retry-failover.json");
+    for case in expected["failover_cases"].as_array().unwrap() {
+        let ladder = case["ladder"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let actual = failover_candidates(
+            case["chosen"].as_str().unwrap(),
+            ladder,
+            case["policy"].as_str().unwrap(),
+        );
+        let expected = case["expected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
 
-    assert!(precheck_ok(500, None));
-    assert!(precheck_ok(500, Some(1000)));
-    assert!(!precheck_ok(1500, Some(1000)));
+    for case in expected["precheck_cases"].as_array().unwrap() {
+        assert_eq!(
+            precheck_ok(
+                case["estimated_tokens"].as_u64().unwrap() as usize,
+                case["context_window"].as_u64().map(|value| value as usize),
+            ),
+            case["expected"].as_bool().unwrap()
+        );
+    }
 }

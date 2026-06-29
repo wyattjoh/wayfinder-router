@@ -1,0 +1,69 @@
+{
+  "description": "Static Python-derived heuristic judge verdicts.",
+  "cases": [
+    {
+      "prompt": "q",
+      "cheap": "",
+      "expensive": "The capital of France is Paris.",
+      "sufficient": false,
+      "reason": "cheap arm refused/empty while the dear arm answered",
+      "comparator": "refusal"
+    },
+    {
+      "prompt": "q",
+      "cheap": "42",
+      "expensive": "The capital of France is Paris.",
+      "sufficient": false,
+      "reason": "cheap arm refused/empty while the dear arm answered",
+      "comparator": "refusal"
+    },
+    {
+      "prompt": "q",
+      "cheap": "I can't help with that, sorry.",
+      "expensive": "The capital of France is Paris.",
+      "sufficient": false,
+      "reason": "cheap arm refused/empty while the dear arm answered",
+      "comparator": "refusal"
+    },
+    {
+      "prompt": "q",
+      "cheap": "",
+      "expensive": "   ",
+      "sufficient": null,
+      "reason": "both arms refused or returned no answer",
+      "comparator": "refusal"
+    },
+    {
+      "prompt": "q",
+      "cheap": "The capital of France is Paris.",
+      "expensive": "I'm unable to answer that.",
+      "sufficient": true,
+      "reason": "dear arm refused/empty while the cheap arm answered",
+      "comparator": "refusal"
+    },
+    {
+      "prompt": "q",
+      "cheap": "The capital of France is Paris.",
+      "expensive": "The capital of France is Paris.",
+      "sufficient": true,
+      "reason": "answers identical after normalization",
+      "comparator": "agreement"
+    },
+    {
+      "prompt": "q",
+      "cheap": "The capital of France is Paris.",
+      "expensive": "The capital of France is Paris!",
+      "sufficient": true,
+      "reason": "answers 0.97 similar (>= 0.80)",
+      "comparator": "similarity"
+    },
+    {
+      "prompt": "q",
+      "cheap": "The capital of France is Paris.",
+      "expensive": "The mitochondria is the powerhouse of the cell, an organelle.",
+      "sufficient": null,
+      "reason": "answers diverge (0.28 similar); heuristic cannot adjudicate",
+      "comparator": "divergence"
+    }
+  ]
+}

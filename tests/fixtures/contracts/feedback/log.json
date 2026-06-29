@@ -1,0 +1,12 @@
+{
+  "description": "Static Python-derived feedback JSONL row shape and validation messages.",
+  "rows": [
+    { "text": "hi", "label": "local" },
+    { "text": "café ∑", "label": "cloud" }
+  ],
+  "jsonl": "{\"text\": \"hi\", \"label\": \"local\"}\n{\"text\": \"café ∑\", \"label\": \"cloud\"}\n",
+  "errors": {
+    "empty_text": "feedback needs a non-empty prompt text",
+    "empty_label": "feedback needs a non-empty label"
+  }
+}
