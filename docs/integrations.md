@@ -1,13 +1,13 @@
 # Integration recipes
 
 Wayfinder's gateway speaks the OpenAI API, so almost anything that takes a custom
-`base_url` works with **one line of config** — no SDK, no plugin. Two rules cover
+`base_url` works with **one line of config** - no SDK, no plugin. Two rules cover
 nearly every tool:
 
-1. **Point `base_url` at the gateway** — `http://localhost:8088/v1` (or your host).
+1. **Point `base_url` at the gateway** - `http://localhost:8088/v1` (or your host).
    The gateway is path-tolerant, so the bare host (`http://localhost:8088`, no `/v1`)
    also works.
-2. **Use `auto` as the model** — that's the routing directive that means "let Wayfinder
+2. **Use `auto` as the model** - that's the routing directive that means "let Wayfinder
    decide." (You can also pin `prefer-local` / `prefer-hosted`, or a configured endpoint
    name, per request.) The API key can be any non-empty string unless you've put auth in
    front of the gateway; Wayfinder injects the real upstream key from its own config.
@@ -24,14 +24,14 @@ export OPENAI_API_KEY="unused"   # any non-empty value; the real key lives in th
 
 ## Chat UIs
 
-**Open WebUI** — Admin Settings → Connections → OpenAI → Add Connection, or via env:
+**Open WebUI** - Admin Settings → Connections → OpenAI → Add Connection, or via env:
 
 ```bash
 OPENAI_API_BASE_URL="http://localhost:8088/v1"
 OPENAI_API_KEY="unused"
 ```
 
-**LibreChat** — add a custom endpoint in `librechat.yaml`:
+**LibreChat** - add a custom endpoint in `librechat.yaml`:
 
 ```yaml
 endpoints:
@@ -44,17 +44,17 @@ endpoints:
         fetch: true   # auto-discover via /v1/models
 ```
 
-**Jan** — Settings → Model Providers → "+", set Base URL `http://localhost:8088/v1`, API
+**Jan** - Settings → Model Providers → "+", set Base URL `http://localhost:8088/v1`, API
 key `unused`, format **OpenAI**, model `auto`.
 
-**AnythingLLM** — LLM provider "Generic OpenAI": Base URL `http://localhost:8088/v1`,
+**AnythingLLM** - LLM provider "Generic OpenAI": Base URL `http://localhost:8088/v1`,
 API key `unused`, model `auto`.
 
 ---
 
 ## Editors / IDE assistants
 
-**Continue.dev** — `config.yaml`:
+**Continue.dev** - `config.yaml`:
 
 ```yaml
 models:
@@ -65,10 +65,10 @@ models:
     apiKey: unused
 ```
 
-**Cline** — provider **OpenAI Compatible**: Base URL `http://localhost:8088/v1` (note: the
+**Cline** - provider **OpenAI Compatible**: Base URL `http://localhost:8088/v1` (note: the
 `/v1`, not the full `/chat/completions` path), API key `unused`, Model ID `auto`.
 
-**Zed** — `settings.json`:
+**Zed** - `settings.json`:
 
 ```json
 { "language_models": { "openai_compatible": { "Wayfinder": {
@@ -76,11 +76,11 @@ models:
 } } } }
 ```
 
-**JetBrains AI Assistant** — Settings → Tools → AI Assistant → Providers & API keys → set a
+**JetBrains AI Assistant** - Settings → Tools → AI Assistant → Providers & API keys → set a
 custom OpenAI-compatible Base URL `http://localhost:8088/v1` and Test Connection.
 
 > **Cursor / VS Code Copilot caveat.** Both honor a custom OpenAI base URL only for their
-> **chat/plan** panels — autocomplete, inline edit, Composer, and "apply" stay on the
+> **chat/plan** panels - autocomplete, inline edit, Composer, and "apply" stay on the
 > vendor's own backend and cannot be routed through Wayfinder. Use them for chat; don't
 > expect inline-completion traffic to flow through the gateway.
 
@@ -88,26 +88,26 @@ custom OpenAI-compatible Base URL `http://localhost:8088/v1` and Test Connection
 
 ## Agent frameworks
 
-**OpenAI SDK (Python / JS)** — set `base_url` / `baseURL`, or just the env pair above:
+**OpenAI SDK (Python / JS)** - set `base_url` / `baseURL`, or just the env pair above:
 
 ```python
 client = openai.OpenAI(base_url="http://localhost:8088/v1", api_key="unused")
 ```
 
-**LangChain** — `ChatOpenAI(model="auto", base_url="http://localhost:8088/v1", api_key="unused")`
+**LangChain** - `ChatOpenAI(model="auto", base_url="http://localhost:8088/v1", api_key="unused")`
 (or the `OPENAI_BASE_URL` env var).
 
-**LlamaIndex** — use `OpenAILike` (the base `OpenAI` class is pinned to GPT model names):
+**LlamaIndex** - use `OpenAILike` (the base `OpenAI` class is pinned to GPT model names):
 
 ```python
 from llama_index.llms.openai_like import OpenAILike
 llm = OpenAILike(model="auto", api_base="http://localhost:8088/v1", api_key="unused")
 ```
 
-**CrewAI** — `LLM(model="openai/auto", base_url="http://localhost:8088/v1", api_key="unused")`
+**CrewAI** - `LLM(model="openai/auto", base_url="http://localhost:8088/v1", api_key="unused")`
 (the `openai/` prefix is required).
 
-**AutoGen** — custom endpoints need an explicit capability dict:
+**AutoGen** - custom endpoints need an explicit capability dict:
 
 ```python
 OpenAIChatCompletionClient(
@@ -116,9 +116,9 @@ OpenAIChatCompletionClient(
 )
 ```
 
-**OpenAI Agents SDK (Python)** — `set_default_openai_client(AsyncOpenAI(base_url="http://localhost:8088/v1", api_key="unused"))`, or the `OPENAI_BASE_URL` env var.
+**OpenAI Agents SDK (Python)** - `set_default_openai_client(AsyncOpenAI(base_url="http://localhost:8088/v1", api_key="unused"))`, or the `OPENAI_BASE_URL` env var.
 
-**Vercel AI SDK** — `createOpenAICompatible({ name: "wayfinder", baseURL: "http://localhost:8088/v1", apiKey: "unused" })` from `@ai-sdk/openai-compatible`.
+**Vercel AI SDK** - `createOpenAICompatible({ name: "wayfinder", baseURL: "http://localhost:8088/v1", apiKey: "unused" })` from `@ai-sdk/openai-compatible`.
 
 ---
 
@@ -140,10 +140,10 @@ export COPILOT_PROVIDER_API_KEY="unused"
 export COPILOT_MODEL="auto"
 ```
 
-**Claude Code** — Claude Code speaks Anthropic's Messages API, so it can't use the OpenAI
+**Claude Code** - Claude Code speaks Anthropic's Messages API, so it can't use the OpenAI
 `base_url` rule above. Instead the gateway exposes a first-class `POST /v1/messages` adapter
 (WF-DESIGN-0011) that translates Anthropic ⇄ OpenAI in both directions, including streaming
-and tool use. Point `ANTHROPIC_BASE_URL` at the gateway *root* (no `/v1` suffix — the client
+and tool use. Point `ANTHROPIC_BASE_URL` at the gateway *root* (no `/v1` suffix - the client
 appends `/v1/messages`):
 
 ```bash
@@ -155,7 +155,7 @@ claude
 Wayfinder scores each turn and routes it to the configured tier; the inbound Claude model id
 is ignored in favour of the routing decision (send a configured endpoint name to pin). The
 same `x-wayfinder-router-*` decision headers and budget/failover behaviour apply as on the
-OpenAI endpoint — it is the one router (WF-ADR-0001). Image/vision blocks and extended
+OpenAI endpoint - it is the one router (WF-ADR-0001). Image/vision blocks and extended
 thinking are not translated yet (WF-DESIGN-0011).
 
 ---
@@ -164,7 +164,7 @@ thinking are not translated yet (WF-DESIGN-0011).
 
 - **Streaming** works end to end: send `stream: true` and the gateway relays Server-Sent
   Events as they arrive.
-- **Tool calling / vision** depend on the *upstream* model you route to, not on Wayfinder —
+- **Tool calling / vision** depend on the *upstream* model you route to, not on Wayfinder -
   the gateway forwards your request body unchanged (plus the resolved model id).
 - **Per-request overrides** travel as headers (e.g. `X-Wayfinder-Threshold`), so you can
   tune routing without changing client config.

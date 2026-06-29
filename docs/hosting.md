@@ -1,18 +1,18 @@
 # Hosting a Wayfinder demo
 
 Two ways to put a "try it live" Wayfinder in front of people. The recipe below is the
-quick one — a **decision-only gateway in a container**. For a zero-server, zero-cost
+quick one - a **decision-only gateway in a container**. For a zero-server, zero-cost
 static demo (the scorer compiled into the browser), see
 [WF-DESIGN-0002](../designs/WF-DESIGN-0002-static-serverless-demo.md).
 
 ## Why decision-only
 
-The whole pitch — route (`● LOCAL` / `◆ CLOUD`), structural score, *why*, cost saved, the
-live threshold slider — is computed by the deterministic scorer with **no model call and no
+The whole pitch - route (`● LOCAL` / `◆ CLOUD`), structural score, *why*, cost saved, the
+live threshold slider - is computed by the deterministic scorer with **no model call and no
 keys** (WF-ADR-0001). So host the gateway in `--dry-run`: it serves `/demo` and answers the
 routing decision without ever calling an upstream. That means **no keys, no spend, no abuse
 surface** (it can't run up a bill because it never calls a paid model), and it's the honest
-core of the product — "no model call to decide."
+core of the product - "no model call to decide."
 
 ## The recipe (dry-run container)
 
@@ -32,11 +32,8 @@ docker run --rm -p 8088:8088 wayfinder-demo \
 
 - Bind `0.0.0.0` (the image already does) so the container is reachable.
 - `/healthz` is a cheap health check for the platform.
-- It's **stateless** — demo threads live in the browser's localStorage (WF-ADR-0026) — so a
+- It's **stateless**: demo threads live in the browser's localStorage (WF-ADR-0026), so a
   single small instance is enough and restarts/scale-out are free.
-
-The Python/PyPI package remains available for legacy commands and the Python API,
-but the current container image does not install Python gateway dependencies.
 
 Deploy that container to anything that runs one: Fly.io, Render, Railway, Cloud Run, or a
 small VPS. The dry-run scorer is microseconds of pure CPU and `/demo` is one small HTML page,
@@ -49,21 +46,21 @@ The resource footprint is tiny; the cost is really about the platform's pricing 
 
 | Path | Cost | Catch |
 | --- | --- | --- |
-| Static + WASM/JS (WF-DESIGN-0002) | **$0, forever** | no cold start, infinite scale — but needs the client-side scorer build |
+| Static + WASM/JS (WF-DESIGN-0002) | **$0, forever** | no cold start, infinite scale - but needs the client-side scorer build |
 | Cloud Run / HF Spaces (free tier) | ~$0 for bursty traffic | scales-to-zero → **cold start** on the first hit; pre-warm before posting |
-| Render / Railway (free) | $0 | sleeps after ~15 min idle — worst case for a launch spike |
-| $5 VPS, or a warm Render/Fly instance | **~$4–7/mo** | none — always warm, survives the front-page hug |
+| Render / Railway (free) | $0 | sleeps after ~15 min idle - worst case for a launch spike |
+| $5 VPS, or a warm Render/Fly instance | **~$4–7/mo** | none - always warm, survives the front-page hug |
 
 For a launch window, the simplest reliable option is **a ~$5/mo warm instance** (cancel it
 after); the genuinely-free-and-robust option is the **static/WASM demo** in WF-DESIGN-0002.
-Avoid the sleep-after-15-min free tiers — the cold start lands exactly when the post does.
+Avoid the sleep-after-15-min free tiers - the cold start lands exactly when the post does.
 
 ## If you must show real replies
 
 A demo that returns model output needs keys and therefore guardrails. Run the gateway
 **without** `--dry-run`, with `[gateway.models]` configured, and:
 
-- keys via the platform's secret store (env vars, per `api_key_env` — never baked into the
+- keys via the platform's secret store (env vars, per `api_key_env` - never baked into the
   image);
 - a hard **budget cap** on the provider account;
 - **per-IP rate limiting** and a small context/token cap at the proxy;

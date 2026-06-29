@@ -5,13 +5,13 @@
   <img alt="Wayfinder" src="docs/banner-light.png" width="640">
 </picture>
 
-<p><strong>Deterministic prompt-complexity routing — send each prompt to your
+<p><strong>Deterministic prompt-complexity routing - send each prompt to your
 local or cloud model, offline, with no model call to decide.</strong></p>
 
 <p>
   <a href="#quickstart">Quickstart</a> ·
-  <a href="benchmarks/README.md">Benchmark</a> ·
-  <a href="#how-it-compares">How it compares</a> ·
+  <a href="#command-reference">Commands</a> ·
+  <a href="#deploy-and-integrate">Deploy</a> ·
   <a href="EXPLAINER.md">Explainer</a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>
@@ -20,19 +20,15 @@ local or cloud model, offline, with no model call to decide.</strong></p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
   <a href="https://github.com/wyattjoh/wayfinder-router/actions/workflows/ci.yml"><img src="https://github.com/wyattjoh/wayfinder-router/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/core-Rust-dea584.svg?logo=rust&logoColor=white" alt="Rust core">
-  <a href="https://pypi.org/project/wayfinder-router/"><img src="https://img.shields.io/pypi/v/wayfinder-router.svg?label=upstream%20pypi" alt="Upstream PyPI"></a>
 </p>
 
 </div>
 
-> **Fork notice.** This is a Rust-focused fork of
-> [`itsthelore/wayfinder-router`](https://github.com/itsthelore/wayfinder-router). The routing
-> and scoring core, the OpenAI/Anthropic gateway, and the terminal chat are reimplemented in
-> Rust (under [`crates/`](crates)). The original Python package
-> ([`wayfinder_router/`](wayfinder_router)) stays in the tree for the parts not yet ported:
-> the calibration toolchain (`calibrate` / `recalibrate` / `onboard` / `judge`), the local web
-> UI, the upstream PyPI library API, and the CLI commands that have not moved to Rust. See
-> [Repository layout](#repository-layout) for the split.
+> **Fork notice.** This is a Rust fork of
+> [`itsthelore/wayfinder-router`](https://github.com/itsthelore/wayfinder-router).
+> The routing and scoring core, OpenAI/Anthropic gateway, calibration tools,
+> terminal chat, browser demo, local tuning UI, onboarding loop, automated judge,
+> and operator commands are implemented in Rust under [`crates/`](crates).
 
 <table align="center">
 <tr>
@@ -46,292 +42,159 @@ local or cloud model, offline, with no model call to decide.</strong></p>
 </table>
 
 Wayfinder looks at a prompt's structure (length, headings, lists, code) and its
-wording (proofs, math, hard constraints), then tells you whether to send it to your
-small local model or your big cloud one. It decides in microseconds, runs offline,
-and never calls another model to make the call: no API key, no network, no model
-call to decide. You get a score and a recommendation, and what you do with it is up
-to you.
+wording (proofs, math, hard constraints), then tells you whether to send it to a
+small local model or a larger cloud model. It decides in microseconds, runs
+offline, and never calls another model to make the call. You get a score and a
+recommendation, and your gateway or client decides where the request goes.
 
-Cheap prompts stay local and hard ones go to the expensive model, so you stop paying
-top-tier prices for "summarize this" and "fix my typo."
-
-## How it compares
-
-Most routers decide by calling a model: a trained classifier, an LLM judge, or a
-hosted API. That adds latency, cost, and randomness to the exact step meant to save
-you money. Wayfinder reads structure and wording instead, so the decision is free
-and the same every time.
-
-| router | decides by | model call? | self-host | calibrate |
-| --- | --- | :-: | :-: | :-: |
-| **Wayfinder** | deterministic structural score | **no** | **yes** | **yes** |
-| RouteLLM | trained classifier (preference data) | yes | yes | retrain |
-| NotDiamond / Martian | learned, hosted | yes | no | via platform |
-| OpenRouter (Auto) | hosted auto-router | yes | no | — |
-| Bifrost / LiteLLM | provider gateway (not complexity-routed) | no | yes | n/a |
-
-The gateways in the last two rows (OpenRouter, Bifrost, LiteLLM) answer a different
-question: *which provider* serves a call, by price, availability, and failover.
-Wayfinder answers *which tier a prompt deserves*: cheap vs expensive, by difficulty,
-decided offline. The two compose. Run Wayfinder to make the cheap-vs-expensive call,
-and a gateway underneath to reach the providers.
-
-Wayfinder is not chasing a top accuracy number. What it gives you is a routing
-decision you can run offline, with no model call, and tune on your own traffic. By
-default it scores prompt *structure* only. It can also read lexical cues (proofs,
-math, constraints), but those ship **off by default**: a
-[double-blind test](benchmarks/blind-eval.md) on independently-authored prompts
-showed the lexical lift does *not* generalize (it catches ~20% of unseen hard
-prompts and loses to a plain word-count baseline), so they are opt-in. Raise their
-weights only if you've calibrated them to your own traffic's vocabulary. A prompt
-whose difficulty is purely semantic (a subtle code snippet, an innocent-looking
-"what is the 100th prime number?") has no structural tell, and a semantic router
-will beat it there. What holds up under the blind test is the part to rely on: a
-deterministic, sub-millisecond, offline routing decision with no model call. The
-[benchmark](benchmarks/README.md) (`make benchmark`) shows where it wins and where
-it loses, against honest baselines and a perfect oracle. Point it at RouterBench or
-RouterArena for graded numbers.
-
-New here, or weighing it up? The [FAQ](docs/faq.md) gives straight answers —
-including where it loses (it's no better than random on RouterBench's short-but-hard
-items) and why you'd still run it.
-
-## Try the demo (no keys)
-
-Two ways to see the routing decision for yourself — no API keys, no models, nothing on the network.
-
-**In your terminal**, a decision-first chat in the Wayfinder palette. The Rust port
-builds the current TUI surface from source:
-
-```bash
-cargo run --bin wayfinder-router -- chat --dry-run --why "Summarise this in one sentence."
-# or after `cargo build --release --bin wayfinder-router`:
-./target/release/wayfinder-router chat --dry-run "What is DNS?"
-```
-
-![Wayfinder terminal chat — a routed prompt, the decision, the reply, and the running savings](docs/tui-chat.png)
-
-The current Rust TUI prints the prompt, route, score, and mode. Add `--why` for
-the feature breakdown, pass prompt text as arguments or stdin, and use `/route`,
-`/local`, `/cloud`, `/auto`, `/threads`, `/load <id>`, and `/save <id>` in scripted
-or piped input.
-
-**In your browser**, the Rust gateway serves the same `/demo` page. Run it in
-decision-only mode when you want zero keys and no upstream calls:
-
-```bash
-cargo run --bin wayfinder-router -- serve --host 127.0.0.1 --port 8088 --dry-run
-# open http://127.0.0.1:8088/demo
-```
-
-`serve` is the supported Rust gateway command. It exposes `/healthz`,
-`/v1/chat/completions`, `/v1/messages`, `/v1/models`, `/metrics`, `/router`, and `/demo`.
-With `--dry-run`, the gateway returns routing decisions without calling upstream models.
-
-The PyPI package is still present for legacy Python API users and Python-only commands
-that have not moved to Rust yet, including `route`, `calibrate`, `init`, `doctor`, `ui`,
-`onboard`, `judge`, and `recalibrate`. The current Rust support is intentionally limited
-to the gateway service and TUI.
-
-## Works with any OpenAI-compatible API
-
-Wayfinder forwards each call to an OpenAI-style `/chat/completions` endpoint — so if
-your provider speaks that (and most do), **it just works.** A tier is one `base_url`,
-a model name, and a key read from the environment at request time; no SDK, no
-per-provider code. Pair a free local model with a hosted one, or run two cloud tiers.
-
-<div align="center">
-
-![OpenAI](https://img.shields.io/badge/OpenAI-412991?logo=openai&logoColor=white)
-&nbsp;
-![Claude](https://img.shields.io/badge/Claude-D97757?logo=anthropic&logoColor=white)
-&nbsp;
-![Gemini](https://img.shields.io/badge/Gemini-1C69FF?logo=googlegemini&logoColor=white)
-&nbsp;
-![Mistral](https://img.shields.io/badge/Mistral-FA520F?logo=mistralai&logoColor=white)
-&nbsp;
-![Ollama](https://img.shields.io/badge/Ollama-000000?logo=ollama&logoColor=white)
-
-<sub>…plus Groq, Together, OpenRouter, Fireworks, DeepSeek, and local servers
-(vLLM, LM Studio, llama.cpp) — <strong>+ any OpenAI-compatible endpoint</strong>
-that takes a Bearer key.</sub>
-
-</div>
+Cheap prompts stay local and hard ones go to the expensive model, so you stop
+paying top-tier prices for "summarize this" and "fix my typo."
 
 ## Quickstart
 
-Put Wayfinder in front of your models. Your app keeps speaking the OpenAI API; you
-just change one `base_url`.
+Put Wayfinder in front of your models. Your app keeps speaking the OpenAI API;
+you only change the `base_url`.
 
-1. Describe your two models in `wayfinder-router.toml`:
-
-   ```toml
-   [routing]
-   threshold = 0.5            # below -> local, at/above -> cloud
-
-   [gateway.models.local]
-   base_url = "http://localhost:11434/v1"
-   model = "llama3.2"
-
-   [gateway.models.cloud]
-   base_url = "https://api.openai.com/v1"
-   model = "gpt-4o"
-   api_key_env = "OPENAI_API_KEY"   # read from this env var, never stored
-   # api_key_cmd = "op read op://Private/OpenAI/credential"  # optional: fill it from a vault
-   ```
-
-   Wayfinder never stores secrets: a model names an env var (`api_key_env`) and the key
-   is read from your environment at request time. There is nothing to "install" — just
-   export the variable. Prefer not to paste a raw key into your shell? Add an optional
-   `api_key_cmd` and Wayfinder fills that variable from your secret store at startup —
-   `op read …` (1Password), `security …` (macOS Keychain), `secret-tool …` (Linux),
-   `pass`/`gopass`, `vault kv get …`, `aws secretsmanager get-secret-value …`, `bw`,
-   `doppler`, `gcloud secrets …`, or any command that prints the secret. The key is held
-   in memory only, still never written to disk.
-
-   Legacy Python package users can still run `wayfinder-router init` and
-   `wayfinder-router doctor` from the PyPI CLI to scaffold and inspect this file.
-
-2. Set your key(s), then run the gateway. Legacy Python package users can run
-   `wayfinder-router doctor` first to check whether each model's key resolves:
+1. Build the Rust CLI:
 
    ```bash
-   export ANTHROPIC_API_KEY=sk-...     # or OPENAI_API_KEY, per your config
-   cargo run --bin wayfinder-router -- serve --port 8088
-   # or: ./target/release/wayfinder-router serve --port 8088
+   cargo build --release --bin wayfinder-router
    ```
 
-3. Point your existing client at it. No code change:
+2. Scaffold a starter config:
 
-   ```python
-   client = openai.OpenAI(base_url="http://localhost:8088/v1", api_key="unused")
-   client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "..."}])
+   ```bash
+   ./target/release/wayfinder-router init --preset hybrid
+   ./target/release/wayfinder-router doctor
    ```
 
-Easy prompts go local, hard ones go cloud, and every response carries
-`x-wayfinder-router-model` and `x-wayfinder-router-score` so you can see where it
-went. Want to force a tier for one request? Set `model="local"` or `"cloud"` (or
-`prefer-local` / `prefer-hosted`), move the cut for a single call with an
-`X-Wayfinder-Threshold` header, or start a chat message with `/local` or `/cloud`
-(see [Steer a single request](#steer-a-single-request)).
+   `init` writes `wayfinder-router.toml` and `.env.example`. It stores only
+   environment variable names in config, never raw secrets.
 
-Check it's working:
+3. Set the key variables named by your config, then start the gateway:
+
+   ```bash
+   export OPENAI_API_KEY="sk-..."
+   ./target/release/wayfinder-router serve --port 8088
+   ```
+
+4. Point an OpenAI-compatible client at the gateway:
+
+   ```bash
+   export OPENAI_BASE_URL="http://localhost:8088/v1"
+   export OPENAI_API_KEY="unused"
+   ```
+
+Requests with `model: "auto"` are scored and routed. Use `model: "local"`,
+`model: "cloud"`, `model: "prefer-local"`, or `model: "prefer-hosted"` to pin a
+single request.
+
+Check that it is running:
 
 ```bash
-curl -s localhost:8088/healthz
-# {"status":"ok","models":["cloud","local"]}
+curl -s http://localhost:8088/healthz
 
 curl -s -D - -o /dev/null http://localhost:8088/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"auto","messages":[{"role":"user","content":"hi"}]}' \
   | grep -i x-wayfinder-router
-# x-wayfinder-router-model: local
-# x-wayfinder-router-score: 0.00
 ```
 
-No backends yet? `wayfinder-router serve --dry-run` answers with the routing
-decision instead of calling an upstream, so you can feel the routing in 30 seconds
-before wiring up real models.
+No backends yet? Use `serve --dry-run` to return routing decisions without
+calling upstream models.
+
+## Try The Demo
+
+Run a terminal decision preview with no keys and no upstream calls:
+
+```bash
+cargo run --bin wayfinder-router -- chat --dry-run --why "Summarise this in one sentence."
+```
+
+![Wayfinder terminal chat, a routed prompt, the decision, the reply, and the running savings](docs/tui-chat.png)
+
+Run the browser demo from the Rust gateway:
+
+```bash
+cargo run --bin wayfinder-router -- webchat --dry-run --port 8088
+# open http://127.0.0.1:8088/demo
+```
+
+`webchat` starts the same gateway as `serve`, points the browser at `/demo`, and
+can run in `--dry-run` mode for a decision-only public demo.
 
 ## Install
 
+Wayfinder is a Rust workspace. The supported local install path is the Rust
+binary built from this repository:
+
 | command | what you get |
 | --- | --- |
-| `cargo build --release --bin wayfinder-router` | current Rust CLI binary with `serve` and `chat` |
-| `./target/release/wayfinder-router serve --port 8088` | Rust OpenAI-compatible gateway service |
-| `./target/release/wayfinder-router chat --dry-run "hello"` | Rust TUI routing preview with no keys |
-| `docker build -t wayfinder-router .` | container image that builds and runs the Rust gateway binary |
-| `pip install wayfinder-router` | scorer, CLI, Python API, **and the terminal chat** (`chat`); the scorer/library imports stay dependency-light |
-| `pip install "wayfinder-router[gateway]"` | adds the OpenAI-compatible routing gateway, the common case for serving |
-| `pip install "wayfinder-router[ui]"` | adds the local calibrate / explain / configure UI |
-| `pip install "wayfinder-router[all]"` | gateway and UI on top of the default install |
+| `cargo build --release --bin wayfinder-router` | the complete Rust CLI |
+| `./target/release/wayfinder-router route prompt.md` | offline prompt scoring |
+| `./target/release/wayfinder-router serve --port 8088` | OpenAI/Anthropic-compatible routing gateway |
+| `./target/release/wayfinder-router chat` | terminal chat UI |
+| `./target/release/wayfinder-router ui --port 8099` | local explain, calibrate, configure, onboard, and recalibrate UI |
+| `docker build -t wayfinder-router .` | container image for the Rust gateway binary |
 
-The Rust CLI is not a public Rust library promise. The supported Rust surfaces are
-the gateway service (`serve`) and the TUI (`chat`). The Python/PyPI package remains
-available for the Python API and for legacy commands that are not yet implemented
-in Rust.
+The release workflow packages the Rust CLI. The Dockerfile builds and runs the
+same binary.
 
-## How it works
+## Command Reference
 
-Wayfinder sits behind whatever OpenAI-compatible client you already use. You point
-that client's `base_url` at the gateway once, and from then on it is invisible. The
-same client serves a request whether it routes local or hosted.
+Every command below is served by the Rust `wayfinder-router` binary.
+
+| command | purpose |
+| --- | --- |
+| `route <prompt\|->` | Score a prompt from a file or stdin and recommend a model. Use `--json`, `--explain`, or `--threshold <0..1>`. |
+| `calibrate <dataset>` | Turn labeled JSONL (`{"text": "...", "label": "local"}`) into routing config. Supports `--mode threshold|tiers|classifier`, cost-aware objectives, custom weights, and `--out`. |
+| `serve` | Run the OpenAI/Anthropic-compatible gateway. Supports `--host`, `--port`, `--dry-run`, and `--timeout`. |
+| `chat [prompt]` | Open the terminal chat UI, or print a scriptable transcript when a prompt or stdin is supplied. Supports `--dry-run`, `--why`, `--theme`, `--base-url`, `--thread-dir`, and `--no-stream`. |
+| `ui` | Run the local web UI for explain, calibration, config editing, onboarding, and recalibration. |
+| `webchat` | Run the gateway and open `/demo`. Supports the same bind and dry-run options as `serve`, plus `--no-open`. |
+| `onboard <prompts>` | A/B configured gateway arms, ask which output is good enough, append labels, and optionally emit calibrated config with `--calibrate`. |
+| `judge <prompts>` | Auto-label prompts by comparing two tiers behind trust checks. Supports `--gold`, `--kappa-floor`, `--folds`, `--limit`, and `--save-comparisons`. |
+| `recalibrate` | Re-fit a config from the feedback log, preserving gateway settings. Supports `--log`, `--out`, `--mode`, and `--min-labels`. |
+| `init` | Scaffold `wayfinder-router.toml` and `.env.example` from `hybrid`, `openai`, or `gemini` presets. |
+| `doctor` | Check config discovery, routing mode, gateway models, and key readiness. |
+| `keys new` | Mint a virtual API key for `[gateway.keys.<id>]`; only the hash is stored in config. |
+
+Use `wayfinder-router --help` or `wayfinder-router <command> --help` for exact
+flags.
+
+## How It Works
+
+Wayfinder sits behind whatever OpenAI-compatible client you already use:
 
 ```text
-  your client   (chat app, IDE, agent, or code)
+  your client
        |
        v
-  Wayfinder gateway   scores, picks a model
+  Wayfinder gateway scores, picks a model
        |
-       |-- low  -->  local    (Ollama, vLLM)
-       |-- high -->  hosted   (OpenAI, any /v1)
+       |-- low score  -> local endpoint
+       |-- high score -> hosted endpoint
        |
        v
-  response returns via the same client,
+  response returns through the same client,
   with x-wayfinder-router-* headers
 ```
 
-A few things follow from this:
+The interface in front is yours: a chat GUI, IDE assistant, agent framework, CLI,
+or application code. The local and hosted models are just upstream endpoints with
+model ids and key environment variables.
 
-- **The interface in front is yours.** A chat GUI (Open WebUI, LibreChat), an IDE
-  assistant with a custom endpoint (Cursor, Continue), an agent framework, or your
-  own code on the OpenAI SDK. Want a chat window today? Put Open WebUI in front and
-  point it at the gateway.
-- **Local and hosted are backends, not apps.** The local model is just a server
-  (Ollama, LM Studio, vLLM, llama.cpp) speaking OpenAI's `/v1`; the hosted one is
-  the same shape. The user never switches UIs and usually never knows which model
-  answered.
-- **The score is computed, not a second opinion.** Asking a model how hard a
-  prompt is would be slow, non-deterministic, and would cost a model call to decide
-  whether to make a model call. Wayfinder scans the prompt instead — structure
-  (length, headings, steps, links, code, tables) and difficulty cues in the wording
-  (reasoning terms, math symbols, constraints) — into a `0.0`-`1.0` value and
-  compares it to your threshold. Same prompt, same threshold, same answer. It is a
-  proxy for difficulty, not a verdict, which is why the threshold is yours to tune.
+The score is computed, not guessed by a second model. Wayfinder scans prompt
+structure and optional lexical cues into a `0.0` to `1.0` value and compares it to
+your threshold or tier rules. Same prompt, same config, same route.
 
-Keys are read from the environment at request time and never touch the config file
-or the scored path.
+## Configure Routing
 
-## Score a prompt from the CLI
+Wayfinder reads `wayfinder-router.toml`, found by walking up from the current
+directory. There are three routing modes, in precedence order: classifier, tiers,
+then threshold.
 
-```bash
-echo "Summarise this paragraph in one sentence." | wayfinder-router route -
-```
-
-```text
-Recommended Model: local
-Complexity Score: 0.00  (mode: tiered)
-
-Tiers:
-  >= 0.00  local <-
-  >= 0.50  cloud
-
-Contributing Features:
-  Word Count: 6
-  ...
-```
-
-Add `--json` for machine consumers (an agent reads this and routes to its own
-model):
-
-```json
-{
-  "schema_version": "3",
-  "score": 0.66,
-  "recommendation": "cloud",
-  "mode": "tiered",
-  "features": { "word_count": 545, "heading_count": 12, "reasoning_term_count": 3, "...": 0 },
-  "tiers": [{ "min_score": 0.0, "model": "local" }, { "min_score": 0.5, "model": "cloud" }]
-}
-```
-
-## Configure routing
-
-Wayfinder reads its own `wayfinder-router.toml`, found by walking up from where you
-run it. There are three modes, in precedence order (classifier > tiers >
-threshold); the scalar-score `weights` apply to any of them.
-
-**Binary** (the default) is a single cut:
+Binary routing uses one cut:
 
 ```toml
 [routing]
@@ -339,65 +202,47 @@ threshold = 0.6
 weights = { word_count = 4.0, list_item_count = 2.5 }
 ```
 
-`--threshold N` overrides it for one run; `WAYFINDER_ROUTER_THRESHOLD` overrides it
-from the environment.
-
-To switch the lexical cues on, raise their `weights` and cut at the knee — the one
-held-out improvement over the structural default on real frontier traffic (skill
-−0.038 → +0.057, 61% cost saved on RouterBench). See
-[`docs/lexical-routing.md`](docs/lexical-routing.md) and the ready-to-edit
-[`examples/wayfinder-router.lexical.toml`](examples/wayfinder-router.lexical.toml);
-recalibrate the threshold to your own traffic (a ~20-prompt bootstrap is only a smoke
-test — see [`benchmarks/calibration-eval.md`](benchmarks/calibration-eval.md)).
-
-**Tiered** routes ordered score bands to any number of models:
+Tiered routing maps score bands to model names:
 
 ```toml
 [[routing.tiers]]
 min_score = 0.0
 model = "llama-3b"
-[[routing.tiers]]
-min_score = 0.3
-model = "llama-70b"
+
 [[routing.tiers]]
 min_score = 0.6
 model = "claude-cloud"
 ```
 
-**Classifier** is a fitted multinomial-logistic model, `argmax` over per-model
-linear scores. You usually generate it with `calibrate` rather than write it by
-hand.
+Gateway models map those route names to upstream endpoints:
 
-Each `[gateway.models.<name>]` block maps a routed name to an upstream `base_url`, a
-`model`, and an optional `api_key_env` (the name of an environment variable, never
-the secret itself). The gateway is the only part that touches keys or the network;
-the scorer, config, and calibrator stay pure and offline.
+```toml
+[gateway.models.local]
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
 
-## Calibrate on your data
+[gateway.models.cloud]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o"
+api_key_env = "OPENAI_API_KEY"
+```
 
-The cut is a proxy, so tune it against your own traffic. `wayfinder-router
-calibrate` reads a labeled JSONL dataset (`{"text": ..., "label": ...}`) and prints
-a config fragment. It runs offline and never calls a model; the labels are your
-ground truth.
+Add `api_key_cmd` when you want the gateway to read a secret from a local secret
+store at startup. The command output is held in memory and is never written back
+to config.
+
+## Calibrate On Your Data
+
+The cut is a proxy, so tune it against your own traffic. `calibrate` reads a
+labeled JSONL dataset and prints a config fragment:
 
 ```bash
-wayfinder-router calibrate data.jsonl --mode threshold              # sweep the binary cut
-wayfinder-router calibrate data.jsonl --mode tiers                  # ordinal multi-model
+wayfinder-router calibrate data.jsonl --mode threshold
+wayfinder-router calibrate data.jsonl --mode tiers --models local,cloud
 wayfinder-router calibrate data.jsonl --mode classifier --out wayfinder-router.toml
 ```
 
-The fragment drops straight into `wayfinder-router.toml`; the accuracy and chosen
-breakpoints print to stderr. The classifier is fit by deterministic L2-regularized
-Newton/IRLS, pure Python, converging in a handful of iterations.
-
-To pick a cut in cost terms instead of bare accuracy, use a cost-aware objective.
-`--objective knee` chooses the cost-aware knee automatically (it maximizes
-quality-recovered × cost-saved — no target to guess, and it can't collapse to
-always-routing-to-the-expensive-model the way pure accuracy does on skewed labels);
-`--objective cost-quality --target-savings X` instead holds a specific savings floor.
-Add `--weights` to score with — and emit — custom feature weights, e.g. the lexical
-opt-in, so the output is a complete, deployable config (see
-[`docs/lexical-routing.md`](docs/lexical-routing.md)):
+Use a cost-aware objective when you care about savings as well as accuracy:
 
 ```bash
 wayfinder-router calibrate data.jsonl --mode threshold --objective knee \
@@ -405,266 +250,110 @@ wayfinder-router calibrate data.jsonl --mode threshold --objective knee \
   --weights reasoning_term_count=5,math_symbol_count=3,constraint_term_count=1.5
 ```
 
-Cost is metadata only — it shapes the calibrated cut and is reported on the
-`/metrics` endpoint, but never enters a per-request decision, which stays
-deterministic and free.
+The calibrator runs offline. Cost is metadata for choosing a cut and reporting
+savings, not a per-request input to the live route.
 
-### Steer a single request
+## Learn From Feedback
 
-The deployment's config sets the default boundary, but a client can override the
-decision for one request over plain OpenAI transport. An override only changes
-where the request goes; the prompt is still scored, and nothing adds a model call.
+Collect labels, then recalibrate:
 
-- **The `model` field is a routing directive.** `auto` (or any normal model id)
-  lets Wayfinder decide; a configured endpoint name (`local`, `cloud`) pins the
-  request there; `prefer-local` / `prefer-hosted` pin to the low / high end of your
-  router (`prefer-cloud` still works as an alias of `prefer-hosted`).
-- **An `X-Wayfinder-Threshold` header re-cuts the decision** for that request, a
-  number in `0.0`-`1.0` reusing your weights (binary routers only).
-- **An in-message `/directive`** (opt-in: `[gateway] slash_directives = true`) lets a
-  plain chat box steer routing — start a message with `/local`, `/cloud`, `/prefer-hosted`,
-  or `/auto` and it pins that turn (stripped before the model sees it). Only known
-  directives are acted on; anything else starting with `/` is left as ordinary text
-  (WF-ADR-0036).
+```bash
+curl http://localhost:8088/v1/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"text":"...","label":"cloud"}'
 
-```python
-# Pin one call to cloud regardless of score:
-client.chat.completions.create(model="cloud", messages=[...])
-# Or move the cut for one call (keep model="auto"):
-client.chat.completions.create(
-    model="auto", messages=[...], extra_headers={"X-Wayfinder-Threshold": "0.8"}
-)
+wayfinder-router recalibrate --min-labels 50
 ```
 
-Each response adds `x-wayfinder-router-mode` (`scored` / `pinned` /
-`threshold-override`) next to the `-model` and `-score` headers, so you can see
-which channel decided the route.
-
-## Drive it from a chat UI (no fork)
-
-Because the `model` field is a routing directive, any OpenAI-compatible chat UI can
-drive routing with no code change: the app's normal model dropdown becomes a
-per-conversation routing picker (`auto` / `prefer-local` / `prefer-hosted` / a
-pinned endpoint). The gateway lists these at `GET /v1/models`, so a UI discovers
-them on its own.
-
-- **LibreChat** — copy [`examples/librechat.yaml`](examples/librechat.yaml) and
-  [`examples/docker-compose.override.yml`](examples/docker-compose.override.yml)
-  into your checkout, run `docker compose up`, and pick the "Wayfinder" endpoint.
-- **Open WebUI** — add an OpenAI connection pointing at the gateway; it
-  auto-discovers the routing options.
-
-See [`examples/`](examples/) for both. The one thing a stock UI can't express is a
-live per-conversation threshold slider; that's what the `wayfinder-chat` fork adds,
-and this no-fork path proves it out first.
-
-## See where requests go
-
-Wayfinder's controls are spread across the tools you already run, so it's easy not
-to notice it working. Four surfaces show or steer routing:
-
-| surface | what it shows | where |
-| --- | --- | --- |
-| Model dropdown | the routing picker (`auto` / `prefer-local` / `prefer-hosted` / a pinned endpoint) | your client, from `GET /v1/models` |
-| Response headers | where each request went and why (`-model` / `-score` / `-mode` / `-request-id`) | every response |
-| Debug body field | the decision inside the response body, opt-in | request header `X-Wayfinder-Debug: true` |
-| Dashboard | recent decisions, per-model counts, scores — metadata only, never prompt text | `GET /router` (JSON at `/router/recent`) |
-
-The dashboard is separate from the off-path `wayfinder-router ui` console, which is
-for tuning, not production traffic.
-
-## Learn from feedback
-
-Don't guess the cut, learn it from your own judgment of local versus hosted output.
-The loop is: collect judgments, calibrate, route automatically.
-
-Bootstrap it with A/B onboarding. For each sample prompt, `wayfinder-router
-onboard` runs both arms and asks which was good enough; the answer is a label:
+Bootstrap labels manually with `onboard`:
 
 ```bash
 wayfinder-router onboard prompts.jsonl --arms local,cloud --calibrate > wayfinder-router.toml
 ```
 
-The comparison goes to stderr; `--calibrate` prints the resulting config to stdout.
-Each judgment appends a `{"text", "label"}` line to a feedback log, which is itself
-the `calibrate` dataset, so the log turns straight into a config.
-
-To skip the manual grading, let `wayfinder-router judge` label automatically. It runs
-both tiers and asks an automated judge *"was the cheaper tier good enough?"* — the same
-sufficiency question, no person in the loop:
+Or let `judge` compare two configured arms and emit labels only when trust checks
+pass:
 
 ```bash
 wayfinder-router judge prompts.jsonl --arms local,cloud --gold gold.jsonl > wayfinder-router.toml
 ```
 
-The built-in judge is a deterministic text comparator that **abstains** rather than guess
-when it can't tell. Because a bad label would silently degrade live routing, `judge` will
-only emit a config once it **passes trust gates** — agreement with your human-labeled
-`--gold` set (Cohen's κ ≥ 0.6), out-of-fold lift over the majority baseline, and both arms
-represented. If the gates fail it prints the confusion matrix and refuses (the labels are
-still recorded). Pass `--save-comparisons out.jsonl` to also keep the raw responses (off by
-default — it's a body store).
+`judge` runs upstream models through the gateway layer. The scorer remains pure
+and offline.
 
-Once you're routing automatically, keep it honest by recording which model was
-actually good enough:
+## Local UI
+
+Run the Rust web UI when you want a browser surface for tuning:
 
 ```bash
-curl localhost:8088/v1/feedback -d '{"text": "...", "label": "cloud"}'
+wayfinder-router ui --port 8099
+# open http://127.0.0.1:8099
 ```
 
-Then re-fit on a schedule from cron, a k8s CronJob, or a click in the UI.
-Recalibration rewrites only the `[routing]` section and preserves your `[gateway]`
-endpoints, and a running gateway hot-reloads the result with no restart:
+The UI exposes the same core operations as the CLI:
+
+- explain a prompt and see per-feature contributions
+- calibrate a pasted dataset
+- validate and save `wayfinder-router.toml`
+- run onboarding against configured gateway models
+- recalibrate from the feedback log
+
+## Deploy And Integrate
+
+Build and run the Rust gateway as a service, sidecar, or standalone container:
 
 ```bash
-wayfinder-router recalibrate                  # log -> calibrate -> write config
-wayfinder-router recalibrate --min-labels 50  # no-op until you have enough signal
+docker build -t wayfinder-router .
+docker run --rm -p 8088:8088 -v "$PWD/data:/data" wayfinder-router
+
+# or
+docker compose up gateway
 ```
 
-The judging runs models, so it lives in the gateway layer (with your key); the
-scoring core stays untouched and the log carries no secrets.
+Anything that speaks the OpenAI API can point at `http://localhost:8088/v1`,
+including chat UIs, IDE assistants, agent frameworks, and command-line tools. See
+[Integration recipes](docs/integrations.md) for concrete setup examples.
 
-## Deploy and integrate
-
-The gateway is the current production service surface. In production, prompts flow
-through the Rust gateway, so routing happens where prompts already are. The Python
-library remains available for in-process scoring in legacy Python integrations.
-
-Run the gateway as a service, sidecar or standalone:
+Claude Code speaks Anthropic's Messages API, so the gateway also exposes
+`POST /v1/messages`. Point `ANTHROPIC_BASE_URL` at the gateway root:
 
 ```bash
-docker build -t wayfinder-router . && docker run -p 8088:8088 -v "$PWD/data:/data" wayfinder-router
-# or: docker compose up gateway   # see docker-compose.example.yml
-```
-
-Point your existing client at it with no app change. Anything that speaks the
-OpenAI API takes a `base_url`, including agent frameworks (LangChain, LlamaIndex),
-IDE assistants with a custom endpoint (Cursor, Continue), and gateways like LiteLLM:
-
-```python
-client = openai.OpenAI(base_url="http://localhost:8088/v1", api_key="unused")
-```
-
-See **[Integration recipes](docs/integrations.md)** for copy-paste setup across chat UIs
-(Open WebUI, LibreChat, Jan), editors (Continue, Cline, Zed, JetBrains), agent frameworks
-(LangChain, LlamaIndex, CrewAI, AutoGen, the OpenAI Agents SDK, the Vercel AI SDK), and
-CLIs (aider, Copilot CLI) — plus the canonical `OPENAI_BASE_URL` / `OPENAI_API_KEY` pair.
-
-**Claude Code** speaks Anthropic's Messages API rather than OpenAI's, so the gateway exposes a
-`POST /v1/messages` adapter (WF-DESIGN-0011) that translates Anthropic ⇄ OpenAI in both
-directions — streaming and tool use included. Point it at the gateway root and Claude Code
-routes through Wayfinder like any other client:
-
-```bash
-export ANTHROPIC_BASE_URL="http://localhost:8088"   # client appends /v1/messages
-export ANTHROPIC_API_KEY="unused"                   # the gateway uses each upstream's own key
+export ANTHROPIC_BASE_URL="http://localhost:8088"
+export ANTHROPIC_API_KEY="unused"
 claude
 ```
 
-For the Rust gateway, wire your clients to the OpenAI-compatible or Anthropic-compatible
-routes and inspect routing through response headers, `/metrics`, `/router`, and
-`/router/recent`.
+The gateway exposes:
 
-Legacy Python package users can still wire feedback from wherever users are. Your
-app, IDE, or chat shows a thumbs-up or thumbs-down and posts the judgment; the next
-recalibration learns from it:
-
-```js
-fetch("http://localhost:8088/v1/feedback", {
-  method: "POST",
-  body: JSON.stringify({ text: prompt, label: wasGoodEnough ? "local" : "cloud" }),
-});
-```
-
-The Rust gateway forwards asynchronously and streams: a request with `stream: true`
-comes back as Server-Sent-Events, so chat clients render tokens as they arrive. An
-upstream timeout or connection failure returns an OpenAI-shaped error instead of a
-bare 500, every response carries a request id for tracing, and routing decisions
-are visible in headers and metrics. Current Rust gateway knobs:
-
-| setting | effect |
+| surface | purpose |
 | --- | --- |
-| `serve --timeout` | upstream timeout in seconds (default 60) |
-| `serve --dry-run` | return routing decisions without calling any upstream |
-| `GET /healthz` | reports service health and configured model ids |
-| `GET /router` | read-only dashboard of recent decisions, with `X-Wayfinder-Debug: true` surfacing one in the body |
-| `GET /metrics` | Prometheus text for decisions, upstream errors, cost counters, cache, rate limits, and key usage |
-| `[gateway.cache] enabled` / `ttl` / `max_entries` / `max_bytes` | exact-match response cache. Off by default; in-memory only. A hit is surfaced via `x-wayfinder-router-cache: hit\|miss`; disabling purges it (WF-ADR-0033) |
-| `[gateway] retries` / `breaker_threshold` / `breaker_cooldown` / `failover` plus per-model `fallbacks` / `context_window` | retry transient upstream failures, skip tripped targets, and serve configured same-tier fallbacks without recomputing the routing decision. Failover is surfaced via `x-wayfinder-router-served-by`, `x-wayfinder-router-failover`, and `wayfinder_router_failovers_total` (WF-ADR-0031) |
-| `[gateway.rate_limit] rpm` / `tpm` / `window` | cap requests-per-minute and/or upstream-tokens-per-minute over a fixed `window` (default 60s); on breach returns `429` with `Retry-After`. The outermost guardrail (checked before scoring); gateway-wide. Successful responses carry `X-RateLimit-Limit`/`-Remaining`/`-Reset` so clients can self-pace; surfaced via `x-wayfinder-router-rate-limit` and `wayfinder_router_rate_limited_total` (WF-ADR-0034) |
-| `[gateway.keys.<id>] hash` | virtual API keys: when any is set, `/v1/*` requires a valid `Authorization: Bearer` token (else `401`). Store only a SHA-256 hash. Requests are attributed via `wayfinder_router_key_requests_total` (WF-ADR-0035) |
+| `GET /healthz` | health and configured model ids |
+| `POST /v1/chat/completions` | OpenAI-compatible chat routing |
+| `POST /v1/messages` | Anthropic Messages adapter |
+| `GET /v1/models` | routing directives and configured model names |
+| `POST /v1/feedback` | label collection for recalibration |
+| `GET /router` and `/router/recent` | recent routing decisions, without prompt text in the dashboard |
+| `GET /metrics` | Prometheus metrics |
+| `GET /demo` | browser demo |
 
-Feedback, spend budgets, and key minting commands remain Python/PyPI surfaces
-until they are ported or retired.
+## Repository Layout
 
-## Explain and tune
-
-To see why a prompt routed where it did, ask for the per-feature breakdown: each
-feature's value, its normalized level, its weight, and its share of the score.
-
-```bash
-wayfinder-router route prompt.md --explain
-```
-
-For interactive tuning there's a local web UI:
-
-- **Explain** — paste a prompt; see the score, the tier ladder, and contribution
-  bars, and drag a threshold slider to watch routing change live.
-- **Calibrate** — paste a labeled dataset, run a mode, and see accuracy, the sweep
-  curve, and the resulting config fragment.
-- **Configure** — edit `wayfinder-router.toml` with live validation and save.
-- **Onboard** — A/B a local and a hosted model in the browser, judge each, and
-  calibrate from the log (needs `[gateway]` for the model calls).
-
-```bash
-pip install "wayfinder-router[ui]"
-wayfinder-router ui --port 8099    # then open http://localhost:8099
-```
-
-The UI is a thin wrapper over the same pure functions; it never calls a model, and
-no secret appears in it.
-
-## Python API
-
-```python
-from wayfinder_router import score_complexity, RoutingConfig, explain_score
-
-result = score_complexity(prompt_text, config=RoutingConfig.binary(threshold=0.7))
-print(result.recommendation, result.score, result.features)
-for fc in explain_score(result.features, RoutingConfig().weights):
-    print(fc.name, fc.contribution)
-```
-
-## Origin
-
-Wayfinder started as a `route` experiment inside a larger requirements tool and was
-split out because routing is a runtime concern, not a knowledge one: a prompt router
-shouldn't make you install an engine you don't need. The result is a small, focused
-tool whose scoring core stays dependency-free — you can `import wayfinder_router` and
-score prompts with nothing but the standard library (WF-ADR-0001, WF-ADR-0029).
-
-## Repository layout
-
-This fork's product is the Rust workspace. The Python package is upstream's, kept for the
-toolchain that has not been ported yet (see the Fork notice at the top).
-
-```
+```text
 wayfinder-router/
-  crates/             Rust workspace (the shipped product): the routing/scoring core,
-                      the OpenAI/Anthropic gateway service, the terminal chat (TUI), and
-                      the `wayfinder-router` CLI (serve + chat)
-  wayfinder_router/   upstream Python package: scorer, tiers + classifier, config
-                      loader/writer, offline calibration (Newton/IRLS), explain, the
-                      feedback log and onboarding harness, recalibration, CLI, and the
-                      local web UI. Still the PyPI library API and the parity oracle the
-                      Rust contract tests check against
-  crates/wayfinder-core/tests/contracts.rs   asserts the Rust core matches the Python
-                      golden snapshots in tests/fixtures/contracts/
-  tests/              Python coverage: scorer, config, calibration, explain, feedback,
-                      onboard, recalibrate, CLI, gateway, and UI
-  decisions/          design notes behind the tool's own choices
-  docs/               the FAQ and the lexical-routing guide
-  Dockerfile, docker-compose.example.yml   build and run the Rust gateway service
+  crates/wayfinder-cli/       top-level Rust CLI
+  crates/wayfinder-core/      scoring, config, calibration, feedback,
+                              onboarding, sufficiency, profiles, and virtual keys
+  crates/wayfinder-gateway/   OpenAI/Anthropic gateway, demo, metrics,
+                              feedback endpoint, key checks, and recalibration
+  crates/wayfinder-tui/       terminal chat UI
+  crates/wayfinder-ui/        local browser UI for tuning
+  tests/fixtures/contracts/   frozen golden snapshots for Rust parity tests
+  docs/                       user docs and operational notes
+  decisions/                  ADRs
+  designs/                    design notes
+  examples/                   config and integration examples
+  Dockerfile                  Rust gateway image
+  docker-compose.example.yml  local gateway compose example
 ```
 
 ## Test
@@ -673,6 +362,4 @@ wayfinder-router/
 cargo fmt --check
 cargo clippy --all-targets --no-deps
 cargo test
-pip install -e .[dev]   # or: pip install pytest
-make test
 ```
