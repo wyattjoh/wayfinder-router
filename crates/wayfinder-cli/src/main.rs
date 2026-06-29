@@ -31,6 +31,23 @@ fn main() {
                 }
             }
         }
+        Ok(wayfinder_internal_cli::CliCommand::Route(mut options)) => {
+            if options.prompt == "-" && options.input.is_none() {
+                options.input = Some(read_stdin());
+            }
+            match wayfinder_internal_cli::execute(wayfinder_internal_cli::CliCommand::Route(
+                options,
+            )) {
+                Ok(output) => {
+                    print!("{}", output.stdout);
+                    eprint!("{}", output.stderr);
+                }
+                Err(err) => {
+                    eprintln!("wayfinder-router: {err}");
+                    std::process::exit(err.exit_code());
+                }
+            }
+        }
         Ok(command) => match wayfinder_internal_cli::execute(command) {
             Ok(output) => {
                 print!("{}", output.stdout);
@@ -48,13 +65,18 @@ fn main() {
     }
 }
 
+fn read_stdin() -> String {
+    let mut input = String::new();
+    let _ = io::stdin().read_to_string(&mut input);
+    input
+}
+
 fn read_piped_stdin() -> Option<String> {
-    let mut stdin = io::stdin();
+    let stdin = io::stdin();
     if stdin.is_terminal() {
         return None;
     }
-    let mut input = String::new();
-    stdin.read_to_string(&mut input).ok()?;
+    let input = read_stdin();
     if input.trim().is_empty() {
         None
     } else {

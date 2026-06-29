@@ -423,7 +423,13 @@ where
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(None),
-            "--mode" => options.mode = next_value(&mut args, "--mode")?,
+            "--mode" => {
+                options.mode = parse_choice(
+                    "--mode",
+                    next_value(&mut args, "--mode")?,
+                    &["threshold", "tiers", "classifier"],
+                )?
+            }
             "--models" => options.models = Some(next_value(&mut args, "--models")?),
             "--out" => options.out = Some(next_value(&mut args, "--out")?.into()),
             "--iterations" => {
@@ -436,7 +442,13 @@ where
                     .parse()
                     .map_err(|_| CliError::new("--l2 must be a number"))?;
             }
-            "--objective" => options.objective = next_value(&mut args, "--objective")?,
+            "--objective" => {
+                options.objective = parse_choice(
+                    "--objective",
+                    next_value(&mut args, "--objective")?,
+                    &["accuracy", "knee", "cost-quality"],
+                )?
+            }
             "--target-savings" => {
                 options.target_savings = Some(
                     next_value(&mut args, "--target-savings")?
@@ -481,7 +493,13 @@ where
             "--help" | "-h" => return Ok(None),
             "--log" => options.log = next_value(&mut args, "--log")?.into(),
             "--out" => options.out = next_value(&mut args, "--out")?.into(),
-            "--mode" => options.mode = next_value(&mut args, "--mode")?,
+            "--mode" => {
+                options.mode = parse_choice(
+                    "--mode",
+                    next_value(&mut args, "--mode")?,
+                    &["threshold", "tiers", "classifier"],
+                )?
+            }
             "--min-labels" => {
                 options.min_labels = next_value(&mut args, "--min-labels")?
                     .parse()
@@ -953,6 +971,16 @@ where
         .ok_or_else(|| CliError::new(format!("{flag} requires a value")))
 }
 
+fn parse_choice(flag: &str, value: String, choices: &[&str]) -> Result<String, CliError> {
+    if choices.contains(&value.as_str()) {
+        return Ok(value);
+    }
+    Err(CliError::usage(format!(
+        "{flag} must be one of {}",
+        choices.join(", ")
+    )))
+}
+
 fn non_empty(value: String) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1155,5 +1183,32 @@ mod tests {
                 min_labels: 5,
             })
         );
+    }
+
+    #[test]
+    fn parse_calibrate_rejects_unknown_mode_as_usage_error() {
+        let err = parse(["calibrate", "data.jsonl", "--mode", "bogus"])
+            .expect_err("unknown calibrate mode should be a usage error");
+
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--mode"));
+    }
+
+    #[test]
+    fn parse_calibrate_rejects_unknown_objective_as_usage_error() {
+        let err = parse(["calibrate", "data.jsonl", "--objective", "bogus"])
+            .expect_err("unknown calibrate objective should be a usage error");
+
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--objective"));
+    }
+
+    #[test]
+    fn parse_recalibrate_rejects_unknown_mode_as_usage_error() {
+        let err = parse(["recalibrate", "--mode", "bogus"])
+            .expect_err("unknown recalibrate mode should be a usage error");
+
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--mode"));
     }
 }
