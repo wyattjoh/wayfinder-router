@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use toml::Value;
 use wayfinder_internal_core::complexity::{
-    recommend_tier, score_complexity, ComplexityScore, RoutingConfig, Tier,
+    explain_score, recommend_tier, score_complexity, ComplexityScore, RoutingConfig, Tier,
 };
 use wayfinder_internal_core::config::{dump_routing_toml, routing_config_from_toml, CONFIG_FILE};
 use wayfinder_internal_core::feedback::{read_labels, record_label, DEFAULT_LOG};
@@ -1640,17 +1640,7 @@ async fn chat_completions_response(
         return json_response(
             StatusCode::OK,
             response_headers,
-            json!({
-                "wayfinder": {
-                    "model": route.chosen,
-                    "score": round_score(decision.score),
-                    "mode": route.mode,
-                    "request_id": request_id,
-                    "features": decision.features,
-                    "tiers": decision.tiers,
-                    "dry_run": true
-                }
-            }),
+            dry_run_debug_body(&state, &decision, &route, &request_id),
         );
     }
 
@@ -3068,6 +3058,43 @@ fn debug_payload(decision: &ComplexityScore, route: &RouteDecision, request_id: 
         "request_id": request_id,
         "features": decision.features,
         "tiers": decision.tiers
+    })
+}
+
+fn dry_run_debug_body(
+    state: &AppState,
+    decision: &ComplexityScore,
+    route: &RouteDecision,
+    request_id: &str,
+) -> JsonValue {
+    json!({
+        "id": "resp-1",
+        "object": "chat.completion",
+        "wayfinder": {
+            "model": route.chosen,
+            "score": round_score(decision.score),
+            "mode": route.mode,
+            "request_id": request_id,
+            "features": decision.features,
+            "contributions": explain_score(&decision.features, state.routing.weights),
+            "tiers": decision.tiers,
+            "cost": dry_run_cost(state, &route.chosen, decision.features.word_count),
+            "dry_run": true
+        }
+    })
+}
+
+fn dry_run_cost(state: &AppState, route: &str, word_count: usize) -> JsonValue {
+    let per_1k = state.price_table.get(route).copied().unwrap_or_default();
+    let baseline_per_1k = state.price_table.values().copied().fold(per_1k, f64::max);
+    let units = word_count as f64 / 1000.0;
+    json!({
+        "per_call": round_cost(per_1k * units),
+        "baseline": round_cost(baseline_per_1k * units),
+        "saved": round_cost((baseline_per_1k - per_1k).max(0.0) * units),
+        "unit": if state.priced { "usd / 1k tokens" } else { "relative units / 1k words" },
+        "estimated": true,
+        "word_count": word_count
     })
 }
 

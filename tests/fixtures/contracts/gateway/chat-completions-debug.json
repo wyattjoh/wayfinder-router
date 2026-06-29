@@ -47,7 +47,85 @@
           "constraint_term_count": 0,
           "question_count": 0
         },
-        "contributions": "<array-of-feature-contributions>",
+        "contributions": [
+          {
+            "name": "word_count",
+            "value": 2,
+            "normalized": 0.005,
+            "weight": 3.0,
+            "contribution": 0.0014
+          },
+          {
+            "name": "heading_count",
+            "value": 0,
+            "normalized": 0.0,
+            "weight": 1.5,
+            "contribution": 0.0
+          },
+          {
+            "name": "max_heading_depth",
+            "value": 0,
+            "normalized": 0.0,
+            "weight": 1.0,
+            "contribution": 0.0
+          },
+          {
+            "name": "list_item_count",
+            "value": 0,
+            "normalized": 0.0,
+            "weight": 2.0,
+            "contribution": 0.0
+          },
+          {
+            "name": "link_count",
+            "value": 0,
+            "normalized": 0.0,
+            "weight": 1.0,
+            "contribution": 0.0
+          },
+          {
+            "name": "code_block_count",
+            "value": 0,
+            "normalized": 0.0,
+            "weight": 1.5,
+            "contribution": 0.0
+          },
+          {
+            "name": "table_row_count",
+            "value": 0,
+            "normalized": 0.0,
+            "weight": 1.0,
+            "contribution": 0.0
+          },
+          {
+            "name": "reasoning_term_count",
+            "value": 0,
+            "normalized": 0.0,
+            "weight": 0.0,
+            "contribution": 0.0
+          },
+          {
+            "name": "math_symbol_count",
+            "value": 0,
+            "normalized": 0.0,
+            "weight": 0.0,
+            "contribution": 0.0
+          },
+          {
+            "name": "constraint_term_count",
+            "value": 0,
+            "normalized": 0.0,
+            "weight": 0.0,
+            "contribution": 0.0
+          },
+          {
+            "name": "question_count",
+            "value": 0,
+            "normalized": 0.0,
+            "weight": 0.0,
+            "contribution": 0.0
+          }
+        ],
         "tiers": [
           {
             "min_score": 0.0,
@@ -65,7 +143,8 @@
           "unit": "relative units / 1k words",
           "estimated": true,
           "word_count": 2
-        }
+        },
+        "dry_run": true
       }
     }
   }

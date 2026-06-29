@@ -40,6 +40,18 @@ fn contract_fixture(path: &str) -> Value {
         .unwrap_or_else(|err| panic!("fixture {} should be JSON: {err}", path.display()))
 }
 
+fn normalize_gateway_debug_body(mut body: Value) -> Value {
+    if let Some(wayfinder) = body.get_mut("wayfinder").and_then(Value::as_object_mut) {
+        if wayfinder.contains_key("request_id") {
+            wayfinder.insert(
+                "request_id".to_owned(),
+                Value::String("<opaque-request-id>".to_owned()),
+            );
+        }
+    }
+    body
+}
+
 async fn get_json(path: &str) -> (StatusCode, Value) {
     let app = build_app_from_dir(ServeOptions::default(), std::env::current_dir().unwrap())
         .expect("app should build");
@@ -771,7 +783,7 @@ async fn chat_completions_dry_run_returns_decision_headers_and_debug_payload() {
         dir.path().join("wayfinder-router.toml"),
         r#"
 [routing]
-threshold = 0.5
+threshold = 0.2
 "#,
     )
     .unwrap();
@@ -803,15 +815,9 @@ threshold = 0.5
             assert_eq!(headers[name.as_str()], value.as_str().unwrap());
         }
     }
-    assert!(headers.contains_key("x-wayfinder-router-request-id"));
     assert_eq!(
-        body["wayfinder"]["model"],
-        expected["expected_response"]["body"]["wayfinder"]["model"]
-    );
-    assert_eq!(body["wayfinder"]["dry_run"], true);
-    assert_eq!(
-        body["wayfinder"]["features"],
-        expected["expected_response"]["body"]["wayfinder"]["features"]
+        normalize_gateway_debug_body(body),
+        expected["expected_response"]["body"]
     );
 }
 

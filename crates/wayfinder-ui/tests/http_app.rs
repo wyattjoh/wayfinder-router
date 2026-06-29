@@ -127,6 +127,21 @@ fn write_gateway_config_from_fixture(dir: &TempDir, fixture: &JsonValue) {
     .expect("gateway config should be writable");
 }
 
+fn write_feedback_log_from_fixture(dir: &TempDir, fixture: &JsonValue) {
+    let lines = fixture["feedback_log_lines"]
+        .as_array()
+        .expect("feedback_log_lines should be an array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("feedback log line should be a string")
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(dir.path().join(DEFAULT_LOG), lines.join("\n"))
+        .expect("feedback log should write");
+}
+
 #[tokio::test]
 async fn index_serves_the_page() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -452,7 +467,7 @@ async fn api_onboard_and_recalibrate_match_static_contract_fixture() {
     );
     assert_eq!(dataset_body, expected["onboard_dataset"]["body"]);
 
-    std::fs::write(dir.path().join(DEFAULT_LOG), dataset()).expect("feedback log should write");
+    write_feedback_log_from_fixture(&dir, &expected);
     let (status, recalibrate_body) = post_json(
         &dir,
         "/api/recalibrate",
@@ -464,19 +479,12 @@ async fn api_onboard_and_recalibrate_match_static_contract_fixture() {
         expected["recalibrate"]["status"].as_u64().unwrap() as u16
     );
     assert_eq!(
-        recalibrate_body["written"],
-        expected["recalibrate"]["body"]["written"]
+        recalibrate_body, expected["recalibrate"]["body"],
+        "recalibrate response changed"
     );
     assert_eq!(
-        recalibrate_body["label_count"],
-        expected["recalibrate"]["body"]["label_count"]
-    );
-    assert_eq!(
-        recalibrate_body["summary"]["accuracy"],
-        expected["recalibrate"]["body"]["summary"]["accuracy"]
-    );
-    assert_eq!(
-        recalibrate_body["reason"],
-        expected["recalibrate"]["body"]["reason"]
+        std::fs::read_to_string(dir.path().join("wayfinder-router.toml")).unwrap(),
+        expected["recalibrate"]["written_config"].as_str().unwrap(),
+        "recalibrate written config changed"
     );
 }

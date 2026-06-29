@@ -64,17 +64,49 @@ fn write_config_from_case(case: &JsonValue, dir: &Path) {
     }
 }
 
-fn assert_contains_all(haystack: &str, needles: &JsonValue) {
-    let Some(needles) = needles.as_array() else {
-        return;
-    };
-    for needle in needles {
-        let needle = needle.as_str().unwrap();
-        assert!(
-            haystack.contains(needle),
-            "expected output to contain {needle:?}, got {haystack:?}"
-        );
+fn expected_text(expected: &JsonValue, name: &str) -> String {
+    let lines = expected[format!("{name}_lines")]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected {name}_lines fixture"));
+    let mut text = lines
+        .iter()
+        .map(|value| value.as_str().expect("line should be a string"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if expected[format!("{name}_trailing_newline")]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        text.push('\n');
     }
+    text
+}
+
+fn normalize_dynamic_text(text: &str, dir: &Path, generated: Option<(&str, &str)>) -> String {
+    let mut paths = vec![dir.to_string_lossy().to_string()];
+    if let Ok(canonical) = dir.canonicalize() {
+        paths.push(canonical.to_string_lossy().to_string());
+    }
+    paths.sort_by_key(|path| std::cmp::Reverse(path.len()));
+
+    let mut text = text.to_owned();
+    for path in paths {
+        text = text.replace(&path, "<tempdir>");
+    }
+    if let Some((key, hash)) = generated {
+        text = text.replace(hash, "<generated-key-hash>");
+        text = text.replace(key, "<generated-key>");
+    }
+    text
+}
+
+fn generated_key_material(stdout: &str) -> Option<(&str, &str)> {
+    let key = stdout.lines().find(|line| line.starts_with("wf-"))?;
+    let hash = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("hash = \""))
+        .and_then(|line| line.strip_suffix('"'))?;
+    Some((key, hash))
 }
 
 #[test]
@@ -98,25 +130,30 @@ fn cli_commands_match_static_contract_fixture() {
                 let output = result.unwrap_or_else(|err| {
                     panic!("{} should succeed: {err}", case["name"].as_str().unwrap())
                 });
-                assert_contains_all(&output.stdout, &expected["stdout_contains"]);
-                assert_contains_all(&output.stderr, &expected["stderr_contains"]);
-                if expected["stderr_empty"].as_bool().unwrap_or(false) {
-                    assert!(output.stderr.is_empty());
-                }
+                let generated = generated_key_material(&output.stdout);
                 if expected["verify_generated_key"].as_bool().unwrap_or(false) {
-                    let key = output
-                        .stdout
-                        .lines()
-                        .find(|line| line.starts_with("wf-"))
-                        .expect("plaintext key should be printed");
-                    let hash = output
-                        .stdout
-                        .lines()
-                        .find_map(|line| line.strip_prefix("hash = \""))
-                        .and_then(|line| line.strip_suffix('"'))
-                        .expect("hash line should be printed");
+                    let (key, hash) = generated.expect("generated key material should print");
                     assert!(wayfinder_internal_core::vkeys::verify(key, hash));
                 }
+
+                if let Some(expected_json) = expected.get("stdout_json") {
+                    let actual: JsonValue =
+                        serde_json::from_str(&output.stdout).expect("stdout should be valid JSON");
+                    assert_eq!(&actual, expected_json);
+                } else {
+                    assert_eq!(
+                        normalize_dynamic_text(&output.stdout, &dir, generated),
+                        expected_text(expected, "stdout"),
+                        "{} stdout changed",
+                        case["name"].as_str().unwrap()
+                    );
+                }
+                assert_eq!(
+                    normalize_dynamic_text(&output.stderr, &dir, generated),
+                    expected_text(expected, "stderr"),
+                    "{} stderr changed",
+                    case["name"].as_str().unwrap()
+                );
             }
             false => {
                 let err = result.unwrap_err();
@@ -124,9 +161,15 @@ fn cli_commands_match_static_contract_fixture() {
                     err.exit_code(),
                     expected["exit_code"].as_i64().unwrap() as i32
                 );
-                assert_contains_all(err.stdout(), &expected["stdout_contains"]);
-                assert_contains_all(err.stderr(), &expected["stderr_contains"]);
-                assert_contains_all(&err.to_string(), &expected["message_contains"]);
+                assert_eq!(
+                    normalize_dynamic_text(err.stdout(), &dir, None),
+                    expected_text(expected, "stdout")
+                );
+                assert_eq!(
+                    normalize_dynamic_text(err.stderr(), &dir, None),
+                    expected_text(expected, "stderr")
+                );
+                assert_eq!(err.to_string(), expected["message"].as_str().unwrap());
             }
         }
 

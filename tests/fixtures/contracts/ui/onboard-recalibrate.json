@@ -1,6 +1,16 @@
 {
   "description": "Static Python-derived UI onboarding and recalibration endpoint contracts.",
   "gateway_config": "[gateway.models.cloud]\nbase_url = \"http://cloud.example/v1\"\nmodel = \"cloud-model\"\n\n[gateway.models.local]\nbase_url = \"http://local.example/v1\"\nmodel = \"local-model\"\n",
+  "feedback_log_lines": [
+    "{\"text\":\"hi\",\"label\":\"local\"}",
+    "{\"text\":\"hi\",\"label\":\"local\"}",
+    "{\"text\":\"hi\",\"label\":\"local\"}",
+    "{\"text\":\"hi\",\"label\":\"local\"}",
+    "{\"text\":\"# Plan\\n\\n## Steps\\n\\n- step 0\\n- step 1\\n- step 2\\n- step 3\\n- step 4\\n- step 5\\n- step 6\\n- step 7\\n- step 8\\n- step 9\\n- step 10\\n- step 11\\n\\n## Refs\\n\\n[a](https://x) [b](https://y)\\n\\n```py\\nx=1\\n```\\n| a | b |\\n| - | - |\\n\",\"label\":\"cloud\"}",
+    "{\"text\":\"# Plan\\n\\n## Steps\\n\\n- step 0\\n- step 1\\n- step 2\\n- step 3\\n- step 4\\n- step 5\\n- step 6\\n- step 7\\n- step 8\\n- step 9\\n- step 10\\n- step 11\\n\\n## Refs\\n\\n[a](https://x) [b](https://y)\\n\\n```py\\nx=1\\n```\\n| a | b |\\n| - | - |\\n\",\"label\":\"cloud\"}",
+    "{\"text\":\"# Plan\\n\\n## Steps\\n\\n- step 0\\n- step 1\\n- step 2\\n- step 3\\n- step 4\\n- step 5\\n- step 6\\n- step 7\\n- step 8\\n- step 9\\n- step 10\\n- step 11\\n\\n## Refs\\n\\n[a](https://x) [b](https://y)\\n\\n```py\\nx=1\\n```\\n| a | b |\\n| - | - |\\n\",\"label\":\"cloud\"}",
+    "{\"text\":\"# Plan\\n\\n## Steps\\n\\n- step 0\\n- step 1\\n- step 2\\n- step 3\\n- step 4\\n- step 5\\n- step 6\\n- step 7\\n- step 8\\n- step 9\\n- step 10\\n- step 11\\n\\n## Refs\\n\\n[a](https://x) [b](https://y)\\n\\n```py\\nx=1\\n```\\n| a | b |\\n| - | - |\\n\",\"label\":\"cloud\"}"
+  ],
   "onboard_state": {
     "status": 200,
     "body": {
@@ -35,8 +45,15 @@
     "body": {
       "written": true,
       "label_count": 8,
-      "summary": { "accuracy": 1.0 },
+      "summary": {
+        "accuracy": 1.0,
+        "mode": "threshold",
+        "models": ["local", "cloud"],
+        "samples": 8,
+        "threshold": 0.35
+      },
       "reason": null
-    }
+    },
+    "written_config": "# recalibrated from feedback: mode=threshold, threshold=0.35, models=['local', 'cloud'], accuracy=1.0, samples=8\n\n[[routing.tiers]]\nmin_score = 0.0\nmodel = \"local\"\n\n[[routing.tiers]]\nmin_score = 0.35\nmodel = \"cloud\"\n\n[gateway.models.cloud]\nbase_url = \"http://cloud.example/v1\"\nmodel = \"cloud-model\"\n\n[gateway.models.local]\nbase_url = \"http://local.example/v1\"\nmodel = \"local-model\"\n"
   }
 }
