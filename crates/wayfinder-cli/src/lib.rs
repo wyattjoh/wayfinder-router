@@ -16,9 +16,9 @@ use wayfinder_internal_core::complexity::{
     DEFAULT_WEIGHTS, FEATURE_ORDER,
 };
 use wayfinder_internal_core::config::load_routing_config;
-use wayfinder_internal_core::feedback::{read_labels, DEFAULT_LOG};
+use wayfinder_internal_core::feedback::{read_labels, record_label, DEFAULT_LOG};
 use wayfinder_internal_core::judge::{HeuristicJudge, Judge, OnboardOutputs};
-use wayfinder_internal_core::onboard::run_onboarding;
+use wayfinder_internal_core::onboard::OnboardSummary;
 use wayfinder_internal_core::sufficiency::{
     evaluate_with_options, EvaluateOptions, DEFAULT_CV_FOLDS, DEFAULT_KAPPA_FLOOR,
 };
@@ -927,7 +927,7 @@ fn execute_judge(options: JudgeOptions) -> Result<CommandOutput, CliError> {
 fn execute_onboard_with_invoker<I, R, J>(
     options: OnboardOptions,
     available_arms: I,
-    run_model: R,
+    mut run_model: R,
     judge: J,
 ) -> Result<CommandOutput, CliError>
 where
@@ -940,7 +940,32 @@ where
         available_arms,
         "onboard needs two gateway models (e.g. local and hosted); configure [gateway.models.*] or pass --arms local,cloud",
     )?;
-    execute_onboard_selected(options, arms, run_model, judge)
+    execute_onboard_selected(
+        options,
+        arms,
+        |arm, prompt| Ok(run_model(arm, prompt)),
+        judge,
+    )
+}
+
+#[cfg(test)]
+fn execute_onboard_with_invoker_result<I, R, J>(
+    options: OnboardOptions,
+    available_arms: I,
+    run_model: R,
+    judge: J,
+) -> Result<CommandOutput, CliError>
+where
+    I: IntoIterator<Item = String>,
+    R: FnMut(&str, &str) -> Result<String, String>,
+    J: FnMut(&str, &wayfinder_internal_core::judge::OnboardOutputs) -> Option<String>,
+{
+    let arms = resolve_arms(
+        options.arms.as_deref(),
+        available_arms,
+        "onboard needs two gateway models (e.g. local and hosted); configure [gateway.models.*] or pass --arms local,cloud",
+    )?;
+    execute_onboard_selected(options, arms, map_string_error(run_model), judge)
 }
 
 fn execute_onboard_selected<R, J>(
@@ -950,13 +975,12 @@ fn execute_onboard_selected<R, J>(
     judge: J,
 ) -> Result<CommandOutput, CliError>
 where
-    R: FnMut(&str, &str) -> String,
+    R: FnMut(&str, &str) -> Result<String, CliError>,
     J: FnMut(&str, &wayfinder_internal_core::judge::OnboardOutputs) -> Option<String>,
 {
     ensure_file(&options.prompts)?;
     let prompts = load_prompts(&options.prompts)?;
-    let summary = run_onboarding(prompts, &arms, run_model, judge, &options.log)
-        .map_err(|err| CliError::config(err.to_string()))?;
+    let summary = run_onboarding_fallible(prompts, &arms, run_model, judge, &options.log)?;
     let mut output = CommandOutput {
         stdout: String::new(),
         stderr: format!(
@@ -984,7 +1008,7 @@ where
 fn execute_judge_with_invoker<I, R>(
     options: JudgeOptions,
     available_arms: I,
-    run_model: R,
+    mut run_model: R,
 ) -> Result<CommandOutput, CliError>
 where
     I: IntoIterator<Item = String>,
@@ -995,7 +1019,7 @@ where
         available_arms,
         "judge needs two gateway models in cheap,expensive order; configure [gateway.models.*] or pass --arms cheap,expensive",
     )?;
-    execute_judge_selected(options, arms, run_model)
+    execute_judge_selected(options, arms, |arm, prompt| Ok(run_model(arm, prompt)))
 }
 
 fn execute_judge_selected<R>(
@@ -1004,7 +1028,7 @@ fn execute_judge_selected<R>(
     mut run_model: R,
 ) -> Result<CommandOutput, CliError>
 where
-    R: FnMut(&str, &str) -> String,
+    R: FnMut(&str, &str) -> Result<String, CliError>,
 {
     ensure_file(&options.prompts)?;
     if let Some(gold) = &options.gold {
@@ -1019,7 +1043,7 @@ where
 
     if let Some(gold) = &options.gold {
         for row in read_labels(gold).map_err(|err| CliError::config(err.to_string()))? {
-            let outputs = run_all_arms(&arms, &row.text, &mut run_model);
+            let outputs = run_all_arms(&arms, &row.text, &mut run_model)?;
             let verdict = judge_impl.judge(&row.text, &outputs[&cheap], &outputs[&expensive]);
             write_comparison_if_requested(
                 options.save_comparisons.as_deref(),
@@ -1043,31 +1067,32 @@ where
         prompts.truncate(limit);
     }
 
-    let save_comparisons = options.save_comparisons.clone();
-    let summary = run_onboarding(
-        prompts,
-        &arms,
-        |arm, prompt| run_model(arm, prompt),
-        |prompt, outputs| {
-            let verdict = judge_impl.judge(prompt, &outputs[&cheap], &outputs[&expensive]);
-            let _ = write_comparison_if_requested(
-                save_comparisons.as_deref(),
-                prompt,
-                outputs,
-                &cheap,
-                &expensive,
-                &judge_impl,
-                &verdict,
-            );
-            match verdict.sufficient {
-                Some(true) => Some(cheap.clone()),
-                Some(false) => Some(expensive.clone()),
-                None => None,
+    let mut summary = OnboardSummary::default();
+    for prompt in prompts {
+        let outputs = run_all_arms(&arms, &prompt, &mut run_model)?;
+        let verdict = judge_impl.judge(&prompt, &outputs[&cheap], &outputs[&expensive]);
+        write_comparison_if_requested(
+            options.save_comparisons.as_deref(),
+            &prompt,
+            &outputs,
+            &cheap,
+            &expensive,
+            &judge_impl,
+            &verdict,
+        )?;
+        let label = match verdict.sufficient {
+            Some(true) => cheap.clone(),
+            Some(false) => expensive.clone(),
+            None => {
+                summary.abstained += 1;
+                continue;
             }
-        },
-        &options.log,
-    )
-    .map_err(|err| CliError::config(err.to_string()))?;
+        };
+        record_label(&options.log, &prompt, &label)
+            .map_err(|err| CliError::config(err.to_string()))?;
+        summary.judged += 1;
+        *summary.label_counts.entry(label).or_default() += 1;
+    }
 
     let mut stderr = format!(
         "wayfinder-router: judged {} prompts ({} abstained) -> {}\nwayfinder-router: labels appended to {}\n",
@@ -1120,22 +1145,75 @@ where
     Ok(CommandOutput { stdout, stderr })
 }
 
-fn invoke_gateway_model(model: &GatewayModel, prompt: &str) -> String {
+fn invoke_gateway_model(model: &GatewayModel, prompt: &str) -> Result<String, CliError> {
     invoke_messages(
         model,
         &[RelayMessage::new("user", prompt)],
         Duration::from_secs(60),
     )
-    .unwrap_or_else(|err| format!("model call failed: {err}"))
+    .map_err(|err| CliError::config(err.to_string()))
 }
 
-fn run_all_arms<R>(arms: &[String], prompt: &str, run_model: &mut R) -> OnboardOutputs
+fn run_all_arms<R>(
+    arms: &[String],
+    prompt: &str,
+    run_model: &mut R,
+) -> Result<OnboardOutputs, CliError>
 where
-    R: FnMut(&str, &str) -> String,
+    R: FnMut(&str, &str) -> Result<String, CliError>,
 {
-    arms.iter()
-        .map(|arm| (arm.clone(), run_model(arm, prompt)))
-        .collect()
+    let mut outputs = OnboardOutputs::new();
+    for arm in arms {
+        outputs.insert(arm.clone(), run_model(arm, prompt)?);
+    }
+    Ok(outputs)
+}
+
+fn run_onboarding_fallible<P, S, R, J>(
+    prompts: P,
+    arms: &[String],
+    mut run_model: R,
+    mut judge: J,
+    log_path: &Path,
+) -> Result<OnboardSummary, CliError>
+where
+    P: IntoIterator<Item = S>,
+    S: AsRef<str>,
+    R: FnMut(&str, &str) -> Result<String, CliError>,
+    J: FnMut(&str, &OnboardOutputs) -> Option<String>,
+{
+    if arms.len() < 2 {
+        return Err(CliError::usage(
+            "onboarding needs at least two arms (e.g. a local and a hosted model)",
+        ));
+    }
+
+    let mut summary = OnboardSummary::default();
+    for prompt in prompts {
+        let prompt = prompt.as_ref();
+        let outputs = run_all_arms(arms, prompt, &mut run_model)?;
+        let Some(label) = judge(prompt, &outputs) else {
+            summary.abstained += 1;
+            continue;
+        };
+        if !arms.iter().any(|arm| arm == &label) {
+            return Err(CliError::usage(format!(
+                "judge returned an unknown arm: {label:?}"
+            )));
+        }
+        record_label(log_path, prompt, &label).map_err(|err| CliError::config(err.to_string()))?;
+        summary.judged += 1;
+        *summary.label_counts.entry(label).or_default() += 1;
+    }
+    Ok(summary)
+}
+
+#[cfg(test)]
+fn map_string_error<R>(mut run_model: R) -> impl FnMut(&str, &str) -> Result<String, CliError>
+where
+    R: FnMut(&str, &str) -> Result<String, String>,
+{
+    move |arm, prompt| run_model(arm, prompt).map_err(CliError::config)
 }
 
 fn resolve_arms<I>(
@@ -2067,6 +2145,72 @@ mod tests {
         assert!(output.stdout.contains("[[routing.tiers]]"));
         assert!(output.stderr.contains("trust gates: PASS"));
         assert!(!dir.join("comparisons.jsonl").exists());
+    }
+
+    #[test]
+    fn onboard_stops_when_model_invoker_fails_without_recording_labels() {
+        let dir = unique_temp_dir("cli-onboard-fail");
+        let prompts = dir.join("prompts.txt");
+        let log = dir.join("labels.jsonl");
+        fs::write(&prompts, "What is DNS?\n").expect("prompts write");
+
+        let err = super::execute_onboard_with_invoker_result(
+            OnboardOptions {
+                prompts,
+                arms: Some("local,cloud".to_owned()),
+                log: log.clone(),
+                calibrate: true,
+                mode: "threshold".to_owned(),
+            },
+            ["local".to_owned(), "cloud".to_owned()],
+            |arm, _| {
+                if arm == "local" {
+                    Err("local upstream unavailable".to_owned())
+                } else {
+                    Ok("cloud answer".to_owned())
+                }
+            },
+            |_, _| Some("local".to_owned()),
+        )
+        .expect_err("model failure should stop onboarding");
+
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("local upstream unavailable"));
+        assert!(!log.exists());
+    }
+
+    #[test]
+    fn judge_returns_comparison_write_error_without_recording_labels() {
+        let dir = unique_temp_dir("cli-judge-comparison-fail");
+        let prompts = dir.join("prompts.txt");
+        let gold = dir.join("gold.jsonl");
+        let log = dir.join("labels.jsonl");
+        let comparisons = dir.join("missing").join("comparisons.jsonl");
+        fs::write(&prompts, "short prompt\n").expect("prompts write");
+        fs::write(&gold, "{\"text\":\"gold cheap\",\"label\":\"local\"}\n").expect("gold write");
+
+        let err = super::execute_judge_with_invoker(
+            JudgeOptions {
+                prompts,
+                arms: Some("local,cloud".to_owned()),
+                gold: Some(gold),
+                log: log.clone(),
+                mode: "threshold".to_owned(),
+                kappa_floor: 0.0,
+                folds: 2,
+                limit: Some(1),
+                save_comparisons: Some(comparisons.clone()),
+            },
+            ["local".to_owned(), "cloud".to_owned()],
+            |_, _| "same sufficient answer with enough detail".to_owned(),
+        )
+        .expect_err("comparison write failure should stop judging");
+
+        assert_eq!(err.exit_code(), 2);
+        assert!(err
+            .to_string()
+            .contains(&format!("cannot write {}", comparisons.display())));
+        assert!(!log.exists());
     }
 
     #[test]
