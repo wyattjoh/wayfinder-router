@@ -50,10 +50,9 @@ pub fn routing_config_from_toml(
             )));
         }
         None => {
-            return Ok(RoutingConfig {
-                tiers: binary_tiers(apply_env_threshold(DEFAULT_THRESHOLD)?),
-                ..RoutingConfig::default()
-            });
+            return Ok(default_binary_config(apply_env_threshold(
+                DEFAULT_THRESHOLD,
+            )?));
         }
     };
 
@@ -91,15 +90,23 @@ pub fn routing_config_from_toml(
 
 pub fn load_routing_config(start_dir: &Path) -> Result<RoutingConfig, WayfinderConfigError> {
     let Some(path) = find_config_file(start_dir) else {
-        return Ok(RoutingConfig {
-            tiers: binary_tiers(apply_env_threshold(DEFAULT_THRESHOLD)?),
-            ..RoutingConfig::default()
-        });
+        return Ok(default_binary_config(apply_env_threshold(
+            DEFAULT_THRESHOLD,
+        )?));
     };
     let text = fs::read_to_string(&path).map_err(|err| {
         WayfinderConfigError::new(format!("cannot read {}: {err}", path.display()))
     })?;
     routing_config_from_toml(&text, &path.to_string_lossy())
+}
+
+fn default_binary_config(threshold: f64) -> RoutingConfig {
+    RoutingConfig {
+        weights: DEFAULT_WEIGHTS,
+        tiers: binary_tiers(threshold),
+        classifier: None,
+        lexicon: Lexicon::default(),
+    }
 }
 
 fn find_config_file(start_dir: &Path) -> Option<std::path::PathBuf> {
@@ -530,9 +537,33 @@ fn quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_threshold_env<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK
+            .lock()
+            .expect("threshold env lock should not poison");
+        let saved = env::var_os(THRESHOLD_ENV);
+        match value {
+            Some(value) => env::set_var(THRESHOLD_ENV, value),
+            None => env::remove_var(THRESHOLD_ENV),
+        }
+        let result = catch_unwind(AssertUnwindSafe(test));
+        match saved {
+            Some(value) => env::set_var(THRESHOLD_ENV, value),
+            None => env::remove_var(THRESHOLD_ENV),
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
 
     fn unique_temp_dir() -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -549,39 +580,58 @@ mod tests {
 
     #[test]
     fn load_routing_config_parses_present_file() {
-        let dir = unique_temp_dir();
-        fs::write(dir.join(CONFIG_FILE), "[routing]\nthreshold = 0.8\n")
-            .expect("config file should be writable");
+        with_threshold_env(None, || {
+            let dir = unique_temp_dir();
+            fs::write(dir.join(CONFIG_FILE), "[routing]\nthreshold = 0.8\n")
+                .expect("config file should be writable");
 
-        let config = load_routing_config(&dir).expect("present config should parse");
-        assert_eq!(config.tiers[1].min_score, 0.8);
+            let config = load_routing_config(&dir).expect("present config should parse");
+            assert_eq!(config.tiers[1].min_score, 0.8);
 
-        fs::remove_dir_all(&dir).expect("temp dir should be removable");
+            fs::remove_dir_all(&dir).expect("temp dir should be removable");
+        });
     }
 
     #[test]
     fn load_routing_config_finds_config_in_parent_directory() {
-        let parent = unique_temp_dir();
-        fs::write(parent.join(CONFIG_FILE), "[routing]\nthreshold = 0.8\n")
-            .expect("config file should be writable");
-        let child = parent.join("nested/deeper");
-        fs::create_dir_all(&child).expect("child dirs should be creatable");
+        with_threshold_env(None, || {
+            let parent = unique_temp_dir();
+            fs::write(parent.join(CONFIG_FILE), "[routing]\nthreshold = 0.8\n")
+                .expect("config file should be writable");
+            let child = parent.join("nested/deeper");
+            fs::create_dir_all(&child).expect("child dirs should be creatable");
 
-        let config =
-            load_routing_config(&child).expect("ancestor config should be found from a subdir");
-        assert_eq!(config.tiers[1].min_score, 0.8);
+            let config =
+                load_routing_config(&child).expect("ancestor config should be found from a subdir");
+            assert_eq!(config.tiers[1].min_score, 0.8);
 
-        fs::remove_dir_all(&parent).expect("temp dir should be removable");
+            fs::remove_dir_all(&parent).expect("temp dir should be removable");
+        });
     }
 
     #[test]
     fn load_routing_config_returns_default_when_absent() {
-        let dir = unique_temp_dir();
+        with_threshold_env(None, || {
+            let dir = unique_temp_dir();
 
-        let config = load_routing_config(&dir).expect("missing config should fall back");
-        assert_eq!(config, RoutingConfig::default());
+            let config = load_routing_config(&dir).expect("missing config should fall back");
+            assert_eq!(config, RoutingConfig::default());
 
-        fs::remove_dir_all(&dir).expect("temp dir should be removable");
+            fs::remove_dir_all(&dir).expect("temp dir should be removable");
+        });
+    }
+
+    #[test]
+    fn missing_routing_table_applies_env_threshold_to_explicit_defaults() {
+        with_threshold_env(Some("0.2"), || {
+            let config =
+                routing_config_from_toml("[gateway]\n", "inline").expect("config should parse");
+
+            assert_eq!(config.weights, DEFAULT_WEIGHTS);
+            assert_eq!(config.tiers, binary_tiers(0.2));
+            assert_eq!(config.classifier, None);
+            assert_eq!(config.lexicon, Lexicon::default());
+        });
     }
 
     #[test]
