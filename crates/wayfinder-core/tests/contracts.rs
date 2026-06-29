@@ -14,7 +14,7 @@ use wayfinder_internal_core::complexity::{
 use wayfinder_internal_core::config::{
     dump_routing_toml, routing_config_from_toml, WayfinderConfigError, THRESHOLD_ENV,
 };
-use wayfinder_internal_core::{feedback, pricing, threads, vkeys};
+use wayfinder_internal_core::{feedback, onboard, pricing, threads, vkeys};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -534,6 +534,144 @@ fn feedback_json_line_matches_python_format_and_preserves_non_ascii() {
     assert_eq!(text, "{\"text\": \"café ∑\", \"label\": \"cloud\"}\n");
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn onboarding_records_judged_arms_and_runs_every_arm() {
+    let dir = unique_temp_dir("onboard-records");
+    std::fs::create_dir_all(&dir).expect("temp dir should be created");
+    let log = dir.join("feedback.jsonl");
+    let mut ran = Vec::new();
+
+    let summary = onboard::run_onboarding(
+        ["easy", "hard"],
+        &["local", "cloud"],
+        |arm, prompt| {
+            ran.push((arm.to_string(), prompt.to_string()));
+            format!("{arm}:{prompt}")
+        },
+        |prompt, outputs| {
+            assert_eq!(outputs.len(), 2);
+            assert!(outputs.contains_key("local"));
+            assert!(outputs.contains_key("cloud"));
+
+            Some(if prompt == "easy" { "local" } else { "cloud" }.to_string())
+        },
+        &log,
+    )
+    .expect("onboarding should run");
+
+    assert_eq!(summary.judged, 2);
+    assert_eq!(summary.abstained, 0);
+    assert_eq!(
+        summary.label_counts,
+        BTreeMap::from([("cloud".to_string(), 1), ("local".to_string(), 1)])
+    );
+
+    let rows = feedback::read_labels(&log).expect("labels should read");
+    assert_eq!(
+        rows,
+        vec![
+            feedback::LabelRow {
+                text: "easy".to_string(),
+                label: "local".to_string(),
+            },
+            feedback::LabelRow {
+                text: "hard".to_string(),
+                label: "cloud".to_string(),
+            },
+        ]
+    );
+    assert_eq!(
+        ran,
+        vec![
+            ("local".to_string(), "easy".to_string()),
+            ("cloud".to_string(), "easy".to_string()),
+            ("local".to_string(), "hard".to_string()),
+            ("cloud".to_string(), "hard".to_string()),
+        ]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn onboarding_skips_abstentions() {
+    let dir = unique_temp_dir("onboard-abstain");
+    std::fs::create_dir_all(&dir).expect("temp dir should be created");
+    let log = dir.join("feedback.jsonl");
+
+    let summary = onboard::run_onboarding(
+        ["easy", "skip", "easy2"],
+        &["local", "cloud"],
+        |arm, _| arm.to_string(),
+        |prompt, _| {
+            if prompt == "skip" {
+                None
+            } else {
+                Some("local".to_string())
+            }
+        },
+        &log,
+    )
+    .expect("onboarding should run");
+
+    assert_eq!(summary.judged, 2);
+    assert_eq!(summary.abstained, 1);
+    assert_eq!(
+        summary.label_counts,
+        BTreeMap::from([("local".to_string(), 2)])
+    );
+
+    let rows = feedback::read_labels(&log).expect("labels should read");
+    assert_eq!(
+        rows,
+        vec![
+            feedback::LabelRow {
+                text: "easy".to_string(),
+                label: "local".to_string(),
+            },
+            feedback::LabelRow {
+                text: "easy2".to_string(),
+                label: "local".to_string(),
+            },
+        ]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn onboarding_requires_at_least_two_arms() {
+    let err = onboard::run_onboarding(
+        ["x"],
+        &["only"],
+        |_, _| String::new(),
+        |_, _| Some("only".to_string()),
+        "unused.jsonl",
+    )
+    .expect_err("one arm should fail");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        err.to_string(),
+        "onboarding needs at least two arms (e.g. a local and a hosted model)"
+    );
+}
+
+#[test]
+fn onboarding_rejects_unknown_judge_arm() {
+    let err = onboard::run_onboarding(
+        ["x"],
+        &["a", "b"],
+        |_, _| String::new(),
+        |_, _| Some("c".to_string()),
+        "unused.jsonl",
+    )
+    .expect_err("unknown arm should fail");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(err.to_string(), "judge returned an unknown arm: \"c\"");
 }
 
 #[test]
