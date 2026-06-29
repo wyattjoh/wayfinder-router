@@ -115,6 +115,8 @@ fn model(base_url: &str, api_key_env: Option<&str>) -> GatewayModel {
         api_key_env: api_key_env.map(str::to_owned),
         api_key_cmd: None,
         cost_per_1k: None,
+        fallbacks: Vec::new(),
+        context_window: None,
     }
 }
 

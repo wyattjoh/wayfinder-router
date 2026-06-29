@@ -411,6 +411,8 @@ mod tests {
             api_key_env: api_key_env.map(str::to_string),
             api_key_cmd: None,
             cost_per_1k: None,
+            fallbacks: Vec::new(),
+            context_window: None,
         }
     }
 

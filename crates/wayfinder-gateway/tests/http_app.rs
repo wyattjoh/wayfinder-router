@@ -7,6 +7,7 @@ use axum::{Json, Router};
 use futures_util::stream;
 use http_body_util::BodyExt;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +18,10 @@ use tower::ServiceExt;
 use wayfinder_internal_core::feedback::DEFAULT_LOG;
 use wayfinder_internal_core::profiles::PROFILES;
 use wayfinder_internal_core::vkeys;
-use wayfinder_internal_gateway::{build_app_from_dir, load_gateway_models, ServeOptions};
+use wayfinder_internal_gateway::{
+    build_app_from_dir, dump_gateway_toml, gateway_config_from_toml, load_gateway_models,
+    ServeOptions,
+};
 
 async fn get_json(path: &str) -> (StatusCode, Value) {
     let app = build_app_from_dir(ServeOptions::default(), std::env::current_dir().unwrap())
@@ -238,6 +242,51 @@ impl Drop for FakeUpstream {
 }
 
 #[derive(Clone, Default)]
+struct SequencedUpstreamState {
+    requests: Arc<Mutex<Vec<UpstreamRequest>>>,
+    statuses: Arc<Mutex<VecDeque<StatusCode>>>,
+}
+
+struct SequencedUpstream {
+    base_url: String,
+    requests: Arc<Mutex<Vec<UpstreamRequest>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SequencedUpstream {
+    async fn start(statuses: impl IntoIterator<Item = StatusCode>) -> Self {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = SequencedUpstreamState {
+            requests: requests.clone(),
+            statuses: Arc::new(Mutex::new(statuses.into_iter().collect())),
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(sequenced_chat_completion))
+            .with_state(state);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            requests,
+            task,
+        }
+    }
+
+    fn calls(&self) -> Vec<UpstreamRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for SequencedUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone, Default)]
 struct HangingStreamState {
     requests: Arc<Mutex<Vec<UpstreamRequest>>>,
     sender: Arc<Mutex<Option<mpsc::Sender<Result<String, Infallible>>>>>,
@@ -335,6 +384,55 @@ data: [DONE]\n\n",
             .into_response();
     }
     Json(state.body).into_response()
+}
+
+async fn sequenced_chat_completion(
+    State(state): State<SequencedUpstreamState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state.requests.lock().unwrap().push(UpstreamRequest {
+        body: body.clone(),
+        authorization: headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+    });
+    let status = state
+        .statuses
+        .lock()
+        .unwrap()
+        .pop_front()
+        .unwrap_or(StatusCode::OK);
+    if status != StatusCode::OK {
+        return (
+            status,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "upstream unavailable",
+                    "type": "upstream_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "id": "upstream-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "hello from sequenced upstream"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 40,
+            "completion_tokens": 20
+        }
+    }))
+    .into_response()
 }
 
 async fn hanging_stream_chat_completion(
@@ -1034,6 +1132,203 @@ model = "local-upstream"
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(headers["x-wayfinder-router-model"], "local");
     assert_eq!(body["error"]["type"], "upstream_error");
+}
+
+#[test]
+fn gateway_reliability_config_roundtrips() {
+    let config = r#"
+[gateway]
+retries = 1
+breaker_threshold = 2
+breaker_cooldown = 3.5
+failover = "same-tier"
+
+[gateway.models.cloud]
+base_url = "https://primary.example.com/v1"
+model = "big-1"
+fallbacks = ["cloud2"]
+context_window = 8000
+
+[gateway.models.cloud2]
+base_url = "https://backup.example.com/v1"
+model = "big-2"
+"#;
+
+    let gateway = gateway_config_from_toml(config, "test").expect("config should parse");
+    assert_eq!(gateway.retries, 1);
+    assert_eq!(gateway.breaker_threshold, 2);
+    assert_eq!(gateway.breaker_cooldown, 3.5);
+    assert_eq!(gateway.failover, "same-tier");
+    assert_eq!(gateway.models["cloud"].fallbacks, vec!["cloud2"]);
+    assert_eq!(gateway.models["cloud"].context_window, Some(8000));
+
+    let roundtrip =
+        gateway_config_from_toml(&dump_gateway_toml(&gateway), "roundtrip").expect("roundtrip");
+    assert_eq!(roundtrip.retries, 1);
+    assert_eq!(roundtrip.models["cloud"].fallbacks, vec!["cloud2"]);
+    assert_eq!(roundtrip.models["cloud"].context_window, Some(8000));
+}
+
+#[tokio::test]
+async fn chat_completions_retries_then_fails_over_to_same_tier_candidate() {
+    let primary = SequencedUpstream::start([
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ])
+    .await;
+    let backup = SequencedUpstream::start([StatusCode::OK]).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[gateway]
+retries = 1
+breaker_threshold = 5
+
+[routing]
+threshold = 0.0
+
+[gateway.models.local]
+base_url = "{backup_url}"
+model = "local-upstream"
+
+[gateway.models.cloud]
+base_url = "{primary_url}"
+model = "cloud-primary"
+fallbacks = ["cloud2"]
+
+[gateway.models.cloud2]
+base_url = "{backup_url}"
+model = "cloud-backup"
+"#,
+            primary_url = primary.base_url,
+            backup_url = backup.base_url
+        ),
+    )
+    .unwrap();
+
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Say hello."}],
+        "stream": false
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let metrics = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let metrics = String::from_utf8(metrics.to_vec()).unwrap();
+    let primary_calls = primary.calls();
+    let backup_calls = backup.calls();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-wayfinder-router-model"], "cloud");
+    assert_eq!(headers["x-wayfinder-router-served-by"], "cloud2");
+    assert_eq!(headers["x-wayfinder-router-failover"], "true");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hello from sequenced upstream"
+    );
+    assert_eq!(primary_calls.len(), 2);
+    assert_eq!(backup_calls.len(), 1);
+    assert_eq!(backup_calls[0].body["model"], "cloud-backup");
+    assert!(metrics
+        .contains("wayfinder_router_failovers_total{model=\"cloud\",served_by=\"cloud2\"} 1"));
+}
+
+#[tokio::test]
+async fn chat_completions_short_circuits_open_breaker() {
+    let upstream = SequencedUpstream::start([StatusCode::SERVICE_UNAVAILABLE]).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[gateway]
+retries = 0
+breaker_threshold = 1
+breaker_cooldown = 30
+
+[routing]
+threshold = 0.5
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Say hello."}],
+        "stream": false
+    });
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second_status = second.status();
+    let second_body = second.into_body().collect().await.unwrap().to_bytes();
+    let second_body: Value = serde_json::from_slice(&second_body).unwrap();
+
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(second_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        second_body["error"]["type"],
+        "wayfinder_router_circuit_open"
+    );
+    assert_eq!(upstream.calls().len(), 1);
 }
 
 #[tokio::test]

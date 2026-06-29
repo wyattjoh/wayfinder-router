@@ -590,12 +590,12 @@ are visible in headers and metrics. Current Rust gateway knobs:
 | `GET /router` | read-only dashboard of recent decisions, with `X-Wayfinder-Debug: true` surfacing one in the body |
 | `GET /metrics` | Prometheus text for decisions, upstream errors, cost counters, cache, rate limits, and key usage |
 | `[gateway.cache] enabled` / `ttl` / `max_entries` / `max_bytes` | exact-match response cache. Off by default; in-memory only. A hit is surfaced via `x-wayfinder-router-cache: hit\|miss`; disabling purges it (WF-ADR-0033) |
+| `[gateway] retries` / `breaker_threshold` / `breaker_cooldown` / `failover` plus per-model `fallbacks` / `context_window` | retry transient upstream failures, skip tripped targets, and serve configured same-tier fallbacks without recomputing the routing decision. Failover is surfaced via `x-wayfinder-router-served-by`, `x-wayfinder-router-failover`, and `wayfinder_router_failovers_total` (WF-ADR-0031) |
 | `[gateway.rate_limit] rpm` / `tpm` / `window` | cap requests-per-minute and/or upstream-tokens-per-minute over a fixed `window` (default 60s); on breach returns `429` with `Retry-After`. The outermost guardrail (checked before scoring); gateway-wide. Successful responses carry `X-RateLimit-Limit`/`-Remaining`/`-Reset` so clients can self-pace; surfaced via `x-wayfinder-router-rate-limit` and `wayfinder_router_rate_limited_total` (WF-ADR-0034) |
 | `[gateway.keys.<id>] hash` | virtual API keys: when any is set, `/v1/*` requires a valid `Authorization: Bearer` token (else `401`). Store only a SHA-256 hash. Requests are attributed via `wayfinder_router_key_requests_total` (WF-ADR-0035) |
 
-Feedback, `/v1/savings`, persisted savings ledgers, failover policy, spend budgets,
-and key minting commands remain Python/PyPI surfaces until they are ported or
-retired.
+Feedback, spend budgets, and key minting commands remain Python/PyPI surfaces
+until they are ported or retired.
 
 ## Explain and tune
 

@@ -37,6 +37,7 @@ use wayfinder_internal_core::{DEFAULT_HOST, DEFAULT_PORT};
 
 pub mod bootstrap;
 pub mod recalibrate;
+pub mod reliability;
 
 pub const COMMAND_NAME: &str = "serve";
 
@@ -50,6 +51,10 @@ const DEFAULT_CACHE_TTL: f64 = 300.0;
 const DEFAULT_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_RATE_LIMIT_WINDOW: f64 = 60.0;
+const DEFAULT_RETRIES: usize = 2;
+const DEFAULT_BREAKER_THRESHOLD: usize = 5;
+const DEFAULT_BREAKER_COOLDOWN: f64 = 30.0;
+const DEFAULT_FAILOVER: &str = "same-tier";
 const RECENT_LIMIT: usize = 200;
 const FEEDBACK_TOKEN_ENV: &str = "WAYFINDER_ROUTER_FEEDBACK_TOKEN";
 const SAVINGS_FILE_ENV: &str = "WAYFINDER_ROUTER_SAVINGS_FILE";
@@ -146,6 +151,10 @@ struct AppState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GatewayConfig {
     pub models: BTreeMap<String, GatewayModel>,
+    pub retries: usize,
+    pub breaker_threshold: usize,
+    pub breaker_cooldown: f64,
+    pub failover: String,
     cache: Option<CacheConfig>,
     rate_limit: Option<RateLimitConfig>,
     keys: BTreeMap<String, VirtualKeyConfig>,
@@ -159,6 +168,8 @@ pub struct GatewayModel {
     pub api_key_env: Option<String>,
     pub api_key_cmd: Option<String>,
     pub cost_per_1k: Option<f64>,
+    pub fallbacks: Vec<String>,
+    pub context_window: Option<usize>,
 }
 
 /// One OpenAI-style chat message handed to the in-process relay.
@@ -231,6 +242,7 @@ struct VirtualKeyConfig {
 struct GatewayRuntime {
     cache: Mutex<ResponseCache>,
     rate_limiter: Mutex<RateLimiter>,
+    breaker: Mutex<reliability::CircuitBreaker>,
     metrics: Mutex<Metrics>,
     recent: Mutex<VecDeque<RecentDecision>>,
     ledger: Mutex<SavingsLedger>,
@@ -281,6 +293,7 @@ struct RateSnapshot {
 struct Metrics {
     requests: BTreeMap<(String, String), u64>,
     upstream_errors: BTreeMap<String, u64>,
+    failovers: BTreeMap<(String, String), u64>,
     rate_limited: BTreeMap<String, u64>,
     key_requests: BTreeMap<String, u64>,
     cache_hits: u64,
@@ -477,6 +490,10 @@ fn load_config(start_dir: &Path) -> Result<LoadedConfig, GatewayError> {
             routing: RoutingConfig::default(),
             gateway: GatewayConfig {
                 models: BTreeMap::new(),
+                retries: DEFAULT_RETRIES,
+                breaker_threshold: DEFAULT_BREAKER_THRESHOLD,
+                breaker_cooldown: DEFAULT_BREAKER_COOLDOWN,
+                failover: DEFAULT_FAILOVER.to_owned(),
                 cache: None,
                 rate_limit: None,
                 keys: BTreeMap::new(),
@@ -527,6 +544,29 @@ pub fn validate_gateway_toml(text: &str, where_: &str) -> Result<(), GatewayErro
 /// Serialize parsed gateway config back to TOML without resolving secrets.
 pub fn dump_gateway_toml(gateway: &GatewayConfig) -> String {
     let mut blocks = Vec::new();
+    if gateway.retries != DEFAULT_RETRIES
+        || gateway.breaker_threshold != DEFAULT_BREAKER_THRESHOLD
+        || gateway.breaker_cooldown != DEFAULT_BREAKER_COOLDOWN
+        || gateway.failover != DEFAULT_FAILOVER
+    {
+        let mut lines = vec!["[gateway]".to_owned()];
+        if gateway.retries != DEFAULT_RETRIES {
+            lines.push(format!("retries = {}", gateway.retries));
+        }
+        if gateway.breaker_threshold != DEFAULT_BREAKER_THRESHOLD {
+            lines.push(format!("breaker_threshold = {}", gateway.breaker_threshold));
+        }
+        if gateway.breaker_cooldown != DEFAULT_BREAKER_COOLDOWN {
+            lines.push(format!(
+                "breaker_cooldown = {}",
+                python_float_repr(gateway.breaker_cooldown)
+            ));
+        }
+        if gateway.failover != DEFAULT_FAILOVER {
+            lines.push(format!("failover = \"{}\"", gateway.failover));
+        }
+        blocks.push(lines.join("\n"));
+    }
     if let Some(cache) = &gateway.cache {
         let mut lines = vec![
             "[gateway.cache]".to_owned(),
@@ -574,6 +614,18 @@ pub fn dump_gateway_toml(gateway: &GatewayConfig) -> String {
         if let Some(cost_per_1k) = model.cost_per_1k {
             lines.push(format!("cost_per_1k = {}", python_float_repr(cost_per_1k)));
         }
+        if !model.fallbacks.is_empty() {
+            let rendered = model
+                .fallbacks
+                .iter()
+                .map(|fallback| format!("\"{fallback}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("fallbacks = [{rendered}]"));
+        }
+        if let Some(context_window) = model.context_window {
+            lines.push(format!("context_window = {context_window}"));
+        }
         blocks.push(lines.join("\n"));
     }
     blocks.join("\n\n")
@@ -608,6 +660,10 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
     let Some(gateway_value) = data.get("gateway") else {
         return Ok(GatewayConfig {
             models: BTreeMap::new(),
+            retries: DEFAULT_RETRIES,
+            breaker_threshold: DEFAULT_BREAKER_THRESHOLD,
+            breaker_cooldown: DEFAULT_BREAKER_COOLDOWN,
+            failover: DEFAULT_FAILOVER.to_owned(),
             cache: None,
             rate_limit: None,
             keys: BTreeMap::new(),
@@ -616,12 +672,55 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
     let gateway_table = gateway_value
         .as_table()
         .ok_or_else(|| GatewayError::new(format!("{where_}: '[gateway]' must be a table")))?;
+    let retries = match gateway_table.get("retries") {
+        Some(value) => non_negative_usize(value).ok_or_else(|| {
+            GatewayError::new(format!(
+                "{where_}: 'gateway.retries' must be a non-negative integer"
+            ))
+        })?,
+        None => DEFAULT_RETRIES,
+    };
+    let breaker_threshold = match gateway_table.get("breaker_threshold") {
+        Some(value) => positive_usize_value(value).ok_or_else(|| {
+            GatewayError::new(format!(
+                "{where_}: 'gateway.breaker_threshold' must be a positive integer"
+            ))
+        })?,
+        None => DEFAULT_BREAKER_THRESHOLD,
+    };
+    let breaker_cooldown = match gateway_table.get("breaker_cooldown") {
+        Some(value) => non_negative_number(value).ok_or_else(|| {
+            GatewayError::new(format!(
+                "{where_}: 'gateway.breaker_cooldown' must be a non-negative number"
+            ))
+        })?,
+        None => DEFAULT_BREAKER_COOLDOWN,
+    };
+    let failover = match gateway_table.get("failover") {
+        Some(value) => string_field(Some(value)).ok_or_else(|| {
+            GatewayError::new(format!(
+                "{where_}: 'gateway.failover' must be one of {}",
+                reliability::FAILOVER_POLICIES.join(", ")
+            ))
+        })?,
+        None => DEFAULT_FAILOVER.to_owned(),
+    };
+    if !reliability::FAILOVER_POLICIES.contains(&failover.as_str()) {
+        return Err(GatewayError::new(format!(
+            "{where_}: 'gateway.failover' must be one of {}",
+            reliability::FAILOVER_POLICIES.join(", ")
+        )));
+    }
     let cache = parse_cache_config(gateway_table.get("cache"), where_)?;
     let rate_limit = parse_rate_limit_config(gateway_table.get("rate_limit"), where_)?;
     let keys = parse_keys_config(gateway_table.get("keys"), where_)?;
     let Some(models_value) = gateway_table.get("models") else {
         return Ok(GatewayConfig {
             models: BTreeMap::new(),
+            retries,
+            breaker_threshold,
+            breaker_cooldown,
+            failover,
             cache,
             rate_limit,
             keys,
@@ -680,6 +779,32 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
             })?),
             None => None,
         };
+        let fallbacks = match table.get("fallbacks") {
+            Some(Value::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    string_field(Some(value)).ok_or_else(|| {
+                        GatewayError::new(format!(
+                            "{where_}: 'gateway.models.{name}.fallbacks' must be a list of model names"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(GatewayError::new(format!(
+                    "{where_}: 'gateway.models.{name}.fallbacks' must be a list of model names"
+                )));
+            }
+            None => Vec::new(),
+        };
+        let context_window = match table.get("context_window") {
+            Some(value) => Some(positive_usize_value(value).ok_or_else(|| {
+                GatewayError::new(format!(
+                    "{where_}: 'gateway.models.{name}.context_window' must be a positive integer"
+                ))
+            })?),
+            None => None,
+        };
         parsed.insert(
             name.clone(),
             GatewayModel {
@@ -688,11 +813,31 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
                 api_key_env,
                 api_key_cmd,
                 cost_per_1k,
+                fallbacks,
+                context_window,
             },
         );
     }
+    for (name, model) in &parsed {
+        for fallback in &model.fallbacks {
+            if fallback == name {
+                return Err(GatewayError::new(format!(
+                    "{where_}: 'gateway.models.{name}.fallbacks' cannot include itself"
+                )));
+            }
+            if !parsed.contains_key(fallback) {
+                return Err(GatewayError::new(format!(
+                    "{where_}: 'gateway.models.{name}.fallbacks' names unknown model '{fallback}'"
+                )));
+            }
+        }
+    }
     Ok(GatewayConfig {
         models: parsed,
+        retries,
+        breaker_threshold,
+        breaker_cooldown,
+        failover,
         cache,
         rate_limit,
         keys,
@@ -857,10 +1002,21 @@ fn positive_number(value: &Value) -> Option<f64> {
 }
 
 fn positive_usize(value: &Value) -> Option<usize> {
+    positive_usize_value(value)
+}
+
+fn positive_usize_value(value: &Value) -> Option<usize> {
     let Value::Integer(value) = value else {
         return None;
     };
     usize::try_from(*value).ok().filter(|value| *value > 0)
+}
+
+fn non_negative_usize(value: &Value) -> Option<usize> {
+    let Value::Integer(value) = value else {
+        return None;
+    };
+    usize::try_from(*value).ok()
 }
 
 fn positive_u64(value: &Value) -> Option<u64> {
@@ -902,6 +1058,10 @@ impl GatewayRuntime {
         Self {
             cache: Mutex::new(ResponseCache::new(gateway.cache.clone())),
             rate_limiter: Mutex::new(RateLimiter::new(gateway.rate_limit.clone())),
+            breaker: Mutex::new(reliability::CircuitBreaker::new(
+                gateway.breaker_threshold,
+                Duration::from_secs_f64(gateway.breaker_cooldown),
+            )),
             metrics: Mutex::new(Metrics::default()),
             recent: Mutex::new(VecDeque::new()),
             ledger: Mutex::new(ledger),
@@ -1085,6 +1245,13 @@ impl Metrics {
         *self.upstream_errors.entry(model.to_owned()).or_default() += 1;
     }
 
+    fn observe_failover(&mut self, chosen: &str, served_by: &str) {
+        *self
+            .failovers
+            .entry((chosen.to_owned(), served_by.to_owned()))
+            .or_default() += 1;
+    }
+
     fn observe_cost(&mut self, realized: f64, baseline: f64) {
         self.realized_cost = round_cost(self.realized_cost + realized);
         self.baseline_cost = round_cost(self.baseline_cost + baseline);
@@ -1144,6 +1311,20 @@ impl Metrics {
                 "wayfinder_router_upstream_errors_total{{model=\"{}\"}} {count}",
                 label_escape(model)
             ));
+        }
+        if !self.failovers.is_empty() {
+            lines.push(
+                "# HELP wayfinder_router_failovers_total Requests served by a fallback target."
+                    .to_owned(),
+            );
+            lines.push("# TYPE wayfinder_router_failovers_total counter".to_owned());
+            for ((chosen, served_by), count) in &self.failovers {
+                lines.push(format!(
+                    "wayfinder_router_failovers_total{{model=\"{}\",served_by=\"{}\"}} {count}",
+                    label_escape(chosen),
+                    label_escape(served_by)
+                ));
+            }
         }
         lines.push(
             "# HELP wayfinder_router_cache_hits_total Exact-match response cache hits.".to_owned(),
@@ -1378,7 +1559,7 @@ async fn chat_completions(
 async fn chat_completions_response(
     state: AppState,
     headers: HeaderMap,
-    mut body: JsonValue,
+    body: JsonValue,
 ) -> Response<Body> {
     let request_id = next_request_id();
     let key_id = match authorize_key(&state, &headers, &request_id) {
@@ -1486,11 +1667,6 @@ async fn chat_completions_response(
         );
     };
 
-    let served_by = route.chosen.clone();
-    response_headers.insert(
-        "x-wayfinder-router-served-by",
-        HeaderValue::from_str(&served_by).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
-    );
     let debug = debug_enabled(&headers);
     let cache_key = if cache_enabled(&state) && is_cacheable_request(&client_body) && !debug {
         Some(cache_key(&target.model, &client_body))
@@ -1517,7 +1693,7 @@ async fn chat_completions_response(
                 RecentDecision {
                     request_id: request_id.clone(),
                     model: route.chosen.clone(),
-                    served_by: served_by.clone(),
+                    served_by: route.chosen.clone(),
                     score: round_score(decision.score),
                     mode: route.mode.clone(),
                     ts: unix_ts(),
@@ -1527,18 +1703,37 @@ async fn chat_completions_response(
             );
             return bytes_response(
                 entry.status,
-                with_content_type(response_headers, &entry.content_type),
+                with_content_type(
+                    served_headers(response_headers, &route.chosen, &route.chosen),
+                    &entry.content_type,
+                ),
                 entry.body,
             );
         }
         response_headers.insert("x-wayfinder-router-cache", HeaderValue::from_static("miss"));
         state.runtime.metrics.lock().unwrap().observe_cache_miss();
     }
-    body["model"] = JsonValue::String(target.model.clone());
+    let policy = failover_policy(&headers, &state.gateway.failover);
+    let plan = delivery_plan_for(&state, &route.chosen, &prompt, policy);
+    if plan.is_empty() {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            response_headers,
+            json!({
+                "error": {
+                    "message": format!(
+                        "no available upstream for '{}' (cooling down or context too small)",
+                        route.chosen
+                    ),
+                    "type": "wayfinder_router_circuit_open"
+                }
+            }),
+        );
+    }
     if body.get("stream").and_then(JsonValue::as_bool) == Some(true) {
         return stream_upstream(
             state,
-            target,
+            plan,
             body,
             response_headers,
             decision,
@@ -1552,7 +1747,7 @@ async fn chat_completions_response(
     }
     forward_upstream(
         state,
-        target,
+        plan,
         body,
         response_headers,
         debug,
@@ -1756,9 +1951,83 @@ fn threshold_tiers(routing: &RoutingConfig, threshold: f64) -> Option<Vec<Tier>>
     ])
 }
 
+fn failover_policy<'a>(headers: &'a HeaderMap, configured: &'a str) -> &'a str {
+    headers
+        .get("x-wayfinder-failover")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| reliability::FAILOVER_POLICIES.contains(value))
+        .unwrap_or(configured)
+}
+
+fn delivery_plan_for(state: &AppState, chosen: &str, prompt: &str, policy: &str) -> Vec<String> {
+    let Some(target) = state.gateway.models.get(chosen) else {
+        return Vec::new();
+    };
+    let ladder = state
+        .routing
+        .tiers
+        .iter()
+        .map(|tier| tier.model.as_str())
+        .collect::<Vec<_>>();
+    let mut candidates = target.fallbacks.clone();
+    candidates.extend(reliability::failover_candidates(chosen, ladder, policy));
+    let estimated_tokens = estimate_tokens(prompt);
+    let now = reliability_now();
+    let breaker = state.runtime.breaker.lock().unwrap();
+    reliability::delivery_plan_at(chosen, candidates, Some(&breaker), now, |name| {
+        state
+            .gateway
+            .models
+            .get(name)
+            .map(|model| reliability::precheck_ok(estimated_tokens, model.context_window))
+            .unwrap_or(true)
+    })
+}
+
+fn reliability_now() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
+fn retry_jitter() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    f64::from(nanos % 1_000_000) / 1_000_000.0
+}
+
+fn retry_delays_for(retries: usize) -> Vec<Duration> {
+    reliability::retry_delays(
+        retries,
+        Duration::from_millis(200),
+        Duration::from_secs(5),
+        retry_jitter,
+    )
+}
+
+fn retry_delay(delays: &[Duration], attempt: usize) -> Duration {
+    delays.get(attempt).copied().unwrap_or_default()
+}
+
+fn served_headers(mut headers: HeaderMap, chosen: &str, served_by: &str) -> HeaderMap {
+    headers.insert(
+        "x-wayfinder-router-served-by",
+        HeaderValue::from_str(served_by).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+    );
+    if served_by != chosen {
+        headers.insert(
+            "x-wayfinder-router-failover",
+            HeaderValue::from_static("true"),
+        );
+    }
+    headers
+}
+
 async fn forward_upstream(
     state: AppState,
-    target: GatewayModel,
+    plan: Vec<String>,
     body: JsonValue,
     headers: HeaderMap,
     debug: bool,
@@ -1766,149 +2035,195 @@ async fn forward_upstream(
     route: RouteDecision,
     request_id: String,
     prompt: String,
-    cache_key: Option<String>,
+    cache_key_hint: Option<String>,
     key_id: Option<String>,
     decision_latency: Duration,
 ) -> Response<Body> {
     let client = upstream_client(&state.options);
-    let url = chat_url(&target.base_url);
-    let upstream_started = Instant::now();
-    let response = client
-        .post(url)
-        .headers(upstream_headers(&target))
-        .json(&body)
-        .send()
-        .await;
-    let Ok(response) = response else {
-        state
-            .runtime
-            .metrics
-            .lock()
-            .unwrap()
-            .observe_upstream_error(&route.chosen);
-        return upstream_error(headers, "upstream request failed");
-    };
-    let upstream_latency = upstream_started.elapsed();
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/json")
-        .to_owned();
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(_) => {
+    let mut last_error = "no upstream available".to_owned();
+    for served_by in plan {
+        let Some(target) = state.gateway.models.get(&served_by).cloned() else {
+            continue;
+        };
+        let delays = retry_delays_for(state.gateway.retries);
+        for attempt in 0..=state.gateway.retries {
+            let mut upstream_body = body.clone();
+            upstream_body["model"] = JsonValue::String(target.model.clone());
+            let upstream_started = Instant::now();
+            let response = client
+                .post(chat_url(&target.base_url))
+                .headers(upstream_headers(&target))
+                .json(&upstream_body)
+                .send()
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(err) => {
+                    last_error = err.to_string();
+                    state
+                        .runtime
+                        .metrics
+                        .lock()
+                        .unwrap()
+                        .observe_upstream_error(&served_by);
+                    if attempt < state.gateway.retries {
+                        tokio::time::sleep(retry_delay(&delays, attempt)).await;
+                    }
+                    continue;
+                }
+            };
+            let upstream_latency = upstream_started.elapsed();
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/json")
+                .to_owned();
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    last_error = err.to_string();
+                    state
+                        .runtime
+                        .metrics
+                        .lock()
+                        .unwrap()
+                        .observe_upstream_error(&served_by);
+                    if attempt < state.gateway.retries {
+                        tokio::time::sleep(retry_delay(&delays, attempt)).await;
+                    }
+                    continue;
+                }
+            };
+            if !reliability::is_retryable(Some(status.as_u16())) {
+                state
+                    .runtime
+                    .breaker
+                    .lock()
+                    .unwrap()
+                    .record(&served_by, true, reliability_now());
+                if status.is_success() {
+                    let served_headers = served_headers(headers, &route.chosen, &served_by);
+                    let parsed = serde_json::from_slice::<JsonValue>(&bytes).ok();
+                    let completion = parsed
+                        .as_ref()
+                        .map(extract_completion_text)
+                        .unwrap_or_default();
+                    let usage = parsed
+                        .as_ref()
+                        .map(|parsed| usage_tokens(parsed, &prompt, &completion))
+                        .unwrap_or_else(|| usage_tokens(&JsonValue::Null, &prompt, &completion));
+                    let turn_cost = turn_cost_from_tokens(
+                        &state,
+                        &served_by,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.estimated,
+                    );
+                    let cost = recent_cost_from_turn(&state, &turn_cost);
+                    state
+                        .runtime
+                        .rate_limiter
+                        .lock()
+                        .unwrap()
+                        .add_tokens(usage.prompt_tokens + usage.completion_tokens);
+                    record_savings(&state, &turn_cost);
+                    {
+                        let mut metrics = state.runtime.metrics.lock().unwrap();
+                        metrics.observe_decision(&route.chosen, &route.mode, decision_latency);
+                        metrics.observe_upstream(&served_by, upstream_latency);
+                        if served_by != route.chosen {
+                            metrics.observe_failover(&route.chosen, &served_by);
+                        }
+                        metrics.observe_cost(turn_cost.realized, turn_cost.baseline);
+                    }
+                    push_recent(
+                        &state,
+                        RecentDecision {
+                            request_id: request_id.clone(),
+                            model: route.chosen.clone(),
+                            served_by: served_by.clone(),
+                            score: round_score(decision.score),
+                            mode: route.mode.clone(),
+                            ts: unix_ts(),
+                            cost: cost.clone(),
+                            key_id: key_id.clone(),
+                        },
+                    );
+                    if let Some(parsed) = parsed.as_ref() {
+                        if cache_key_hint.is_some()
+                            && is_storable_response(status, &content_type, parsed)
+                        {
+                            state.runtime.cache.lock().unwrap().put(
+                                cache_key(&target.model, &body),
+                                CacheEntry {
+                                    status,
+                                    content_type: content_type.clone(),
+                                    body: bytes.to_vec(),
+                                    stored_at: Instant::now(),
+                                    prompt_tokens: usage.prompt_tokens,
+                                    completion_tokens: usage.completion_tokens,
+                                    estimated: usage.estimated,
+                                    avoided_cost: cost.realized,
+                                },
+                            );
+                        }
+                    }
+                    if debug && content_type.contains("json") {
+                        if let Some(mut parsed) = parsed {
+                            if let Some(object) = parsed.as_object_mut() {
+                                object.insert(
+                                    "wayfinder".to_owned(),
+                                    debug_payload(&decision, &route, &request_id),
+                                );
+                                return bytes_response(
+                                    StatusCode::OK,
+                                    with_content_type(served_headers, "application/json"),
+                                    serde_json::to_vec(&parsed).unwrap_or_else(|_| bytes.to_vec()),
+                                );
+                            }
+                        }
+                    }
+                    return bytes_response(
+                        status,
+                        with_content_type(served_headers, &content_type),
+                        bytes.to_vec(),
+                    );
+                }
+                return bytes_response(
+                    status,
+                    with_content_type(
+                        served_headers(headers, &route.chosen, &served_by),
+                        &content_type,
+                    ),
+                    bytes.to_vec(),
+                );
+            }
+            last_error = format!("upstream returned {status}");
             state
                 .runtime
                 .metrics
                 .lock()
                 .unwrap()
-                .observe_upstream_error(&route.chosen);
-            return upstream_error(headers, "upstream response failed");
-        }
-    };
-    if status.is_client_error() {
-        return bytes_response(
-            status,
-            with_content_type(headers, &content_type),
-            bytes.to_vec(),
-        );
-    }
-    if !status.is_success() {
-        state
-            .runtime
-            .metrics
-            .lock()
-            .unwrap()
-            .observe_upstream_error(&route.chosen);
-        return upstream_error(headers, &format!("upstream returned {status}"));
-    }
-    let parsed = serde_json::from_slice::<JsonValue>(&bytes).ok();
-    let completion = parsed
-        .as_ref()
-        .map(extract_completion_text)
-        .unwrap_or_default();
-    let usage = parsed
-        .as_ref()
-        .map(|parsed| usage_tokens(parsed, &prompt, &completion))
-        .unwrap_or_else(|| usage_tokens(&JsonValue::Null, &prompt, &completion));
-    let turn_cost = turn_cost_from_tokens(
-        &state,
-        &route.chosen,
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        usage.estimated,
-    );
-    let cost = recent_cost_from_turn(&state, &turn_cost);
-    state
-        .runtime
-        .rate_limiter
-        .lock()
-        .unwrap()
-        .add_tokens(usage.prompt_tokens + usage.completion_tokens);
-    record_savings(&state, &turn_cost);
-    {
-        let mut metrics = state.runtime.metrics.lock().unwrap();
-        metrics.observe_decision(&route.chosen, &route.mode, decision_latency);
-        metrics.observe_upstream(&route.chosen, upstream_latency);
-        metrics.observe_cost(turn_cost.realized, turn_cost.baseline);
-    }
-    push_recent(
-        &state,
-        RecentDecision {
-            request_id: request_id.clone(),
-            model: route.chosen.clone(),
-            served_by: route.chosen.clone(),
-            score: round_score(decision.score),
-            mode: route.mode.clone(),
-            ts: unix_ts(),
-            cost: cost.clone(),
-            key_id: key_id.clone(),
-        },
-    );
-    if let (Some(cache_key), Some(parsed)) = (&cache_key, parsed.as_ref()) {
-        if is_storable_response(status, &content_type, parsed) {
-            state.runtime.cache.lock().unwrap().put(
-                cache_key.clone(),
-                CacheEntry {
-                    status,
-                    content_type: content_type.clone(),
-                    body: bytes.to_vec(),
-                    stored_at: Instant::now(),
-                    prompt_tokens: usage.prompt_tokens,
-                    completion_tokens: usage.completion_tokens,
-                    estimated: usage.estimated,
-                    avoided_cost: cost.realized,
-                },
-            );
-        }
-    }
-    if debug && content_type.contains("json") {
-        if let Some(mut parsed) = parsed {
-            if let Some(object) = parsed.as_object_mut() {
-                object.insert(
-                    "wayfinder".to_owned(),
-                    debug_payload(&decision, &route, &request_id),
-                );
-                return bytes_response(
-                    StatusCode::OK,
-                    with_content_type(headers, "application/json"),
-                    serde_json::to_vec(&parsed).unwrap_or_else(|_| bytes.to_vec()),
-                );
+                .observe_upstream_error(&served_by);
+            if attempt < state.gateway.retries {
+                tokio::time::sleep(retry_delay(&delays, attempt)).await;
             }
         }
+        state
+            .runtime
+            .breaker
+            .lock()
+            .unwrap()
+            .record(&served_by, false, reliability_now());
     }
-    bytes_response(
-        status,
-        with_content_type(headers, &content_type),
-        bytes.to_vec(),
-    )
+    upstream_error(headers, &last_error)
 }
 
 async fn stream_upstream(
     state: AppState,
-    target: GatewayModel,
+    plan: Vec<String>,
     body: JsonValue,
     headers: HeaderMap,
     decision: ComplexityScore,
@@ -1919,54 +2234,97 @@ async fn stream_upstream(
     decision_latency: Duration,
 ) -> Response<Body> {
     let client = upstream_client(&state.options);
-    let url = chat_url(&target.base_url);
-    let upstream_started = Instant::now();
-    let response = client
-        .post(url)
-        .headers(upstream_headers(&target))
-        .json(&body)
-        .send()
-        .await;
-    let Ok(response) = response else {
-        state
-            .runtime
-            .metrics
-            .lock()
-            .unwrap()
-            .observe_upstream_error(&route.chosen);
-        return upstream_error(headers, "upstream stream request failed");
-    };
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/json")
-        .to_owned();
-    if status.is_client_error() {
-        let bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(_) => return upstream_error(headers, "upstream response failed"),
+    let mut last_error = "no upstream available".to_owned();
+    let mut opened = None;
+    'targets: for served_by in plan {
+        let Some(target) = state.gateway.models.get(&served_by).cloned() else {
+            continue;
         };
-        return bytes_response(
-            status,
-            with_content_type(headers, &content_type),
-            bytes.to_vec(),
-        );
-    }
-    if !status.is_success() {
+        let delays = retry_delays_for(state.gateway.retries);
+        for attempt in 0..=state.gateway.retries {
+            let mut upstream_body = body.clone();
+            upstream_body["model"] = JsonValue::String(target.model.clone());
+            let upstream_started = Instant::now();
+            let response = client
+                .post(chat_url(&target.base_url))
+                .headers(upstream_headers(&target))
+                .json(&upstream_body)
+                .send()
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(err) => {
+                    last_error = err.to_string();
+                    state
+                        .runtime
+                        .metrics
+                        .lock()
+                        .unwrap()
+                        .observe_upstream_error(&served_by);
+                    if attempt < state.gateway.retries {
+                        tokio::time::sleep(retry_delay(&delays, attempt)).await;
+                    }
+                    continue;
+                }
+            };
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/json")
+                .to_owned();
+            if !reliability::is_retryable(Some(status.as_u16())) {
+                state
+                    .runtime
+                    .breaker
+                    .lock()
+                    .unwrap()
+                    .record(&served_by, true, reliability_now());
+                if status.is_success() {
+                    opened = Some((served_by, response, upstream_started));
+                    break 'targets;
+                }
+                let bytes = match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(_) => return upstream_error(headers, "upstream response failed"),
+                };
+                return bytes_response(
+                    status,
+                    with_content_type(
+                        served_headers(headers, &route.chosen, &served_by),
+                        &content_type,
+                    ),
+                    bytes.to_vec(),
+                );
+            }
+            last_error = format!("upstream returned {status}");
+            state
+                .runtime
+                .metrics
+                .lock()
+                .unwrap()
+                .observe_upstream_error(&served_by);
+            if attempt < state.gateway.retries {
+                tokio::time::sleep(retry_delay(&delays, attempt)).await;
+            }
+        }
         state
             .runtime
-            .metrics
+            .breaker
             .lock()
             .unwrap()
-            .observe_upstream_error(&route.chosen);
-        return upstream_error(headers, &format!("upstream returned {status}"));
+            .record(&served_by, false, reliability_now());
     }
+    let Some((served_by, response, upstream_started)) = opened else {
+        return upstream_error(headers, &last_error);
+    };
+    let chosen = route.chosen.clone();
     let stream = Box::pin(response.bytes_stream());
     let accounting = StreamAccounting {
         state,
         route,
+        served_by: served_by.clone(),
         request_id,
         prompt,
         key_id,
@@ -1988,10 +2346,7 @@ async fn stream_upstream(
                 }
                 Some(Err(err)) => {
                     accounting.observe_error();
-                    Some((
-                        Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
-                        (stream, accounting),
-                    ))
+                    Some((Err(std::io::Error::other(err)), (stream, accounting)))
                 }
                 None => {
                     accounting.finish();
@@ -2005,7 +2360,10 @@ async fn stream_upstream(
         .header(CONTENT_TYPE, "text/event-stream")
         .body(Body::from_stream(stream))
         .map(|mut response| {
-            *response.headers_mut() = with_content_type(headers, "text/event-stream");
+            *response.headers_mut() = with_content_type(
+                served_headers(headers, &chosen, &served_by),
+                "text/event-stream",
+            );
             response
         })
         .unwrap_or_else(|_| {
@@ -2020,6 +2378,7 @@ async fn stream_upstream(
 struct StreamAccounting {
     state: AppState,
     route: RouteDecision,
+    served_by: String,
     request_id: String,
     prompt: String,
     key_id: Option<String>,
@@ -2049,7 +2408,12 @@ impl StreamAccounting {
             .metrics
             .lock()
             .unwrap()
-            .observe_upstream_error(&self.route.chosen);
+            .observe_upstream_error(&self.served_by);
+        self.state.runtime.breaker.lock().unwrap().record(
+            &self.served_by,
+            false,
+            reliability_now(),
+        );
     }
 
     fn finish(&mut self) {
@@ -2065,7 +2429,7 @@ impl StreamAccounting {
         let usage = usage_tokens(&JsonValue::Null, &self.prompt, &self.completion);
         let turn_cost = turn_cost_from_tokens(
             &self.state,
-            &self.route.chosen,
+            &self.served_by,
             usage.prompt_tokens,
             usage.completion_tokens,
             usage.estimated,
@@ -2089,6 +2453,12 @@ impl StreamAccounting {
             cost,
             self.key_id.clone(),
         );
+        self.state
+            .runtime
+            .breaker
+            .lock()
+            .unwrap()
+            .record(&self.served_by, true, reliability_now());
     }
 }
 
@@ -2215,12 +2585,43 @@ pub fn invoke_messages(
     timeout: Duration,
 ) -> Result<String, UpstreamError> {
     let client = blocking_client(timeout)?;
-    let response = client
-        .post(chat_url(&target.base_url))
-        .headers(upstream_headers(target))
-        .json(&relay_body(target, messages, false))
-        .send()
-        .map_err(|err| UpstreamError::Transport(err.to_string()))?;
+    let body = relay_body(target, messages, false);
+    let delays = retry_delays_for(DEFAULT_RETRIES);
+    let mut last_transport = None;
+    let mut final_response = None;
+    for attempt in 0..=DEFAULT_RETRIES {
+        let response = client
+            .post(chat_url(&target.base_url))
+            .headers(upstream_headers(target))
+            .json(&body)
+            .send();
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                last_transport = Some(err.to_string());
+                if attempt < DEFAULT_RETRIES {
+                    std::thread::sleep(retry_delay(&delays, attempt));
+                    continue;
+                }
+                break;
+            }
+        };
+        let status = response.status();
+        if status.is_success() || !reliability::is_retryable(Some(status.as_u16())) {
+            final_response = Some(response);
+            break;
+        }
+        if attempt >= DEFAULT_RETRIES {
+            final_response = Some(response);
+            break;
+        }
+        std::thread::sleep(retry_delay(&delays, attempt));
+    }
+    let Some(response) = final_response else {
+        return Err(UpstreamError::Transport(
+            last_transport.unwrap_or_else(|| "upstream transport failed".to_owned()),
+        ));
+    };
     let status = response.status();
     if !status.is_success() {
         let body = response.text().unwrap_or_default();
@@ -2303,12 +2704,43 @@ impl StreamMessages {
         timeout: Duration,
     ) -> Result<reqwest::blocking::Response, UpstreamError> {
         let client = blocking_client(timeout)?;
-        let response = client
-            .post(chat_url(&target.base_url))
-            .headers(upstream_headers(target))
-            .json(&relay_body(target, messages, true))
-            .send()
-            .map_err(|err| UpstreamError::Transport(err.to_string()))?;
+        let body = relay_body(target, messages, true);
+        let delays = retry_delays_for(DEFAULT_RETRIES);
+        let mut last_transport = None;
+        let mut final_response = None;
+        for attempt in 0..=DEFAULT_RETRIES {
+            let response = client
+                .post(chat_url(&target.base_url))
+                .headers(upstream_headers(target))
+                .json(&body)
+                .send();
+            let response = match response {
+                Ok(response) => response,
+                Err(err) => {
+                    last_transport = Some(err.to_string());
+                    if attempt < DEFAULT_RETRIES {
+                        std::thread::sleep(retry_delay(&delays, attempt));
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let status = response.status();
+            if status.is_success() || !reliability::is_retryable(Some(status.as_u16())) {
+                final_response = Some(response);
+                break;
+            }
+            if attempt >= DEFAULT_RETRIES {
+                final_response = Some(response);
+                break;
+            }
+            std::thread::sleep(retry_delay(&delays, attempt));
+        }
+        let Some(response) = final_response else {
+            return Err(UpstreamError::Transport(
+                last_transport.unwrap_or_else(|| "upstream transport failed".to_owned()),
+            ));
+        };
         let status = response.status();
         if !status.is_success() {
             let body = response.text().unwrap_or_default();
@@ -2736,6 +3168,9 @@ fn observe_decision(
         metrics.observe_decision(&route.chosen, &route.mode, decision_latency);
         if let Some(upstream_latency) = upstream_latency {
             metrics.observe_upstream(served_by, upstream_latency);
+        }
+        if served_by != route.chosen {
+            metrics.observe_failover(&route.chosen, served_by);
         }
         metrics.observe_cost(cost.realized, cost.baseline);
     }
@@ -3211,7 +3646,7 @@ fn openai_sse_to_anthropic_stream(
                     }
                     Some(Err(err)) => {
                         return Some((
-                            Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+                            Err(std::io::Error::other(err)),
                             (upstream, translator, buffer, pending, finished),
                         ));
                     }
@@ -3382,7 +3817,7 @@ fn sse_event(event: &str, data: JsonValue) -> Vec<u8> {
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let dry_run = if state.options.dry_run { true } else { false };
+    let dry_run = state.options.dry_run;
     let recent_total = state.runtime.recent.lock().unwrap().len();
     let body = state.runtime.metrics.lock().unwrap().render(
         env!("CARGO_PKG_VERSION"),
