@@ -432,7 +432,7 @@ lexw.addEventListener('input',()=>{syncLex();touch();}); syncLex();
 rterms.addEventListener('input',touch); cterms.addEventListener('input',touch);
 
 // Read-only Models / key status (WF-ADR-0025): names, endpoints, and whether each
-// model's key env var is set — never the secret itself.
+// model's key env var is set, never the secret itself.
 const mhost=u=>{try{return new URL(u).host;}catch(e){return u;}};
 fetch('/router/models').then(r=>r.json()).then(d=>{
   const box=document.getElementById('models'); box.innerHTML='';
@@ -593,7 +593,7 @@ function openMenu(btn,t){menu.innerHTML='';
   menu.appendChild(mk('Rename',()=>{const row=btn.closest('.thread'),ttl=row&&row.querySelector('.t-title');
     if(ttl)renameInline(ttl,t.title||'',v=>{t.title=v;t.named=true;persist();});}));
   menu.appendChild(el('sep')); menu.appendChild(el('mlabel','Move to'));
-  if(t.folder)menu.appendChild(mk('— No folder —',()=>{t.folder=null;persist();renderSidebar();}));
+  if(t.folder)menu.appendChild(mk('- No folder -',()=>{t.folder=null;persist();renderSidebar();}));
   folders.forEach(f=>{if(f.id!==t.folder)menu.appendChild(mk(f.name,()=>{t.folder=f.id;f.open=true;persist();renderSidebar();}));});
   menu.appendChild(mk('+ New folder…',()=>{const f=addFolder();if(f){t.folder=f.id;persist();renderSidebar();}}));
   menu.appendChild(el('sep'));
@@ -688,7 +688,7 @@ async function send(text){
     const ans=el('answer'); let item;
     if(content){ans.appendChild(el('msg bot',content));item={role:'assistant',content:content,wf};}
     else if(data&&data.error){const m=data.error.message||'error';ans.appendChild(el('msg note',m));item={role:'note',content:m};}
-    else if(wf&&wf.dry_run){const m='Routed to the '+wf.model+' model — no model was called in --dry-run mode. Configure a model (or drop --dry-run) to see the reply.';
+    else if(wf&&wf.dry_run){const m='Routed to the '+wf.model+' model, no model was called in --dry-run mode. Configure a model (or drop --dry-run) to see the reply.';
       ans.appendChild(el('msg bot dry',m));item={role:'assistant',content:'',wf,dry:true};}
     else{const m='No content returned.';ans.appendChild(el('msg note',m));item={role:'note',content:m};}
     if(wf) ans.appendChild(routing(wf));

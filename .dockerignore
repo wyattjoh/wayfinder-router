@@ -1,9 +1,3 @@
 .git
 .claude/worktrees
-.mypy_cache
-.pytest_cache
-.ruff_cache
-__pycache__
-dist
 target
-*.egg-info

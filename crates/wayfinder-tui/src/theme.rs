@@ -1,5 +1,5 @@
 //! The brand palette ported from the Python TUI (`THEMES`, `palette_for`,
-//! `_resolve_theme`) pulled from `wayfinder_router/demo.html`.
+//! `_resolve_theme`) pulled from the embedded gateway demo HTML.
 //!
 //! `accent` is the local arm (green), `cloud` the hosted arm (amber), and `warn`
 //! matches the demo's `.warn`. `bg` is the full-screen fill: the app takes over the

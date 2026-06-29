@@ -1,8 +1,6 @@
 # Wayfinder gateway container.
 #
-# The current service image builds the Rust CLI and runs the Rust gateway surface.
-# The Python package remains available through PyPI for legacy CLI and API users,
-# but it is not installed in this runtime image.
+# The service image builds the Rust CLI and runs the Rust gateway surface.
 FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /app

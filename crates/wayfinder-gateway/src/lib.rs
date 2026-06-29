@@ -41,7 +41,7 @@ pub mod reliability;
 
 pub const COMMAND_NAME: &str = "serve";
 
-const DEMO_HTML: &str = include_str!("../../../wayfinder_router/demo.html");
+const DEMO_HTML: &str = include_str!("assets/demo.html");
 const DEFAULT_TIMEOUT_SECONDS: f64 = 60.0;
 const AUTO_DIRECTIVE: &str = "auto";
 const PREFER_LOCAL_DIRECTIVE: &str = "prefer-local";
@@ -194,7 +194,7 @@ impl RelayMessage {
 
 /// A failure relaying a call to an upstream model (the relay's public error surface).
 ///
-/// `Transport` covers a connection-level failure (timeout, connection refused — the
+/// `Transport` covers a connection-level failure (timeout, connection refused, the
 /// equivalent of the gateway being unavailable). `Status` carries a non-success HTTP
 /// status and the upstream's body. `Shape` means the reply could not be parsed into the
 /// expected OpenAI completion shape.
