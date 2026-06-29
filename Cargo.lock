@@ -2528,6 +2528,8 @@ dependencies = [
 name = "wayfinder-internal-cli"
 version = "0.0.0"
 dependencies = [
+ "serde_json",
+ "wayfinder-internal-core",
  "wayfinder-internal-gateway",
  "wayfinder-internal-tui",
 ]

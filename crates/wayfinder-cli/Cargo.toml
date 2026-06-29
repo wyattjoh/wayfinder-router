@@ -14,5 +14,7 @@ name = "wayfinder-router"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = "1"
+wayfinder-internal-core = { path = "../wayfinder-core" }
 wayfinder-internal-gateway = { path = "../wayfinder-gateway" }
 wayfinder-internal-tui = { path = "../wayfinder-tui" }
