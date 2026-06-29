@@ -15,16 +15,22 @@ use wayfinder_internal_core::complexity::{
     binary_tiers, explain_score, score_complexity, ComplexityScore, FeatureWeights, RoutingConfig,
     DEFAULT_WEIGHTS, FEATURE_ORDER,
 };
-use wayfinder_internal_core::config::load_routing_config;
+use wayfinder_internal_core::config::{load_routing_config, CONFIG_FILE};
 use wayfinder_internal_core::feedback::{read_labels, record_label, DEFAULT_LOG};
 use wayfinder_internal_core::judge::{HeuristicJudge, Judge, OnboardOutputs};
 use wayfinder_internal_core::onboard::OnboardSummary;
 use wayfinder_internal_core::sufficiency::{
     evaluate_with_options, EvaluateOptions, DEFAULT_CV_FOLDS, DEFAULT_KAPPA_FLOOR,
 };
+use wayfinder_internal_core::vkeys;
+use wayfinder_internal_gateway::bootstrap::{
+    key_status, missing_keys, render_config, render_env_example, resolve_keys,
+    suggest_key_commands, DEFAULT_PRESET, PRESETS,
+};
 use wayfinder_internal_gateway::recalibrate::{recalibrate, DEFAULT_MIN_LABELS};
 use wayfinder_internal_gateway::{
-    invoke_messages, load_gateway_models, serve_summary, GatewayModel, RelayMessage, ServeOptions,
+    gateway_config_from_toml, invoke_messages, load_gateway_models, serve_summary, GatewayModel,
+    RelayMessage, ServeOptions,
 };
 use wayfinder_internal_tui::{run_chat, ChatOptions, HELP};
 
@@ -35,6 +41,8 @@ const EXIT_USAGE: i32 = 2;
 pub struct CliError {
     message: String,
     exit_code: i32,
+    stdout: String,
+    stderr: String,
 }
 
 impl CliError {
@@ -46,6 +54,8 @@ impl CliError {
         Self {
             message: message.into(),
             exit_code: EXIT_USAGE,
+            stdout: String::new(),
+            stderr: String::new(),
         }
     }
 
@@ -53,11 +63,35 @@ impl CliError {
         Self {
             message: message.into(),
             exit_code: EXIT_CONFIG,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn with_output(
+        message: impl Into<String>,
+        exit_code: i32,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            exit_code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
         }
     }
 
     pub fn exit_code(&self) -> i32 {
         self.exit_code
+    }
+
+    pub fn stdout(&self) -> &str {
+        &self.stdout
+    }
+
+    pub fn stderr(&self) -> &str {
+        &self.stderr
     }
 }
 
@@ -73,12 +107,66 @@ impl Error for CliError {}
 pub enum CliCommand {
     Serve(ServeOptions),
     Chat(ChatOptions),
+    Init(InitOptions),
+    Doctor(DoctorOptions),
+    Keys(KeysOptions),
     Route(RouteOptions),
     Calibrate(CalibrateOptions),
     Recalibrate(RecalibrateOptions),
     Onboard(OnboardOptions),
     Judge(JudgeOptions),
     Help(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitOptions {
+    pub interactive: bool,
+    pub preset: String,
+    pub path: PathBuf,
+    pub force: bool,
+    pub print: bool,
+}
+
+impl Default for InitOptions {
+    fn default() -> Self {
+        Self {
+            interactive: false,
+            preset: DEFAULT_PRESET.to_owned(),
+            path: PathBuf::from(CONFIG_FILE),
+            force: false,
+            print: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoctorOptions {
+    pub dir: PathBuf,
+}
+
+impl Default for DoctorOptions {
+    fn default() -> Self {
+        Self {
+            dir: PathBuf::from("."),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeysOptions {
+    pub action: String,
+    pub id: String,
+    pub tags: Vec<String>,
+}
+
+impl Default for KeysOptions {
+    fn default() -> Self {
+        Self {
+            action: "new".to_owned(),
+            id: "team-1".to_owned(),
+            tags: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -230,6 +318,38 @@ options:
   --explain            show each feature contribution in human output
   --help, -h           show this help";
 
+const INIT_USAGE: &str = "\
+usage: wayfinder-router init [OPTIONS]
+
+Scaffold a wayfinder-router.toml and matching .env.example.
+
+options:
+  -i, --interactive          accept the interactive init flag
+  --preset <name>            hybrid, openai, or gemini
+  --path <path>              config path to write
+  --force                    overwrite existing files
+  --print                    print config instead of writing
+  --help, -h                 show this help";
+
+const DOCTOR_USAGE: &str = "\
+usage: wayfinder-router doctor [OPTIONS]
+
+Check the nearest wayfinder-router.toml and model key readiness.
+
+options:
+  --dir <path>   where to start the config search
+  --help, -h     show this help";
+
+const KEYS_USAGE: &str = "\
+usage: wayfinder-router keys new [OPTIONS]
+
+Mint a virtual API key for the gateway.
+
+options:
+  --id <id>      key id for the [gateway.keys.<id>] block
+  --tag <tag>    attribution tag, repeatable
+  --help, -h     show this help";
+
 const CALIBRATE_USAGE: &str = "\
 usage: wayfinder-router calibrate <dataset> [OPTIONS]
 
@@ -340,6 +460,18 @@ where
                 Ok(CliCommand::Chat(options))
             }
         },
+        Some("init") => match parse_init(args)? {
+            None => Ok(CliCommand::Help(INIT_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Init(options)),
+        },
+        Some("doctor") => match parse_doctor(args)? {
+            None => Ok(CliCommand::Help(DOCTOR_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Doctor(options)),
+        },
+        Some("keys") => match parse_keys(args)? {
+            None => Ok(CliCommand::Help(KEYS_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Keys(options)),
+        },
         Some("route") => match parse_route(args)? {
             None => Ok(CliCommand::Help(ROUTE_USAGE.to_owned())),
             Some(mut options) => {
@@ -366,10 +498,10 @@ where
             Some(options) => Ok(CliCommand::Judge(options)),
         },
         Some(command) => Err(CliError::new(format!(
-            "unknown command '{command}' (expected 'serve', 'chat', 'route', 'calibrate', 'recalibrate', 'onboard', or 'judge')"
+            "unknown command '{command}' (expected 'serve', 'chat', 'init', 'doctor', 'keys', 'route', 'calibrate', 'recalibrate', 'onboard', or 'judge')"
         ))),
         None => Err(CliError::new(
-            "expected command: serve, chat, route, calibrate, recalibrate, onboard, or judge",
+            "expected command: serve, chat, init, doctor, keys, route, calibrate, recalibrate, onboard, or judge",
         )),
     }
 }
@@ -384,6 +516,9 @@ pub fn execute(command: CliCommand) -> Result<CommandOutput, CliError> {
             stdout: run_chat(&options).map_err(|err| CliError::config(err.to_string()))?,
             stderr: String::new(),
         }),
+        CliCommand::Init(options) => execute_init(options),
+        CliCommand::Doctor(options) => execute_doctor(options),
+        CliCommand::Keys(options) => execute_keys(options),
         CliCommand::Route(options) => execute_route(options),
         CliCommand::Calibrate(options) => execute_calibrate(options),
         CliCommand::Recalibrate(options) => execute_recalibrate(options),
@@ -461,6 +596,69 @@ where
     }
     if !prompt_parts.is_empty() {
         options.input = Some(prompt_parts.join(" "));
+    }
+    Ok(Some(options))
+}
+
+fn parse_init<I>(args: I) -> Result<Option<InitOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = InitOptions::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "-i" | "--interactive" => options.interactive = true,
+            "--preset" => options.preset = next_value(&mut args, "--preset")?,
+            "--path" => options.path = next_value(&mut args, "--path")?.into(),
+            "--force" => options.force = true,
+            "--print" => options.print = true,
+            other => return Err(CliError::new(format!("unknown init option '{other}'"))),
+        }
+    }
+    Ok(Some(options))
+}
+
+fn parse_doctor<I>(args: I) -> Result<Option<DoctorOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = DoctorOptions::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--dir" => options.dir = next_value(&mut args, "--dir")?.into(),
+            other => return Err(CliError::new(format!("unknown doctor option '{other}'"))),
+        }
+    }
+    Ok(Some(options))
+}
+
+fn parse_keys<I>(args: I) -> Result<Option<KeysOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = KeysOptions::default();
+    let mut args = args.into_iter();
+    let Some(action) = args.next() else {
+        return Err(CliError::new("keys requires an action (currently: new)"));
+    };
+    if action == "--help" || action == "-h" {
+        return Ok(None);
+    }
+    if action != "new" {
+        return Err(CliError::new("keys action must be new"));
+    }
+    options.action = action;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--id" => options.id = next_value(&mut args, "--id")?,
+            "--tag" => options.tags.push(next_value(&mut args, "--tag")?),
+            other => return Err(CliError::new(format!("unknown keys option '{other}'"))),
+        }
     }
     Ok(Some(options))
 }
@@ -920,6 +1118,244 @@ fn execute_judge(options: JudgeOptions) -> Result<CommandOutput, CliError> {
 
     execute_judge_selected(options, arms, |arm, prompt| {
         invoke_gateway_model(models.get(arm).expect("arm was validated"), prompt)
+    })
+}
+
+fn execute_init(options: InitOptions) -> Result<CommandOutput, CliError> {
+    let preset = PRESETS
+        .get(options.preset.as_str())
+        .ok_or_else(|| unknown_preset_error(&options.preset))?;
+    let config_text = render_config(preset);
+    if options.print {
+        return Ok(CommandOutput {
+            stdout: config_text,
+            stderr: String::new(),
+        });
+    }
+
+    let target = options.path;
+    if target.exists() && !options.force {
+        let stderr = format!(
+            "wayfinder-router: {} already exists — use --force to overwrite, or run `wayfinder-router doctor` to check it\n",
+            target.display()
+        );
+        return Err(CliError::with_output(
+            stderr.trim_end().to_owned(),
+            EXIT_USAGE,
+            "",
+            stderr,
+        ));
+    }
+    fs::write(&target, &config_text)
+        .map_err(|err| CliError::usage(format!("cannot write {}: {err}", target.display())))?;
+
+    let mut stdout = format!(
+        "✓ wrote {}  (preset: {} — {})\n",
+        target.display(),
+        preset.name,
+        preset.summary
+    );
+    let mut stderr = String::new();
+
+    if !preset.env_vars.is_empty() {
+        let env_path = target
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(".env.example");
+        if env_path.exists() && !options.force {
+            stdout.push_str(&format!(
+                "· kept existing {} (use --force to overwrite)\n",
+                env_path.display()
+            ));
+        } else if let Err(err) = fs::write(&env_path, render_env_example(preset)) {
+            stderr.push_str(&format!(
+                "wayfinder-router: cannot write {}: {err}\n",
+                env_path.display()
+            ));
+        } else {
+            stdout.push_str(&format!(
+                "✓ wrote {}  (env-var names only — no secrets)\n",
+                env_path.display()
+            ));
+        }
+    }
+
+    let gateway = gateway_config_from_toml(&config_text, "<init>")
+        .map_err(|err| CliError::config(err.to_string()))?;
+    let statuses = key_status(&gateway.models);
+    stdout.push('\n');
+    stdout.push_str(&render_key_report(&statuses));
+    stdout.push('\n');
+    stdout.push('\n');
+    let missing = missing_keys(&statuses);
+    if !missing.is_empty() {
+        stdout.push_str(
+            "set your key(s) — read from the environment at request time, never stored:\n",
+        );
+        stdout.push_str(&render_key_remedies(&missing));
+        stdout.push('\n');
+    }
+    stdout.push_str(
+        "next:  wayfinder-router chat        # or `wayfinder-router doctor` to re-check\n",
+    );
+    Ok(CommandOutput { stdout, stderr })
+}
+
+fn execute_doctor(options: DoctorOptions) -> Result<CommandOutput, CliError> {
+    let Some(path) = find_config_file(&options.dir) else {
+        let stderr = "no wayfinder-router.toml found — run `wayfinder-router init` to create one\n";
+        return Err(CliError::with_output(
+            stderr.trim_end(),
+            EXIT_USAGE,
+            "",
+            stderr,
+        ));
+    };
+    let routing =
+        load_routing_config(&options.dir).map_err(|err| CliError::config(err.to_string()))?;
+    let models =
+        load_gateway_models(&options.dir).map_err(|err| CliError::config(err.to_string()))?;
+
+    let mut stdout = format!(
+        "config:  {}\nrouting: {}\n",
+        path.display(),
+        summarize_routing(&routing)
+    );
+    if models.is_empty() {
+        stdout.push_str(
+            "models:  none configured — add [gateway.models] (see `wayfinder-router init`)\n",
+        );
+        stdout.push_str("(chat / serve will show routing decisions only)\n");
+        return Ok(CommandOutput {
+            stdout,
+            stderr: String::new(),
+        });
+    }
+
+    let cmd_errors = resolve_keys(&models);
+    let statuses = key_status(&models);
+    stdout.push('\n');
+    stdout.push_str(&render_key_report(&statuses));
+    stdout.push('\n');
+    stdout.push('\n');
+    if !cmd_errors.is_empty() {
+        stdout.push_str("key command(s) failed:\n");
+        for (name, reason) in cmd_errors {
+            stdout.push_str(&format!("  {name}: {reason}\n"));
+        }
+        stdout.push('\n');
+    }
+    let missing = missing_keys(&statuses);
+    if !missing.is_empty() {
+        stdout.push_str("not ready — set the missing key(s):\n");
+        stdout.push_str(&render_key_remedies(&missing));
+        return Err(CliError::with_output(
+            stdout.trim_end().to_owned(),
+            EXIT_CONFIG,
+            stdout,
+            "",
+        ));
+    }
+    stdout.push_str("ready:  wayfinder-router chat\n");
+    Ok(CommandOutput {
+        stdout,
+        stderr: String::new(),
+    })
+}
+
+fn execute_keys(options: KeysOptions) -> Result<CommandOutput, CliError> {
+    if options.action != "new" {
+        return Err(CliError::usage("keys action must be new"));
+    }
+    let generated = vkeys::generate(vkeys::KEY_PREFIX);
+    let key_hash = vkeys::hash_key(&generated.plaintext);
+    let mut lines = vec![
+        "# Paste into wayfinder-router.toml (only the hash is stored — never the key):".to_owned(),
+        format!("[gateway.keys.{}]", options.id),
+        format!("hash = \"{key_hash}\""),
+    ];
+    if !options.tags.is_empty() {
+        let tags = options
+            .tags
+            .iter()
+            .map(|tag| format!("\"{tag}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("tags = [{tags}]"));
+    }
+    lines.push(String::new());
+    lines.push(
+        "# Give this key to the caller; it is shown once and cannot be recovered:".to_owned(),
+    );
+    lines.push(generated.plaintext);
+    Ok(CommandOutput {
+        stdout: format!("{}\n", lines.join("\n")),
+        stderr: String::new(),
+    })
+}
+
+fn unknown_preset_error(preset: &str) -> CliError {
+    let choices = PRESETS.keys().copied().collect::<Vec<_>>().join(", ");
+    let stderr = format!("wayfinder-router: unknown preset '{preset}' (choose: {choices})\n");
+    CliError::with_output(stderr.trim_end().to_owned(), EXIT_USAGE, "", stderr)
+}
+
+fn render_key_report(statuses: &[wayfinder_internal_gateway::bootstrap::KeyStatus]) -> String {
+    let mut lines = vec!["models".to_owned()];
+    for status in statuses {
+        let key = match (&status.env_var, status.ok, &status.cmd) {
+            (None, _, _) => "keyless ✓".to_owned(),
+            (Some(env_var), true, Some(_)) => format!("{env_var} ✓ set (via command)"),
+            (Some(env_var), true, None) => format!("{env_var} ✓ set"),
+            (Some(env_var), false, _) => format!("{env_var} ✗ not set"),
+        };
+        lines.push(format!(
+            "  {:<7} {:<24} {:<30} {}",
+            status.name, status.model, status.base_url, key
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_key_remedies(missing: &[String]) -> String {
+    let mut lines = Vec::new();
+    for var in missing {
+        lines.push(format!("  export {var}=\"...\""));
+        for suggestion in suggest_key_commands(var) {
+            lines.push(format!(
+                "  · or store it safely and add:  api_key_cmd = \"{suggestion}\""
+            ));
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn summarize_routing(config: &RoutingConfig) -> String {
+    if let Some(classifier) = &config.classifier {
+        return format!("classifier ({} models)", classifier.models.len());
+    }
+    if config.tiers.is_empty() {
+        return "defaults".to_owned();
+    }
+    config
+        .tiers
+        .iter()
+        .map(|tier| format!("{} ≥{:.2}", tier.model, tier.min_score))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn find_config_file(start_dir: &Path) -> Option<PathBuf> {
+    let current = start_dir
+        .canonicalize()
+        .unwrap_or_else(|_| start_dir.to_path_buf());
+    current.ancestors().find_map(|directory| {
+        let candidate = directory.join(CONFIG_FILE);
+        candidate.is_file().then_some(candidate)
     })
 }
 
@@ -2001,6 +2437,186 @@ mod tests {
                 save_comparisons: Some("comparisons.jsonl".into()),
             })
         );
+    }
+
+    #[test]
+    fn init_prints_exact_preset_config_without_writing() {
+        let dir = unique_temp_dir("cli-init-print");
+        for preset in ["hybrid", "openai", "gemini"] {
+            let path = dir.join(format!("{preset}.toml"));
+            let output = run_output(
+                [
+                    "init",
+                    "--preset",
+                    preset,
+                    "--path",
+                    path.to_str().expect("path is utf-8"),
+                    "--print",
+                ],
+                None,
+            )
+            .expect("init --print should succeed");
+
+            assert_eq!(
+                output.stdout,
+                wayfinder_internal_gateway::bootstrap::render_config(
+                    &wayfinder_internal_gateway::bootstrap::PRESETS[preset],
+                )
+            );
+            assert!(output.stderr.is_empty());
+            assert!(!path.exists());
+            assert!(!dir.join(".env.example").exists());
+        }
+    }
+
+    #[test]
+    fn init_writes_config_and_env_example_next_to_path() {
+        let dir = unique_temp_dir("cli-init-write");
+        let path = dir.join("nested").join("router.toml");
+        fs::create_dir_all(path.parent().expect("path has a parent")).expect("dir write");
+
+        let output = run_output(
+            [
+                "init",
+                "--preset",
+                "openai",
+                "--path",
+                path.to_str().expect("path is utf-8"),
+            ],
+            None,
+        )
+        .expect("init should write files");
+
+        assert!(output.stdout.contains("wrote"));
+        assert!(output.stdout.contains("OPENAI_API_KEY"));
+        assert!(path.is_file());
+        assert!(fs::read_to_string(&path)
+            .expect("config should read")
+            .contains("gpt-4o-mini"));
+        assert!(
+            fs::read_to_string(path.parent().unwrap().join(".env.example"))
+                .expect("env example should read")
+                .contains("OPENAI_API_KEY=")
+        );
+    }
+
+    #[test]
+    fn init_refuses_to_clobber_without_force_and_force_overwrites() {
+        let dir = unique_temp_dir("cli-init-force");
+        let path = dir.join("wayfinder-router.toml");
+        fs::write(&path, "# mine\n").expect("config write");
+
+        let err = run_output(
+            ["init", "--path", path.to_str().expect("path is utf-8")],
+            None,
+        )
+        .expect_err("init should refuse existing file");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("already exists"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("config should read"),
+            "# mine\n"
+        );
+
+        run_output(
+            [
+                "init",
+                "--path",
+                path.to_str().expect("path is utf-8"),
+                "--force",
+            ],
+            None,
+        )
+        .expect("force should overwrite");
+        assert!(fs::read_to_string(&path)
+            .expect("config should read")
+            .contains("[gateway.models.cloud]"));
+    }
+
+    #[test]
+    fn doctor_reports_missing_and_ready_key_status() {
+        let dir = unique_temp_dir("cli-doctor");
+        let config = dir.join("wayfinder-router.toml");
+        let key = format!("WAYFINDER_CLI_DOCTOR_TEST_{}", std::process::id());
+        fs::write(
+            &config,
+            format!(
+                r#"[routing]
+threshold = 0.08
+
+[gateway.models.local]
+base_url = "http://localhost:11434/v1"
+model = "llama3.1"
+
+[gateway.models.cloud]
+base_url = "https://api.example.test/v1"
+model = "hosted"
+api_key_env = "{key}"
+"#
+            ),
+        )
+        .expect("config write");
+
+        std::env::remove_var(&key);
+        let err = run_output(
+            ["doctor", "--dir", dir.to_str().expect("path is utf-8")],
+            None,
+        )
+        .expect_err("missing key should return config error");
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("config:"));
+        assert!(err.to_string().contains("local"));
+        assert!(err.to_string().contains("keyless"));
+        assert!(err.to_string().contains("cloud"));
+        assert!(err.to_string().contains("not ready"));
+        assert!(err.to_string().contains(&key));
+
+        std::env::set_var(&key, "sk-test");
+        let output = run_output(
+            ["doctor", "--dir", dir.to_str().expect("path is utf-8")],
+            None,
+        )
+        .expect("set key should be ready");
+        std::env::remove_var(&key);
+        assert!(output.stdout.contains("ready:"));
+        assert!(output.stdout.contains("keyless"));
+        assert!(output.stdout.contains("set"));
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn doctor_without_config_is_usage_error() {
+        let dir = unique_temp_dir("cli-doctor-missing");
+        let err = run_output(
+            ["doctor", "--dir", dir.to_str().expect("path is utf-8")],
+            None,
+        )
+        .expect_err("missing config should be a usage error");
+
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("no wayfinder-router.toml"));
+    }
+
+    #[test]
+    fn keys_new_mints_pasteable_block() {
+        let output = run_output(["keys", "new", "--id", "team-a", "--tag", "prod"], None)
+            .expect("keys new should succeed");
+        let key = output
+            .stdout
+            .lines()
+            .find(|line| line.starts_with("wf-"))
+            .expect("plaintext key should be printed");
+        let hash = output
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("hash = \""))
+            .and_then(|line| line.strip_suffix('"'))
+            .expect("hash line should be printed");
+
+        assert!(output.stdout.contains("[gateway.keys.team-a]"));
+        assert!(output.stdout.contains("tags = [\"prod\"]"));
+        assert!(wayfinder_internal_core::vkeys::verify(key, hash));
+        assert!(output.stderr.is_empty());
     }
 
     #[test]

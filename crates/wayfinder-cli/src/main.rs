@@ -42,10 +42,7 @@ fn main() {
                     print!("{}", output.stdout);
                     eprint!("{}", output.stderr);
                 }
-                Err(err) => {
-                    eprintln!("wayfinder-router: {err}");
-                    std::process::exit(err.exit_code());
-                }
+                Err(err) => exit_cli_error(err),
             }
         }
         Ok(command) => match wayfinder_internal_cli::execute(command) {
@@ -53,15 +50,9 @@ fn main() {
                 print!("{}", output.stdout);
                 eprint!("{}", output.stderr);
             }
-            Err(err) => {
-                eprintln!("wayfinder-router: {err}");
-                std::process::exit(err.exit_code());
-            }
+            Err(err) => exit_cli_error(err),
         },
-        Err(err) => {
-            eprintln!("wayfinder-router: {err}");
-            std::process::exit(err.exit_code());
-        }
+        Err(err) => exit_cli_error(err),
     }
 }
 
@@ -82,4 +73,14 @@ fn read_piped_stdin() -> Option<String> {
     } else {
         Some(input)
     }
+}
+
+fn exit_cli_error(err: wayfinder_internal_cli::CliError) -> ! {
+    if err.stdout().is_empty() && err.stderr().is_empty() {
+        eprintln!("wayfinder-router: {err}");
+    } else {
+        print!("{}", err.stdout());
+        eprint!("{}", err.stderr());
+    }
+    std::process::exit(err.exit_code());
 }
