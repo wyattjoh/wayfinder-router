@@ -2,9 +2,12 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
+use sha2::{Digest, Sha256};
 use wayfinder_internal_core::calibrate::{
     calibrate, load_dataset, CalibrationOptions, CalibrationResult,
 };
@@ -13,8 +16,16 @@ use wayfinder_internal_core::complexity::{
     DEFAULT_WEIGHTS, FEATURE_ORDER,
 };
 use wayfinder_internal_core::config::load_routing_config;
+use wayfinder_internal_core::feedback::{read_labels, DEFAULT_LOG};
+use wayfinder_internal_core::judge::{HeuristicJudge, Judge, OnboardOutputs};
+use wayfinder_internal_core::onboard::run_onboarding;
+use wayfinder_internal_core::sufficiency::{
+    evaluate_with_options, EvaluateOptions, DEFAULT_CV_FOLDS, DEFAULT_KAPPA_FLOOR,
+};
 use wayfinder_internal_gateway::recalibrate::{recalibrate, DEFAULT_MIN_LABELS};
-use wayfinder_internal_gateway::{serve_summary, ServeOptions};
+use wayfinder_internal_gateway::{
+    invoke_messages, load_gateway_models, serve_summary, GatewayModel, RelayMessage, ServeOptions,
+};
 use wayfinder_internal_tui::{run_chat, ChatOptions, HELP};
 
 const EXIT_CONFIG: i32 = 1;
@@ -65,6 +76,8 @@ pub enum CliCommand {
     Route(RouteOptions),
     Calibrate(CalibrateOptions),
     Recalibrate(RecalibrateOptions),
+    Onboard(OnboardOptions),
+    Judge(JudgeOptions),
     Help(String),
 }
 
@@ -123,6 +136,56 @@ impl Default for RecalibrateOptions {
             out: PathBuf::from("wayfinder-router.toml"),
             mode: "threshold".to_owned(),
             min_labels: DEFAULT_MIN_LABELS,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OnboardOptions {
+    pub prompts: PathBuf,
+    pub arms: Option<String>,
+    pub log: PathBuf,
+    pub calibrate: bool,
+    pub mode: String,
+}
+
+impl Default for OnboardOptions {
+    fn default() -> Self {
+        Self {
+            prompts: PathBuf::new(),
+            arms: None,
+            log: PathBuf::from(DEFAULT_LOG),
+            calibrate: false,
+            mode: "threshold".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct JudgeOptions {
+    pub prompts: PathBuf,
+    pub arms: Option<String>,
+    pub gold: Option<PathBuf>,
+    pub log: PathBuf,
+    pub mode: String,
+    pub kappa_floor: f64,
+    pub folds: usize,
+    pub limit: Option<usize>,
+    pub save_comparisons: Option<PathBuf>,
+}
+
+impl Default for JudgeOptions {
+    fn default() -> Self {
+        Self {
+            prompts: PathBuf::new(),
+            arms: None,
+            gold: None,
+            log: PathBuf::from(DEFAULT_LOG),
+            mode: "threshold".to_owned(),
+            kappa_floor: DEFAULT_KAPPA_FLOOR,
+            folds: DEFAULT_CV_FOLDS,
+            limit: None,
+            save_comparisons: None,
         }
     }
 }
@@ -196,6 +259,34 @@ options:
   --min-labels <n>    skip without writing below this many labels
   --help, -h          show this help";
 
+const ONBOARD_USAGE: &str = "\
+usage: wayfinder-router onboard <prompts> [OPTIONS]
+
+A/B local vs hosted on sample prompts to bootstrap labels.
+
+options:
+  --arms <a,b>      two gateway model names to compare
+  --log <path>      label log to append to
+  --calibrate       calibrate a config from the log when done
+  --mode <name>     threshold, tiers, or classifier
+  --help, -h        show this help";
+
+const JUDGE_USAGE: &str = "\
+usage: wayfinder-router judge <prompts> [OPTIONS]
+
+Auto-label prompts by comparing two tiers, gated by trust checks.
+
+options:
+  --arms <a,b>             two gateway model names in cheap,expensive order
+  --gold <path>            human-labeled {\"text\",\"label\"} JSONL set
+  --log <path>             label log to append to
+  --mode <name>            threshold, tiers, or classifier
+  --kappa-floor <n>        minimum judge-vs-gold Cohen's kappa
+  --folds <n>              cross-validation folds for the lift gate
+  --limit <n>              judge at most this many prompts
+  --save-comparisons <p>   write prompts, responses, and verdicts JSONL
+  --help, -h               show this help";
+
 fn chat_help() -> String {
     format!("{CHAT_USAGE}\n\n{HELP}")
 }
@@ -266,11 +357,19 @@ where
             None => Ok(CliCommand::Help(RECALIBRATE_USAGE.to_owned())),
             Some(options) => Ok(CliCommand::Recalibrate(options)),
         },
+        Some("onboard") => match parse_onboard(args)? {
+            None => Ok(CliCommand::Help(ONBOARD_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Onboard(options)),
+        },
+        Some("judge") => match parse_judge(args)? {
+            None => Ok(CliCommand::Help(JUDGE_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Judge(options)),
+        },
         Some(command) => Err(CliError::new(format!(
-            "unknown command '{command}' (expected 'serve', 'chat', 'route', 'calibrate', or 'recalibrate')"
+            "unknown command '{command}' (expected 'serve', 'chat', 'route', 'calibrate', 'recalibrate', 'onboard', or 'judge')"
         ))),
         None => Err(CliError::new(
-            "expected command: serve, chat, route, calibrate, or recalibrate",
+            "expected command: serve, chat, route, calibrate, recalibrate, onboard, or judge",
         )),
     }
 }
@@ -288,6 +387,8 @@ pub fn execute(command: CliCommand) -> Result<CommandOutput, CliError> {
         CliCommand::Route(options) => execute_route(options),
         CliCommand::Calibrate(options) => execute_calibrate(options),
         CliCommand::Recalibrate(options) => execute_recalibrate(options),
+        CliCommand::Onboard(options) => execute_onboard(options),
+        CliCommand::Judge(options) => execute_judge(options),
         CliCommand::Help(text) => Ok(CommandOutput {
             stdout: format!("{text}\n"),
             stderr: String::new(),
@@ -515,6 +616,114 @@ where
     Ok(Some(options))
 }
 
+fn parse_onboard<I>(args: I) -> Result<Option<OnboardOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = OnboardOptions::default();
+    let mut prompts = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--arms" => options.arms = Some(next_value(&mut args, "--arms")?),
+            "--log" => options.log = next_value(&mut args, "--log")?.into(),
+            "--calibrate" => options.calibrate = true,
+            "--mode" => {
+                options.mode = parse_choice(
+                    "--mode",
+                    next_value(&mut args, "--mode")?,
+                    &["threshold", "tiers", "classifier"],
+                )?
+            }
+            "--" => {
+                prompts = Some(next_value(&mut args, "onboard prompts")?);
+                if args.next().is_some() {
+                    return Err(CliError::new("onboard accepts exactly one prompts file"));
+                }
+                break;
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!("unknown onboard option '{other}'")));
+            }
+            text => {
+                if prompts.is_some() {
+                    return Err(CliError::new("onboard accepts exactly one prompts file"));
+                }
+                prompts = Some(text.to_owned());
+            }
+        }
+    }
+    options.prompts = prompts
+        .ok_or_else(|| CliError::new("onboard requires a prompts file"))?
+        .into();
+    Ok(Some(options))
+}
+
+fn parse_judge<I>(args: I) -> Result<Option<JudgeOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = JudgeOptions::default();
+    let mut prompts = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--arms" => options.arms = Some(next_value(&mut args, "--arms")?),
+            "--gold" => options.gold = Some(next_value(&mut args, "--gold")?.into()),
+            "--log" => options.log = next_value(&mut args, "--log")?.into(),
+            "--mode" => {
+                options.mode = parse_choice(
+                    "--mode",
+                    next_value(&mut args, "--mode")?,
+                    &["threshold", "tiers", "classifier"],
+                )?
+            }
+            "--kappa-floor" => {
+                options.kappa_floor = next_value(&mut args, "--kappa-floor")?
+                    .parse()
+                    .map_err(|_| CliError::new("--kappa-floor must be a number"))?;
+            }
+            "--folds" => {
+                options.folds = next_value(&mut args, "--folds")?
+                    .parse()
+                    .map_err(|_| CliError::new("--folds must be an integer"))?;
+            }
+            "--limit" => {
+                options.limit = Some(
+                    next_value(&mut args, "--limit")?
+                        .parse()
+                        .map_err(|_| CliError::new("--limit must be an integer"))?,
+                );
+            }
+            "--save-comparisons" => {
+                options.save_comparisons = Some(next_value(&mut args, "--save-comparisons")?.into())
+            }
+            "--" => {
+                prompts = Some(next_value(&mut args, "judge prompts")?);
+                if args.next().is_some() {
+                    return Err(CliError::new("judge accepts exactly one prompts file"));
+                }
+                break;
+            }
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!("unknown judge option '{other}'")));
+            }
+            text => {
+                if prompts.is_some() {
+                    return Err(CliError::new("judge accepts exactly one prompts file"));
+                }
+                prompts = Some(text.to_owned());
+            }
+        }
+    }
+    options.prompts = prompts
+        .ok_or_else(|| CliError::new("judge requires a prompts file"))?
+        .into();
+    Ok(Some(options))
+}
+
 fn execute_route(options: RouteOptions) -> Result<CommandOutput, CliError> {
     if let Some(threshold) = options.threshold {
         if !(0.0..=1.0).contains(&threshold) {
@@ -661,6 +870,464 @@ fn execute_recalibrate(options: RecalibrateOptions) -> Result<CommandOutput, Cli
         stdout: String::new(),
         stderr,
     })
+}
+
+fn execute_onboard(options: OnboardOptions) -> Result<CommandOutput, CliError> {
+    let models = load_gateway_models(&PathBuf::from("."))
+        .map_err(|err| CliError::config(err.to_string()))?;
+    wayfinder_internal_gateway::bootstrap::resolve_keys(&models);
+    let arms = resolve_arms(
+        options.arms.as_deref(),
+        models.keys().cloned(),
+        "onboard needs two gateway models (e.g. local and hosted); configure [gateway.models.*] or pass --arms local,cloud",
+    )?;
+    ensure_arms_configured(&arms, &models)?;
+    let primary = arms[0].clone();
+    let fallback = arms[1].clone();
+
+    execute_onboard_selected(
+        options,
+        arms,
+        |arm, prompt| invoke_gateway_model(models.get(arm).expect("arm was validated"), prompt),
+        |prompt, outputs| {
+            eprintln!("\n--- prompt ---\n{prompt}\n");
+            eprintln!("[{primary}]\n{}\n", outputs[&primary]);
+            eprintln!("[{fallback}]\n{}\n", outputs[&fallback]);
+            eprint!("Is '{primary}' good enough? [y/N] ");
+            let _ = std::io::stderr().flush();
+            let mut answer = String::new();
+            let _ = std::io::stdin().read_line(&mut answer);
+            let answer = answer.trim().to_ascii_lowercase();
+            if answer == "y" || answer == "yes" {
+                Some(primary.clone())
+            } else {
+                Some(fallback.clone())
+            }
+        },
+    )
+}
+
+fn execute_judge(options: JudgeOptions) -> Result<CommandOutput, CliError> {
+    let models = load_gateway_models(&PathBuf::from("."))
+        .map_err(|err| CliError::config(err.to_string()))?;
+    wayfinder_internal_gateway::bootstrap::resolve_keys(&models);
+    let arms = resolve_arms(
+        options.arms.as_deref(),
+        models.keys().cloned(),
+        "judge needs two gateway models in cheap,expensive order; configure [gateway.models.*] or pass --arms cheap,expensive",
+    )?;
+    ensure_arms_configured(&arms, &models)?;
+
+    execute_judge_selected(options, arms, |arm, prompt| {
+        invoke_gateway_model(models.get(arm).expect("arm was validated"), prompt)
+    })
+}
+
+#[cfg(test)]
+fn execute_onboard_with_invoker<I, R, J>(
+    options: OnboardOptions,
+    available_arms: I,
+    run_model: R,
+    judge: J,
+) -> Result<CommandOutput, CliError>
+where
+    I: IntoIterator<Item = String>,
+    R: FnMut(&str, &str) -> String,
+    J: FnMut(&str, &wayfinder_internal_core::judge::OnboardOutputs) -> Option<String>,
+{
+    let arms = resolve_arms(
+        options.arms.as_deref(),
+        available_arms,
+        "onboard needs two gateway models (e.g. local and hosted); configure [gateway.models.*] or pass --arms local,cloud",
+    )?;
+    execute_onboard_selected(options, arms, run_model, judge)
+}
+
+fn execute_onboard_selected<R, J>(
+    options: OnboardOptions,
+    arms: Vec<String>,
+    run_model: R,
+    judge: J,
+) -> Result<CommandOutput, CliError>
+where
+    R: FnMut(&str, &str) -> String,
+    J: FnMut(&str, &wayfinder_internal_core::judge::OnboardOutputs) -> Option<String>,
+{
+    ensure_file(&options.prompts)?;
+    let prompts = load_prompts(&options.prompts)?;
+    let summary = run_onboarding(prompts, &arms, run_model, judge, &options.log)
+        .map_err(|err| CliError::config(err.to_string()))?;
+    let mut output = CommandOutput {
+        stdout: String::new(),
+        stderr: format!(
+            "wayfinder-router: judged {} prompts -> {}\nwayfinder-router: labels appended to {}\n",
+            summary.judged,
+            render_label_counts_map(&summary.label_counts),
+            options.log.display()
+        ),
+    };
+
+    if options.calibrate {
+        let samples =
+            load_dataset(&options.log).map_err(|err| CliError::config(err.to_string()))?;
+        let result = calibrate(&samples, &options.mode, CalibrationOptions::default())
+            .map_err(|err| CliError::config(err.to_string()))?;
+        let calibrated = render_calibration_output(result, None)?;
+        output.stdout.push_str(&calibrated.stdout);
+        output.stderr.push_str(&calibrated.stderr);
+    }
+
+    Ok(output)
+}
+
+#[cfg(test)]
+fn execute_judge_with_invoker<I, R>(
+    options: JudgeOptions,
+    available_arms: I,
+    run_model: R,
+) -> Result<CommandOutput, CliError>
+where
+    I: IntoIterator<Item = String>,
+    R: FnMut(&str, &str) -> String,
+{
+    let arms = resolve_arms(
+        options.arms.as_deref(),
+        available_arms,
+        "judge needs two gateway models in cheap,expensive order; configure [gateway.models.*] or pass --arms cheap,expensive",
+    )?;
+    execute_judge_selected(options, arms, run_model)
+}
+
+fn execute_judge_selected<R>(
+    options: JudgeOptions,
+    arms: Vec<String>,
+    mut run_model: R,
+) -> Result<CommandOutput, CliError>
+where
+    R: FnMut(&str, &str) -> String,
+{
+    ensure_file(&options.prompts)?;
+    if let Some(gold) = &options.gold {
+        ensure_file(gold)?;
+    }
+
+    let cheap = arms[0].clone();
+    let expensive = arms[1].clone();
+    let judge_impl = HeuristicJudge::new();
+    let mut gold_pairs = Vec::<(String, String)>::new();
+    let mut gold_abstained = 0usize;
+
+    if let Some(gold) = &options.gold {
+        for row in read_labels(gold).map_err(|err| CliError::config(err.to_string()))? {
+            let outputs = run_all_arms(&arms, &row.text, &mut run_model);
+            let verdict = judge_impl.judge(&row.text, &outputs[&cheap], &outputs[&expensive]);
+            write_comparison_if_requested(
+                options.save_comparisons.as_deref(),
+                &row.text,
+                &outputs,
+                &cheap,
+                &expensive,
+                &judge_impl,
+                &verdict,
+            )?;
+            match verdict.sufficient {
+                Some(true) => gold_pairs.push((cheap.clone(), row.label)),
+                Some(false) => gold_pairs.push((expensive.clone(), row.label)),
+                None => gold_abstained += 1,
+            }
+        }
+    }
+
+    let mut prompts = load_prompts(&options.prompts)?;
+    if let Some(limit) = options.limit {
+        prompts.truncate(limit);
+    }
+
+    let save_comparisons = options.save_comparisons.clone();
+    let summary = run_onboarding(
+        prompts,
+        &arms,
+        |arm, prompt| run_model(arm, prompt),
+        |prompt, outputs| {
+            let verdict = judge_impl.judge(prompt, &outputs[&cheap], &outputs[&expensive]);
+            let _ = write_comparison_if_requested(
+                save_comparisons.as_deref(),
+                prompt,
+                outputs,
+                &cheap,
+                &expensive,
+                &judge_impl,
+                &verdict,
+            );
+            match verdict.sufficient {
+                Some(true) => Some(cheap.clone()),
+                Some(false) => Some(expensive.clone()),
+                None => None,
+            }
+        },
+        &options.log,
+    )
+    .map_err(|err| CliError::config(err.to_string()))?;
+
+    let mut stderr = format!(
+        "wayfinder-router: judged {} prompts ({} abstained) -> {}\nwayfinder-router: labels appended to {}\n",
+        summary.judged,
+        summary.abstained,
+        render_label_counts_map(&summary.label_counts),
+        options.log.display()
+    );
+
+    let samples = load_dataset(&options.log).map_err(|err| CliError::config(err.to_string()))?;
+    let report = evaluate_with_options(
+        &gold_pairs,
+        &samples,
+        EvaluateOptions {
+            kappa_floor: options.kappa_floor,
+            k: options.folds,
+            gold_abstained,
+            ..EvaluateOptions::default()
+        },
+    );
+    stderr.push_str(&report.render());
+    stderr.push('\n');
+    if !report.passed {
+        let banner = judge_provenance_banner_with_title(
+            "refused config",
+            judge_impl.version(),
+            &options,
+            samples.len(),
+            &report,
+        );
+        stderr.push_str(&banner);
+        stderr.push('\n');
+        stderr.push_str(
+            "wayfinder-router: refusing to emit a config - trust gates failed (labels were still recorded to the log)\n",
+        );
+        return Err(CliError::config(stderr));
+    }
+
+    let result = calibrate(&samples, &options.mode, CalibrationOptions::default())
+        .map_err(|err| CliError::config(err.to_string()))?;
+    let mut stdout =
+        judge_provenance_banner(judge_impl.version(), &options, samples.len(), &report);
+    stdout.push('\n');
+    stdout.push_str(&result.toml);
+    stdout.push('\n');
+    stderr.push_str(&format!(
+        "wayfinder-router: {}\n",
+        summary_bits(&result.summary)
+    ));
+    Ok(CommandOutput { stdout, stderr })
+}
+
+fn invoke_gateway_model(model: &GatewayModel, prompt: &str) -> String {
+    invoke_messages(
+        model,
+        &[RelayMessage::new("user", prompt)],
+        Duration::from_secs(60),
+    )
+    .unwrap_or_else(|err| format!("model call failed: {err}"))
+}
+
+fn run_all_arms<R>(arms: &[String], prompt: &str, run_model: &mut R) -> OnboardOutputs
+where
+    R: FnMut(&str, &str) -> String,
+{
+    arms.iter()
+        .map(|arm| (arm.clone(), run_model(arm, prompt)))
+        .collect()
+}
+
+fn resolve_arms<I>(
+    raw: Option<&str>,
+    available_arms: I,
+    too_few_message: &str,
+) -> Result<Vec<String>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut arms = if let Some(raw) = raw {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|arm| !arm.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        available_arms.into_iter().collect::<Vec<_>>()
+    };
+    arms.truncate(2);
+    if arms.len() < 2 {
+        return Err(CliError::usage(too_few_message));
+    }
+    Ok(arms)
+}
+
+fn ensure_arms_configured(
+    arms: &[String],
+    models: &BTreeMap<String, GatewayModel>,
+) -> Result<(), CliError> {
+    let missing = arms
+        .iter()
+        .filter(|arm| !models.contains_key(*arm))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::usage(format!(
+        "no [gateway.models] entry for: {}",
+        missing.join(", ")
+    )))
+}
+
+fn ensure_file(path: &Path) -> Result<(), CliError> {
+    if path.is_file() {
+        return Ok(());
+    }
+    Err(CliError::usage(format!(
+        "file not found: {}",
+        path.display()
+    )))
+}
+
+fn load_prompts(path: &Path) -> Result<Vec<String>, CliError> {
+    let text = fs::read_to_string(path)
+        .map_err(|err| CliError::usage(format!("cannot read {}: {err}", path.display())))?;
+    let mut prompts = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('{') {
+            let row = serde_json::from_str::<JsonValue>(line).map_err(|err| {
+                CliError::config(format!(
+                    "{}:{}: invalid JSON: {err}",
+                    path.display(),
+                    index + 1
+                ))
+            })?;
+            if let Some(text) = row.get("text").and_then(JsonValue::as_str) {
+                prompts.push(text.to_owned());
+                continue;
+            }
+        }
+        prompts.push(line.to_owned());
+    }
+    Ok(prompts)
+}
+
+fn write_comparison_if_requested(
+    path: Option<&Path>,
+    prompt: &str,
+    outputs: &OnboardOutputs,
+    cheap: &str,
+    expensive: &str,
+    judge: &HeuristicJudge,
+    verdict: &wayfinder_internal_core::judge::Verdict,
+) -> Result<(), CliError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let row = json!({
+        "text": prompt,
+        "cheap": {
+            "arm": cheap,
+            "response": outputs.get(cheap).cloned().unwrap_or_default(),
+        },
+        "expensive": {
+            "arm": expensive,
+            "response": outputs.get(expensive).cloned().unwrap_or_default(),
+        },
+        "verdict": {
+            "sufficient": verdict.sufficient,
+            "comparator": verdict.comparator,
+            "reason": verdict.reason,
+        },
+        "judge_version": judge.version(),
+    });
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| CliError::usage(format!("cannot write {}: {err}", path.display())))?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&row).expect("comparison row should serialize")
+    )
+    .map_err(|err| CliError::usage(format!("cannot write {}: {err}", path.display())))
+}
+
+fn judge_provenance_banner(
+    judge_version: &str,
+    options: &JudgeOptions,
+    sample_count: usize,
+    report: &wayfinder_internal_core::sufficiency::GateReport,
+) -> String {
+    judge_provenance_banner_with_title(
+        "trusted config",
+        judge_version,
+        options,
+        sample_count,
+        report,
+    )
+}
+
+fn judge_provenance_banner_with_title(
+    title: &str,
+    judge_version: &str,
+    options: &JudgeOptions,
+    sample_count: usize,
+    report: &wayfinder_internal_core::sufficiency::GateReport,
+) -> String {
+    format!(
+        "# wayfinder-router judge: {title} (WF-ADR-0037)\n\
+         # judge={} mode={} samples={}\n\
+         # kappa={:.2} (floor {:.2}, gold n={}) cv_acc={:.2} baseline={:.2} lift={:+.2}\n\
+         # prompts={} gold={} tool={} generated={}",
+        judge_version,
+        options.mode,
+        sample_count,
+        report.kappa,
+        report.kappa_floor,
+        report.n_gold,
+        report.cv_accuracy,
+        report.majority_baseline,
+        report.lift,
+        file_hash(&options.prompts),
+        options
+            .gold
+            .as_ref()
+            .map(|path| file_hash(path))
+            .unwrap_or_else(|| "none".to_owned()),
+        env!("CARGO_PKG_VERSION"),
+        generated_timestamp(),
+    )
+}
+
+fn file_hash(path: &Path) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return "none".to_owned();
+    };
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}").chars().take(12).collect()
+}
+
+fn generated_timestamp() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    format!("unix:{seconds}")
+}
+
+fn render_label_counts_map(counts: &BTreeMap<String, usize>) -> String {
+    counts
+        .iter()
+        .map(|(label, count)| format!("{label}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_human(result: &ComplexityScore, weights: Option<FeatureWeights>) -> String {
@@ -992,7 +1659,13 @@ fn non_empty(value: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, run, run_output, CalibrateOptions, CliCommand, RecalibrateOptions};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        parse, run, run_output, CalibrateOptions, CliCommand, JudgeOptions, OnboardOptions,
+        RecalibrateOptions,
+    };
 
     #[test]
     fn run_accepts_serve_shape() {
@@ -1186,6 +1859,217 @@ mod tests {
     }
 
     #[test]
+    fn parse_onboard_accepts_flags() {
+        let command = parse([
+            "onboard",
+            "prompts.jsonl",
+            "--arms",
+            "local,cloud",
+            "--log",
+            "labels.jsonl",
+            "--calibrate",
+            "--mode",
+            "tiers",
+        ])
+        .expect("onboard should parse");
+
+        assert_eq!(
+            command,
+            CliCommand::Onboard(OnboardOptions {
+                prompts: "prompts.jsonl".into(),
+                arms: Some("local,cloud".to_owned()),
+                log: "labels.jsonl".into(),
+                calibrate: true,
+                mode: "tiers".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_judge_accepts_flags() {
+        let command = parse([
+            "judge",
+            "prompts.jsonl",
+            "--arms",
+            "local,cloud",
+            "--gold",
+            "gold.jsonl",
+            "--log",
+            "labels.jsonl",
+            "--mode",
+            "classifier",
+            "--kappa-floor",
+            "0.75",
+            "--folds",
+            "3",
+            "--limit",
+            "4",
+            "--save-comparisons",
+            "comparisons.jsonl",
+        ])
+        .expect("judge should parse");
+
+        assert_eq!(
+            command,
+            CliCommand::Judge(JudgeOptions {
+                prompts: "prompts.jsonl".into(),
+                arms: Some("local,cloud".to_owned()),
+                gold: Some("gold.jsonl".into()),
+                log: "labels.jsonl".into(),
+                mode: "classifier".to_owned(),
+                kappa_floor: 0.75,
+                folds: 3,
+                limit: Some(4),
+                save_comparisons: Some("comparisons.jsonl".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn onboard_with_stub_invoker_records_labels_and_calibrates() {
+        let dir = unique_temp_dir("cli-onboard");
+        let prompts = dir.join("prompts.jsonl");
+        let log = dir.join("labels.jsonl");
+        fs::write(
+            &prompts,
+            "{\"text\":\"What is DNS?\"}\nExplain an impossible distributed systems proof.\n",
+        )
+        .expect("prompts should write");
+
+        let output = super::execute_onboard_with_invoker(
+            OnboardOptions {
+                prompts,
+                arms: Some("local,cloud".to_owned()),
+                log: log.clone(),
+                calibrate: true,
+                mode: "threshold".to_owned(),
+            },
+            ["local".to_owned(), "cloud".to_owned()],
+            |arm, prompt| {
+                if arm == "local" && prompt.contains("impossible") {
+                    "I cannot help with that.".to_owned()
+                } else {
+                    format!("{arm} answered {prompt}")
+                }
+            },
+            |_, outputs| {
+                if outputs["local"].contains("cannot help") {
+                    Some("cloud".to_owned())
+                } else {
+                    Some("local".to_owned())
+                }
+            },
+        )
+        .expect("onboard should run");
+
+        let labels = fs::read_to_string(&log).expect("labels should be written");
+        assert!(labels.contains("\"label\": \"local\""));
+        assert!(labels.contains("\"label\": \"cloud\""));
+        assert!(output.stdout.contains("[[routing.tiers]]"));
+        assert!(output.stderr.contains("wayfinder-router: judged 2 prompts"));
+    }
+
+    #[test]
+    fn judge_refuses_failed_gold_gate_and_saves_comparisons_only_when_requested() {
+        let dir = unique_temp_dir("cli-judge-refuse");
+        let prompts = dir.join("prompts.txt");
+        let gold = dir.join("gold.jsonl");
+        let log = dir.join("labels.jsonl");
+        let comparisons = dir.join("comparisons.jsonl");
+        fs::write(&prompts, "short prompt\nanother short prompt\n").expect("prompts write");
+        fs::write(
+            &gold,
+            "{\"text\":\"gold one\",\"label\":\"cloud\"}\n{\"text\":\"gold two\",\"label\":\"cloud\"}\n",
+        )
+        .expect("gold write");
+
+        let err = super::execute_judge_with_invoker(
+            JudgeOptions {
+                prompts,
+                arms: Some("local,cloud".to_owned()),
+                gold: Some(gold),
+                log,
+                mode: "threshold".to_owned(),
+                kappa_floor: 0.6,
+                folds: 2,
+                limit: Some(1),
+                save_comparisons: Some(comparisons.clone()),
+            },
+            ["local".to_owned(), "cloud".to_owned()],
+            |_, _| "same sufficient answer with enough detail".to_owned(),
+        )
+        .expect_err("failed gate should refuse config");
+
+        assert_eq!(err.exit_code(), 1);
+        let message = err.to_string();
+        assert!(message.contains("confusion (rows=judge, cols=gold):"));
+        assert!(message.contains("trust gates: REFUSED"));
+        assert!(message.contains("refusing to emit a config"));
+        let labels = fs::read_to_string(dir.join("labels.jsonl")).expect("labels written");
+        assert_eq!(labels.lines().count(), 1);
+        assert!(comparisons.is_file());
+        assert_eq!(
+            fs::read_to_string(comparisons)
+                .expect("comparisons written")
+                .lines()
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn judge_emits_config_when_gates_pass() {
+        let dir = unique_temp_dir("cli-judge-pass");
+        let prompts = dir.join("prompts.txt");
+        let gold = dir.join("gold.jsonl");
+        let log = dir.join("labels.jsonl");
+        fs::write(
+            &prompts,
+            "Hi.\nThanks.\nAnalyze the distributed systems proof with constraints, theorem details, and tradeoffs.\nCompare the architecture options with reasoning, constraints, and a migration plan.\n",
+        )
+        .expect("prompts write");
+        fs::write(
+            &gold,
+            "{\"text\":\"gold cheap\",\"label\":\"local\"}\n{\"text\":\"gold expensive\",\"label\":\"cloud\"}\n",
+        )
+        .expect("gold write");
+
+        let output = super::execute_judge_with_invoker(
+            JudgeOptions {
+                prompts,
+                arms: Some("local,cloud".to_owned()),
+                gold: Some(gold),
+                log,
+                mode: "threshold".to_owned(),
+                kappa_floor: 0.6,
+                folds: 2,
+                limit: None,
+                save_comparisons: None,
+            },
+            ["local".to_owned(), "cloud".to_owned()],
+            |arm, prompt| {
+                if arm == "local"
+                    && (prompt.contains("Analyze")
+                        || prompt.contains("Compare")
+                        || prompt.contains("expensive"))
+                {
+                    "I cannot help with that.".to_owned()
+                } else {
+                    "complete sufficient answer with enough detail".to_owned()
+                }
+            },
+        )
+        .expect("passing gates should emit config");
+
+        assert!(output
+            .stdout
+            .contains("# wayfinder-router judge: trusted config"));
+        assert!(output.stdout.contains("[[routing.tiers]]"));
+        assert!(output.stderr.contains("trust gates: PASS"));
+        assert!(!dir.join("comparisons.jsonl").exists());
+    }
+
+    #[test]
     fn parse_calibrate_rejects_unknown_mode_as_usage_error() {
         let err = parse(["calibrate", "data.jsonl", "--mode", "bogus"])
             .expect_err("unknown calibrate mode should be a usage error");
@@ -1210,5 +2094,15 @@ mod tests {
 
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("--mode"));
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        dir
     }
 }
