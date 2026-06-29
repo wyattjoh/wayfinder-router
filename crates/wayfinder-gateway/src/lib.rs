@@ -29,6 +29,7 @@ use wayfinder_internal_core::vkeys;
 use wayfinder_internal_core::{DEFAULT_HOST, DEFAULT_PORT};
 
 pub mod bootstrap;
+pub mod recalibrate;
 
 pub const COMMAND_NAME: &str = "serve";
 

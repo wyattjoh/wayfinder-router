@@ -1,0 +1,34 @@
+# recalibrated from feedback: mode=threshold, threshold=0.49, models=['local', 'cloud'], accuracy=1.0, samples=10
+
+[[routing.tiers]]
+min_score = 0.0
+model = "local"
+
+[[routing.tiers]]
+min_score = 0.49
+model = "cloud"
+
+[gateway.cache]
+enabled = true
+ttl = 600.0
+max_entries = 2048
+max_bytes = 134217728
+
+[gateway.rate_limit]
+rpm = 60
+tpm = 100000
+window = 30.0
+
+[gateway.keys.team-a]
+hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[gateway.models.cloud]
+base_url = "https://api.example.com/v1"
+model = "big-model"
+api_key_env = "EXAMPLE_API_KEY"
+api_key_cmd = "op read op://Private/example/credential"
+cost_per_1k = 0.015
+
+[gateway.models.local]
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
