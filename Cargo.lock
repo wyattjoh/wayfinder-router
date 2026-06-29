@@ -2533,6 +2533,7 @@ dependencies = [
  "wayfinder-internal-core",
  "wayfinder-internal-gateway",
  "wayfinder-internal-tui",
+ "wayfinder-internal-ui",
 ]
 
 [[package]]

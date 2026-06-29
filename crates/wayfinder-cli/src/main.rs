@@ -1,4 +1,6 @@
 use std::io::{self, IsTerminal, Read};
+use std::process::Command;
+use std::time::Duration;
 
 use wayfinder_internal_tui::{run_chat, run_interactive_chat, should_launch_interactive};
 
@@ -11,6 +13,27 @@ fn main() {
     match wayfinder_internal_cli::parse_with_input(std::env::args().skip(1), stdin) {
         Ok(wayfinder_internal_cli::CliCommand::Serve(options)) => {
             if let Err(err) = wayfinder_internal_gateway::serve_blocking(options) {
+                eprintln!("wayfinder-router: {err}");
+                std::process::exit(1);
+            }
+        }
+        Ok(wayfinder_internal_cli::CliCommand::Ui(options)) => {
+            if let Err(err) = wayfinder_internal_ui::serve_blocking(options) {
+                eprintln!("wayfinder-router: {err}");
+                std::process::exit(1);
+            }
+        }
+        Ok(wayfinder_internal_cli::CliCommand::Webchat(options)) => {
+            print!("{}", wayfinder_internal_cli::webchat_summary(&options));
+            if !options.no_open {
+                open_browser_delayed(wayfinder_internal_cli::demo_url(
+                    &options.host,
+                    options.port,
+                ));
+            }
+            if let Err(err) = wayfinder_internal_gateway::serve_blocking(
+                wayfinder_internal_cli::webchat_serve_options(&options),
+            ) {
                 eprintln!("wayfinder-router: {err}");
                 std::process::exit(1);
             }
@@ -83,4 +106,33 @@ fn exit_cli_error(err: wayfinder_internal_cli::CliError) -> ! {
         eprint!("{}", err.stderr());
     }
     std::process::exit(err.exit_code());
+}
+
+fn open_browser_delayed(url: String) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Err(err) = open_browser(&url) {
+            eprintln!("wayfinder-router: could not open browser: {err}");
+        }
+    });
+}
+
+fn open_browser(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(url).spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(url).spawn()?;
+        Ok(())
+    }
 }

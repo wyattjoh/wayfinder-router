@@ -19,3 +19,4 @@ sha2 = "0.10"
 wayfinder-internal-core = { path = "../wayfinder-core" }
 wayfinder-internal-gateway = { path = "../wayfinder-gateway" }
 wayfinder-internal-tui = { path = "../wayfinder-tui" }
+wayfinder-internal-ui = { path = "../wayfinder-ui" }

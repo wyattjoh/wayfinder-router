@@ -29,13 +29,16 @@ use wayfinder_internal_gateway::bootstrap::{
 };
 use wayfinder_internal_gateway::recalibrate::{recalibrate, DEFAULT_MIN_LABELS};
 use wayfinder_internal_gateway::{
-    gateway_config_from_toml, invoke_messages, load_gateway_models, serve_summary, GatewayModel,
-    RelayMessage, ServeOptions,
+    gateway_config_from_toml, invoke_messages, load_gateway_models,
+    serve_summary as gateway_serve_summary, GatewayModel, RelayMessage, ServeOptions,
 };
 use wayfinder_internal_tui::{run_chat, ChatOptions, HELP};
+use wayfinder_internal_ui::{serve_summary as ui_serve_summary, UiOptions};
 
 const EXIT_CONFIG: i32 = 1;
 const EXIT_USAGE: i32 = 2;
+const COMMAND_LIST: &str =
+    "route, calibrate, serve, chat, ui, webchat, onboard, judge, recalibrate, init, doctor, keys";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CliError {
@@ -107,6 +110,8 @@ impl Error for CliError {}
 pub enum CliCommand {
     Serve(ServeOptions),
     Chat(ChatOptions),
+    Ui(UiOptions),
+    Webchat(WebchatOptions),
     Init(InitOptions),
     Doctor(DoctorOptions),
     Keys(KeysOptions),
@@ -116,6 +121,28 @@ pub enum CliCommand {
     Onboard(OnboardOptions),
     Judge(JudgeOptions),
     Help(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WebchatOptions {
+    pub host: String,
+    pub port: u16,
+    pub dry_run: bool,
+    pub timeout_seconds: Option<f64>,
+    pub no_open: bool,
+}
+
+impl Default for WebchatOptions {
+    fn default() -> Self {
+        let serve = ServeOptions::default();
+        Self {
+            host: serve.host,
+            port: serve.port,
+            dry_run: false,
+            timeout_seconds: None,
+            no_open: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,6 +345,49 @@ options:
   --explain            show each feature contribution in human output
   --help, -h           show this help";
 
+const TOP_LEVEL_USAGE: &str = "\
+usage: wayfinder-router <command> [OPTIONS]
+
+commands:
+  route        score a prompt and recommend a model
+  calibrate    turn labeled JSONL into routing config
+  serve        run the OpenAI-compatible gateway
+  chat         open the terminal chat UI
+  ui           run the local calibration and configuration UI
+  webchat      run the gateway and open /demo
+  onboard      A/B sample prompts to bootstrap labels
+  judge        auto-label prompts behind trust checks
+  recalibrate  re-fit config from the feedback log
+  init         scaffold wayfinder-router.toml
+  doctor       check config and key readiness
+  keys         mint virtual gateway keys
+
+options:
+  --help, -h   show this help";
+
+const UI_USAGE: &str = "\
+usage: wayfinder-router ui [OPTIONS]
+
+Run the local calibration, explain, and configure UI.
+
+options:
+  --host <host>   bind host
+  --port <port>   bind port
+  --help, -h      show this help";
+
+const WEBCHAT_USAGE: &str = "\
+usage: wayfinder-router webchat [OPTIONS]
+
+Run the gateway and open the browser demo at /demo.
+
+options:
+  --host <host>   bind host
+  --port <port>   bind port
+  --dry-run       show routing decisions without upstream calls
+  --timeout <n>   upstream request timeout in seconds
+  --no-open       do not open the demo in a browser
+  --help, -h      show this help";
+
 const INIT_USAGE: &str = "\
 usage: wayfinder-router init [OPTIONS]
 
@@ -450,6 +520,7 @@ where
 {
     let mut args = args.into_iter().map(Into::into);
     match args.next().as_deref() {
+        Some("--help" | "-h" | "help") => Ok(CliCommand::Help(TOP_LEVEL_USAGE.to_owned())),
         Some("serve") => Ok(CliCommand::Serve(parse_serve(args)?)),
         Some("chat") => match parse_chat(args)? {
             None => Ok(CliCommand::Help(chat_help())),
@@ -459,6 +530,14 @@ where
                 }
                 Ok(CliCommand::Chat(options))
             }
+        },
+        Some("ui") => match parse_ui(args)? {
+            None => Ok(CliCommand::Help(UI_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Ui(options)),
+        },
+        Some("webchat") => match parse_webchat(args)? {
+            None => Ok(CliCommand::Help(WEBCHAT_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Webchat(options)),
         },
         Some("init") => match parse_init(args)? {
             None => Ok(CliCommand::Help(INIT_USAGE.to_owned())),
@@ -498,22 +577,28 @@ where
             Some(options) => Ok(CliCommand::Judge(options)),
         },
         Some(command) => Err(CliError::new(format!(
-            "unknown command '{command}' (expected 'serve', 'chat', 'init', 'doctor', 'keys', 'route', 'calibrate', 'recalibrate', 'onboard', or 'judge')"
+            "unknown command '{command}' (expected {COMMAND_LIST})"
         ))),
-        None => Err(CliError::new(
-            "expected command: serve, chat, init, doctor, keys, route, calibrate, recalibrate, onboard, or judge",
-        )),
+        None => Err(CliError::new(format!("expected command: {COMMAND_LIST}"))),
     }
 }
 
 pub fn execute(command: CliCommand) -> Result<CommandOutput, CliError> {
     match command {
         CliCommand::Serve(options) => Ok(CommandOutput {
-            stdout: serve_summary(&options),
+            stdout: gateway_serve_summary(&options),
             stderr: String::new(),
         }),
         CliCommand::Chat(options) => Ok(CommandOutput {
             stdout: run_chat(&options).map_err(|err| CliError::config(err.to_string()))?,
+            stderr: String::new(),
+        }),
+        CliCommand::Ui(options) => Ok(CommandOutput {
+            stdout: ui_serve_summary(&options),
+            stderr: String::new(),
+        }),
+        CliCommand::Webchat(options) => Ok(CommandOutput {
+            stdout: webchat_summary(&options),
             stderr: String::new(),
         }),
         CliCommand::Init(options) => execute_init(options),
@@ -557,6 +642,87 @@ where
         }
     }
     Ok(options)
+}
+
+fn parse_ui<I>(args: I) -> Result<Option<UiOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = UiOptions::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--host" => options.host = next_value(&mut args, "--host")?,
+            "--port" => {
+                options.port = next_value(&mut args, "--port")?
+                    .parse()
+                    .map_err(|_| CliError::new("--port must be an integer"))?;
+            }
+            other => return Err(CliError::new(format!("unknown ui option '{other}'"))),
+        }
+    }
+    Ok(Some(options))
+}
+
+fn parse_webchat<I>(args: I) -> Result<Option<WebchatOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = WebchatOptions::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--host" => options.host = next_value(&mut args, "--host")?,
+            "--port" => {
+                options.port = next_value(&mut args, "--port")?
+                    .parse()
+                    .map_err(|_| CliError::new("--port must be an integer"))?;
+            }
+            "--dry-run" => options.dry_run = true,
+            "--timeout" => {
+                options.timeout_seconds = Some(
+                    next_value(&mut args, "--timeout")?
+                        .parse()
+                        .map_err(|_| CliError::new("--timeout must be a number"))?,
+                );
+            }
+            "--no-open" => options.no_open = true,
+            other => return Err(CliError::new(format!("unknown webchat option '{other}'"))),
+        }
+    }
+    Ok(Some(options))
+}
+
+pub fn webchat_serve_options(options: &WebchatOptions) -> ServeOptions {
+    ServeOptions {
+        host: options.host.clone(),
+        port: options.port,
+        dry_run: options.dry_run,
+        timeout_seconds: options.timeout_seconds,
+    }
+}
+
+pub fn webchat_summary(options: &WebchatOptions) -> String {
+    let note = if options.dry_run {
+        "  (dry-run: routing decisions only, no model calls)"
+    } else {
+        ""
+    };
+    format!(
+        "wayfinder-router webchat -> {}{note}  (Ctrl-C to stop)\n",
+        demo_url(&options.host, options.port)
+    )
+}
+
+pub fn demo_url(host: &str, port: u16) -> String {
+    let display = if matches!(host, "0.0.0.0" | "::" | "") {
+        "127.0.0.1"
+    } else {
+        host
+    };
+    format!("http://{display}:{port}/demo")
 }
 
 fn parse_chat<I>(args: I) -> Result<Option<ChatOptions>, CliError>
@@ -2184,8 +2350,9 @@ mod tests {
 
     use super::{
         parse, run, run_output, CalibrateOptions, CliCommand, JudgeOptions, OnboardOptions,
-        RecalibrateOptions,
+        RecalibrateOptions, WebchatOptions,
     };
+    use wayfinder_internal_ui::UiOptions;
 
     #[test]
     fn run_accepts_serve_shape() {
@@ -2204,6 +2371,122 @@ mod tests {
         assert!(output.contains("serve"));
         assert!(output.contains("0.0.0.0:9000"));
         assert!(output.contains("dry-run"));
+    }
+
+    #[test]
+    fn parse_ui_accepts_host_and_port() {
+        let command =
+            parse(["ui", "--host", "0.0.0.0", "--port", "9001"]).expect("ui should parse");
+
+        assert_eq!(
+            command,
+            CliCommand::Ui(UiOptions {
+                host: "0.0.0.0".to_owned(),
+                port: 9001,
+            })
+        );
+    }
+
+    #[test]
+    fn run_ui_prints_server_summary() {
+        let output = run(["ui", "--port", "9010"]).expect("ui args should parse");
+
+        assert!(output.contains("wayfinder-router ui listening"));
+        assert!(output.contains("127.0.0.1:9010"));
+    }
+
+    #[test]
+    fn parse_webchat_accepts_gateway_options_and_no_open() {
+        let command = parse([
+            "webchat",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9000",
+            "--dry-run",
+            "--timeout",
+            "2.5",
+            "--no-open",
+        ])
+        .expect("webchat should parse");
+
+        assert_eq!(
+            command,
+            CliCommand::Webchat(WebchatOptions {
+                host: "0.0.0.0".to_owned(),
+                port: 9000,
+                dry_run: true,
+                timeout_seconds: Some(2.5),
+                no_open: true,
+            })
+        );
+    }
+
+    #[test]
+    fn run_webchat_dry_run_prints_demo_summary_without_starting_server() {
+        let output = run(["webchat", "--port", "9000", "--dry-run"]).expect("webchat should run");
+
+        assert!(output.contains("wayfinder-router webchat"));
+        assert!(output.contains("http://127.0.0.1:9000/demo"));
+        assert!(output.contains("dry-run"));
+        assert!(output.contains("Ctrl-C to stop"));
+    }
+
+    #[test]
+    fn demo_url_maps_wildcard_hosts_to_loopback() {
+        assert_eq!(
+            super::demo_url("0.0.0.0", 9000),
+            "http://127.0.0.1:9000/demo"
+        );
+        assert_eq!(super::demo_url("::", 8088), "http://127.0.0.1:8088/demo");
+        assert_eq!(
+            super::demo_url("example.internal", 80),
+            "http://example.internal:80/demo"
+        );
+    }
+
+    #[test]
+    fn top_level_help_lists_all_ported_commands() {
+        let output = run(["--help"]).expect("top-level help should succeed");
+
+        for command in [
+            "route",
+            "calibrate",
+            "serve",
+            "chat",
+            "ui",
+            "webchat",
+            "onboard",
+            "judge",
+            "recalibrate",
+            "init",
+            "doctor",
+            "keys",
+        ] {
+            assert!(output.contains(command), "help missing {command}");
+        }
+    }
+
+    #[test]
+    fn unknown_command_lists_all_ported_commands() {
+        let err = parse(["bogus"]).expect_err("unknown command should fail");
+
+        for command in [
+            "route",
+            "calibrate",
+            "serve",
+            "chat",
+            "ui",
+            "webchat",
+            "onboard",
+            "judge",
+            "recalibrate",
+            "init",
+            "doctor",
+            "keys",
+        ] {
+            assert!(err.to_string().contains(command), "error missing {command}");
+        }
     }
 
     #[test]
