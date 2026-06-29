@@ -1122,6 +1122,12 @@ fn execute_judge(options: JudgeOptions) -> Result<CommandOutput, CliError> {
 }
 
 fn execute_init(options: InitOptions) -> Result<CommandOutput, CliError> {
+    if options.interactive {
+        return Err(CliError::usage(
+            "interactive init is not supported by the Rust CLI yet",
+        ));
+    }
+
     let preset = PRESETS
         .get(options.preset.as_str())
         .ok_or_else(|| unknown_preset_error(&options.preset))?;
@@ -2467,6 +2473,27 @@ mod tests {
             assert!(!path.exists());
             assert!(!dir.join(".env.example").exists());
         }
+    }
+
+    #[test]
+    fn init_interactive_is_explicitly_unsupported() {
+        let dir = unique_temp_dir("cli-init-interactive");
+        let path = dir.join("wayfinder-router.toml");
+        let err = run_output(
+            [
+                "init",
+                "--interactive",
+                "--print",
+                "--path",
+                path.to_str().expect("path is utf-8"),
+            ],
+            None,
+        )
+        .expect_err("interactive init should not be ignored");
+
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("interactive init"));
+        assert!(!path.exists());
     }
 
     #[test]
