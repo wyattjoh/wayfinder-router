@@ -2,6 +2,8 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -19,7 +21,14 @@ use wayfinder_internal_core::complexity::{
 use wayfinder_internal_core::config::{
     dump_routing_toml, load_routing_config, routing_config_from_toml, CONFIG_FILE,
 };
-use wayfinder_internal_gateway::validate_gateway_toml;
+use wayfinder_internal_core::feedback::{read_labels, record_label, DEFAULT_LOG};
+use wayfinder_internal_gateway::recalibrate::{
+    recalibrate, RecalibrationError, DEFAULT_MIN_LABELS,
+};
+use wayfinder_internal_gateway::{
+    invoke_messages, load_gateway_models, validate_gateway_toml, GatewayModel, RelayMessage,
+    UpstreamError,
+};
 
 pub mod page;
 
@@ -28,6 +37,10 @@ pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 8099;
 
 const MODES: [&str; 3] = ["threshold", "tiers", "classifier"];
+const DEFAULT_INVOKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+type OnboardInvoker =
+    Arc<dyn Fn(&GatewayModel, &str) -> Result<String, UpstreamError> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiOptions {
@@ -74,6 +87,7 @@ impl From<std::io::Error> for UiError {
 #[derive(Clone)]
 struct AppState {
     start_dir: PathBuf,
+    invoker: OnboardInvoker,
 }
 
 pub fn build_app() -> Result<Router, UiError> {
@@ -81,8 +95,19 @@ pub fn build_app() -> Result<Router, UiError> {
 }
 
 pub fn build_app_from_dir(start_dir: impl AsRef<Path>) -> Result<Router, UiError> {
+    build_app_from_dir_with_invoker(start_dir, default_onboard_invoker)
+}
+
+pub fn build_app_from_dir_with_invoker<F>(
+    start_dir: impl AsRef<Path>,
+    invoker: F,
+) -> Result<Router, UiError>
+where
+    F: Fn(&GatewayModel, &str) -> Result<String, UpstreamError> + Send + Sync + 'static,
+{
     let state = AppState {
         start_dir: start_dir.as_ref().to_path_buf(),
+        invoker: Arc::new(invoker),
     };
     Ok(Router::new()
         .route("/", get(index))
@@ -91,6 +116,11 @@ pub fn build_app_from_dir(start_dir: impl AsRef<Path>) -> Result<Router, UiError
         .route("/api/config", get(api_get_config))
         .route("/api/config/validate", post(api_validate_config))
         .route("/api/config/save", post(api_save_config))
+        .route("/api/onboard", get(api_onboard_state))
+        .route("/api/onboard/run", post(api_onboard_run))
+        .route("/api/onboard/record", post(api_onboard_record))
+        .route("/api/onboard/dataset", get(api_onboard_dataset))
+        .route("/api/recalibrate", post(api_recalibrate))
         .with_state(state))
 }
 
@@ -198,6 +228,55 @@ pub fn save_config_text(text: &str, start_dir: impl AsRef<Path>) -> Option<Strin
     fs::write(&path, text).err().map(|err| err.to_string())
 }
 
+pub fn onboard_arms(start_dir: impl AsRef<Path>) -> Result<Vec<String>, UiError> {
+    Ok(load_gateway_models(start_dir.as_ref())
+        .map_err(|err| UiError::new(err.to_string()))?
+        .keys()
+        .take(2)
+        .cloned()
+        .collect())
+}
+
+pub fn record_onboard_label(
+    start_dir: impl AsRef<Path>,
+    prompt: &str,
+    label: &str,
+) -> Result<usize, UiError> {
+    let log_path = feedback_log_path(start_dir.as_ref());
+    record_label(&log_path, prompt, label).map_err(|err| UiError::new(err.to_string()))?;
+    Ok(read_labels(&log_path)
+        .map_err(|err| UiError::new(err.to_string()))?
+        .len())
+}
+
+pub fn onboard_dataset_text(start_dir: impl AsRef<Path>) -> Result<String, UiError> {
+    let rows = read_labels(feedback_log_path(start_dir.as_ref()))
+        .map_err(|err| UiError::new(err.to_string()))?;
+    rows.into_iter()
+        .map(|row| serde_json::to_string(&row).map_err(|err| UiError::new(err.to_string())))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|rows| rows.join("\n"))
+}
+
+pub fn recalibrate_payload(
+    start_dir: impl AsRef<Path>,
+    mode: &str,
+) -> Result<JsonValue, RecalibrationError> {
+    let start_dir = start_dir.as_ref();
+    let result = recalibrate(
+        feedback_log_path(start_dir),
+        start_dir.join(CONFIG_FILE),
+        mode,
+        DEFAULT_MIN_LABELS,
+    )?;
+    Ok(json!({
+        "written": result.written,
+        "label_count": result.label_count,
+        "summary": result.summary,
+        "reason": result.reason,
+    }))
+}
+
 async fn index() -> Html<&'static str> {
     Html(page::PAGE)
 }
@@ -260,6 +339,124 @@ async fn api_save_config(State(state): State<AppState>, Json(body): Json<JsonVal
     }
 }
 
+async fn api_onboard_state(State(state): State<AppState>) -> Response {
+    let arms = match onboard_arms(&state.start_dir) {
+        Ok(arms) => arms,
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    let count = match read_labels(feedback_log_path(&state.start_dir)) {
+        Ok(rows) => rows.len(),
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    Json(json!({ "arms": arms, "count": count })).into_response()
+}
+
+async fn api_onboard_run(State(state): State<AppState>, Json(body): Json<JsonValue>) -> Response {
+    let prompt = body
+        .get("prompt")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if prompt.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "missing 'prompt'".to_owned());
+    }
+
+    match onboard_run_payload(
+        state.start_dir,
+        prompt.to_owned(),
+        models_list(body.get("arms")),
+        state.invoker,
+    )
+    .await
+    {
+        Ok(outputs) => Json(json!({ "outputs": outputs })).into_response(),
+        Err((status, error)) => json_error(status, error),
+    }
+}
+
+async fn api_onboard_record(
+    State(state): State<AppState>,
+    Json(body): Json<JsonValue>,
+) -> Response {
+    let prompt = body
+        .get("prompt")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if prompt.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "missing 'prompt'".to_owned());
+    }
+    let label = body
+        .get("label")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if label.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "missing 'label'".to_owned());
+    }
+
+    match record_onboard_label(&state.start_dir, prompt, label) {
+        Ok(count) => Json(json!({ "ok": true, "count": count })).into_response(),
+        Err(err) => json_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn api_onboard_dataset(State(state): State<AppState>) -> Response {
+    match onboard_dataset_text(&state.start_dir) {
+        Ok(dataset) => Json(json!({ "dataset": dataset })).into_response(),
+        Err(err) => json_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn api_recalibrate(State(state): State<AppState>, Json(body): Json<JsonValue>) -> Response {
+    let raw_mode = body.get("mode").and_then(JsonValue::as_str);
+    let mode = raw_mode
+        .filter(|mode| MODES.contains(mode))
+        .unwrap_or("threshold");
+    match recalibrate_payload(&state.start_dir, mode) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(err) => json_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn onboard_run_payload(
+    start_dir: PathBuf,
+    prompt: String,
+    arms: Option<Vec<String>>,
+    invoker: OnboardInvoker,
+) -> Result<JsonValue, (StatusCode, String)> {
+    let models = load_gateway_models(&start_dir)
+        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    let chosen = arms.unwrap_or_else(|| models.keys().take(2).cloned().collect());
+    if chosen.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "onboard needs at least one gateway model".to_owned(),
+        ));
+    }
+    let requests = chosen
+        .into_iter()
+        .map(|arm| {
+            let model = models.get(&arm).cloned().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown gateway model: {arm}"),
+                )
+            })?;
+            Ok((arm, model))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    tokio::task::spawn_blocking(move || {
+        let mut outputs = serde_json::Map::new();
+        for (arm, model) in requests {
+            let output = invoker(&model, &prompt)?;
+            outputs.insert(arm, JsonValue::String(output));
+        }
+        Ok(JsonValue::Object(outputs))
+    })
+    .await
+    .map_err(|err| (StatusCode::BAD_GATEWAY, err.to_string()))?
+    .map_err(|err: UpstreamError| (StatusCode::BAD_GATEWAY, err.to_string()))
+}
+
 fn models_list(value: Option<&JsonValue>) -> Option<Vec<String>> {
     match value {
         Some(JsonValue::Array(values)) => {
@@ -286,6 +483,18 @@ fn models_list(value: Option<&JsonValue>) -> Option<Vec<String>> {
 
 fn json_error(status: StatusCode, error: String) -> Response {
     (status, Json(json!({ "error": error }))).into_response()
+}
+
+fn feedback_log_path(start_dir: &Path) -> PathBuf {
+    start_dir.join(DEFAULT_LOG)
+}
+
+fn default_onboard_invoker(model: &GatewayModel, prompt: &str) -> Result<String, UpstreamError> {
+    invoke_messages(
+        model,
+        &[RelayMessage::new("user", prompt)],
+        DEFAULT_INVOKE_TIMEOUT,
+    )
 }
 
 fn find_config_file(start_dir: &Path) -> Option<PathBuf> {

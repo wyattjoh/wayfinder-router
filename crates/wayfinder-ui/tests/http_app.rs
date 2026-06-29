@@ -5,7 +5,9 @@ use serde_json::{json, Value as JsonValue};
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wayfinder_internal_core::complexity::FEATURE_ORDER;
-use wayfinder_internal_ui::build_app_from_dir;
+use wayfinder_internal_core::feedback::DEFAULT_LOG;
+use wayfinder_internal_gateway::UpstreamError;
+use wayfinder_internal_ui::{build_app_from_dir, build_app_from_dir_with_invoker};
 
 const TRIVIAL: &str = "hi";
 const COMPLEX: &str = "# Plan\n\n## Steps\n\n- step 0\n- step 1\n- step 2\n- step 3\n- step 4\n- step 5\n- step 6\n- step 7\n- step 8\n- step 9\n- step 10\n- step 11\n\n## Refs\n\n[a](https://x) [b](https://y)\n\n```py\nx=1\n```\n| a | b |\n| - | - |\n";
@@ -65,6 +67,10 @@ async fn get_json(dir: &TempDir, path: &str) -> (StatusCode, JsonValue) {
 
 async fn post_json(dir: &TempDir, path: &str, body: JsonValue) -> (StatusCode, JsonValue) {
     let app = build_app_from_dir(dir.path()).expect("app should build");
+    post_json_app(app, path, body).await
+}
+
+async fn post_json_app(app: axum::Router, path: &str, body: JsonValue) -> (StatusCode, JsonValue) {
     let response = app
         .oneshot(
             Request::builder()
@@ -79,6 +85,21 @@ async fn post_json(dir: &TempDir, path: &str, body: JsonValue) -> (StatusCode, J
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     (status, serde_json::from_slice(&body).unwrap())
+}
+
+fn write_gateway_config(dir: &TempDir) {
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        r#"[gateway.models.cloud]
+base_url = "http://cloud.example/v1"
+model = "cloud-model"
+
+[gateway.models.local]
+base_url = "http://local.example/v1"
+model = "local-model"
+"#,
+    )
+    .expect("gateway config should be writable");
 }
 
 #[tokio::test]
@@ -235,4 +256,125 @@ async fn api_config_save_rejects_invalid_without_overwriting() {
             .unwrap()
             .contains("0.6")
     );
+}
+
+#[tokio::test]
+async fn api_onboard_state_lists_arms_and_label_count() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_gateway_config(&dir);
+
+    let (status, body) = get_json(&dir, "/api/onboard").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["arms"], json!(["cloud", "local"]));
+    assert_eq!(body["count"], 0);
+}
+
+#[tokio::test]
+async fn api_onboard_run_returns_per_arm_outputs_from_stub_invoker() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_gateway_config(&dir);
+    let app = build_app_from_dir_with_invoker(dir.path(), |model, prompt| {
+        Ok(format!("reply:{}:{prompt}", model.model))
+    })
+    .expect("app should build");
+
+    let (status, body) = post_json_app(app, "/api/onboard/run", json!({ "prompt": "hi" })).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["outputs"],
+        json!({
+            "cloud": "reply:cloud-model:hi",
+            "local": "reply:local-model:hi",
+        })
+    );
+}
+
+#[tokio::test]
+async fn api_onboard_run_maps_upstream_errors_to_502() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_gateway_config(&dir);
+    let app = build_app_from_dir_with_invoker(dir.path(), |_model, _prompt| {
+        Err(UpstreamError::Status {
+            status: 503,
+            body: "upstream unavailable".to_owned(),
+        })
+    })
+    .expect("app should build");
+
+    let (status, body) = post_json_app(app, "/api/onboard/run", json!({ "prompt": "hi" })).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("upstream returned 503"));
+}
+
+#[tokio::test]
+async fn api_onboard_run_missing_prompt_is_400() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_gateway_config(&dir);
+
+    let (status, body) = post_json(&dir, "/api/onboard/run", json!({})).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "missing 'prompt'");
+}
+
+#[tokio::test]
+async fn api_onboard_record_appends_label_and_dataset_returns_jsonl() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_gateway_config(&dir);
+
+    let (status, body) = post_json(
+        &dir,
+        "/api/onboard/record",
+        json!({ "prompt": "hi", "label": "local" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "ok": true, "count": 1 }));
+    let log_path = dir.path().join(DEFAULT_LOG);
+    assert!(log_path.is_file());
+
+    let (status, dataset_body) = get_json(&dir, "/api/onboard/dataset").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        dataset_body["dataset"].as_str().unwrap(),
+        r#"{"text":"hi","label":"local"}"#
+    );
+}
+
+#[tokio::test]
+async fn api_recalibrate_writes_config_from_feedback_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join(DEFAULT_LOG), dataset()).expect("feedback log should write");
+
+    let (status, body) = post_json(&dir, "/api/recalibrate", json!({ "mode": "threshold" })).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["written"], true);
+    assert_eq!(body["label_count"], 8);
+    assert_eq!(body["summary"]["accuracy"], 1.0);
+    assert_eq!(body["reason"], JsonValue::Null);
+    let config = std::fs::read_to_string(dir.path().join("wayfinder-router.toml")).unwrap();
+    assert!(config.starts_with("# recalibrated from feedback: "));
+    assert!(config.contains("[[routing.tiers]]"));
+}
+
+#[tokio::test]
+async fn api_recalibrate_skips_empty_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let (status, body) = post_json(&dir, "/api/recalibrate", json!({ "mode": "threshold" })).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["written"], false);
+    assert_eq!(body["label_count"], 0);
+    assert_eq!(body["summary"], JsonValue::Null);
+    assert_eq!(body["reason"], "need >= 2 labels, have 0");
 }
