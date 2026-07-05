@@ -1,8 +1,10 @@
 pub mod calibrate;
 pub mod complexity;
 pub mod config;
+pub mod detectors;
 pub mod feedback;
 pub mod judge;
+pub mod judge_validation;
 pub mod onboard;
 pub mod pricing;
 pub mod profiles;

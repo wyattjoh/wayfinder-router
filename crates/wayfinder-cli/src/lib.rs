@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value as JsonValue};
@@ -28,6 +30,10 @@ use wayfinder_internal_gateway::bootstrap::{
     suggest_key_commands, DEFAULT_PRESET, PRESETS,
 };
 use wayfinder_internal_gateway::recalibrate::{recalibrate, DEFAULT_MIN_LABELS};
+use wayfinder_internal_gateway::service::{
+    agent_path, detect_platform, launchd_plist, systemd_unit, systemd_unit_path, ServicePlatform,
+    LAUNCHD_LABEL, SYSTEMD_UNIT_NAME,
+};
 use wayfinder_internal_gateway::{
     gateway_config_from_toml, invoke_messages, load_gateway_models,
     serve_summary as gateway_serve_summary, GatewayModel, RelayMessage, ServeOptions,
@@ -38,7 +44,7 @@ use wayfinder_internal_ui::{serve_summary as ui_serve_summary, UiOptions};
 const EXIT_CONFIG: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 const COMMAND_LIST: &str =
-    "route, calibrate, serve, chat, ui, webchat, onboard, judge, recalibrate, init, doctor, keys";
+    "route, calibrate, serve, service, chat, ui, webchat, onboard, judge, recalibrate, init, doctor, keys";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CliError {
@@ -109,6 +115,7 @@ impl Error for CliError {}
 #[derive(Debug, PartialEq)]
 pub enum CliCommand {
     Serve(ServeOptions),
+    Service(ServiceOptions),
     Chat(ChatOptions),
     Ui(UiOptions),
     Webchat(WebchatOptions),
@@ -130,6 +137,25 @@ pub struct WebchatOptions {
     pub dry_run: bool,
     pub timeout_seconds: Option<f64>,
     pub no_open: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceOptions {
+    pub action: String,
+    pub host: String,
+    pub port: u16,
+    pub print: bool,
+}
+
+impl Default for ServiceOptions {
+    fn default() -> Self {
+        Self {
+            action: "status".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 8088,
+            print: false,
+        }
+    }
 }
 
 impl Default for WebchatOptions {
@@ -352,6 +378,7 @@ commands:
   route        score a prompt and recommend a model
   calibrate    turn labeled JSONL into routing config
   serve        run the OpenAI-compatible gateway
+  service      install, remove, or inspect the local gateway service
   chat         open the terminal chat UI
   ui           run the local calibration and configuration UI
   webchat      run the gateway and open /demo
@@ -386,6 +413,17 @@ options:
   --dry-run       show routing decisions without upstream calls
   --timeout <n>   upstream request timeout in seconds
   --no-open       do not open the demo in a browser
+  --help, -h      show this help";
+
+const SERVICE_USAGE: &str = "\
+usage: wayfinder-router service <install|uninstall|status> [OPTIONS]
+
+Run the gateway as an always-on local service.
+
+options:
+  --host <host>   gateway host
+  --port <port>   gateway port
+  --print         print the generated unit file instead of installing it
   --help, -h      show this help";
 
 const INIT_USAGE: &str = "\
@@ -522,6 +560,10 @@ where
     match args.next().as_deref() {
         Some("--help" | "-h" | "help") => Ok(CliCommand::Help(TOP_LEVEL_USAGE.to_owned())),
         Some("serve") => Ok(CliCommand::Serve(parse_serve(args)?)),
+        Some("service") => match parse_service(args)? {
+            None => Ok(CliCommand::Help(SERVICE_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Service(options)),
+        },
         Some("chat") => match parse_chat(args)? {
             None => Ok(CliCommand::Help(chat_help())),
             Some(mut options) => {
@@ -589,6 +631,7 @@ pub fn execute(command: CliCommand) -> Result<CommandOutput, CliError> {
             stdout: gateway_serve_summary(&options),
             stderr: String::new(),
         }),
+        CliCommand::Service(options) => execute_service(options),
         CliCommand::Chat(options) => Ok(CommandOutput {
             stdout: run_chat(&options).map_err(|err| CliError::config(err.to_string()))?,
             stderr: String::new(),
@@ -642,6 +685,44 @@ where
         }
     }
     Ok(options)
+}
+
+fn parse_service<I>(args: I) -> Result<Option<ServiceOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let Some(action) = args.next() else {
+        return Err(CliError::new(
+            "service requires an action: install, uninstall, or status",
+        ));
+    };
+    if matches!(action.as_str(), "--help" | "-h") {
+        return Ok(None);
+    }
+    if !matches!(action.as_str(), "install" | "uninstall" | "status") {
+        return Err(CliError::new(
+            "service action must be install, uninstall, or status",
+        ));
+    }
+    let mut options = ServiceOptions {
+        action,
+        ..ServiceOptions::default()
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--host" => options.host = next_value(&mut args, "--host")?,
+            "--port" => {
+                options.port = next_value(&mut args, "--port")?
+                    .parse()
+                    .map_err(|_| CliError::new("--port must be an integer"))?;
+            }
+            "--print" => options.print = true,
+            other => return Err(CliError::new(format!("unknown service option '{other}'"))),
+        }
+    }
+    Ok(Some(options))
 }
 
 fn parse_ui<I>(args: I) -> Result<Option<UiOptions>, CliError>
@@ -723,6 +804,336 @@ pub fn demo_url(host: &str, port: u16) -> String {
         host
     };
     format!("http://{display}:{port}/demo")
+}
+
+pub fn resolve_serve_args(host: &str, port: u16) -> Vec<String> {
+    let executable = std::env::current_exe()
+        .ok()
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("wayfinder-router"));
+    vec![
+        executable.to_string_lossy().into_owned(),
+        "serve".to_owned(),
+        "--host".to_owned(),
+        host.to_owned(),
+        "--port".to_owned(),
+        port.to_string(),
+    ]
+}
+
+fn execute_service(options: ServiceOptions) -> Result<CommandOutput, CliError> {
+    let platform = detect_platform(None);
+    if platform == ServicePlatform::Other {
+        return Err(CliError::with_output(
+            "unsupported service platform",
+            EXIT_USAGE,
+            "",
+            "wayfinder-router: service supports macOS (launchd) and Linux (systemd user units); elsewhere run `wayfinder-router serve` yourself.\n",
+        ));
+    }
+
+    let program_args = resolve_serve_args(&options.host, options.port);
+    let endpoint = format!("http://{}:{}/v1", options.host, options.port);
+    let (unit_text, unit_file, manager) = match platform {
+        ServicePlatform::Macos => (
+            launchd_plist(&program_args, LAUNCHD_LABEL, "~/Library/Logs"),
+            agent_path(None),
+            which("launchctl"),
+        ),
+        ServicePlatform::Linux => (
+            systemd_unit(&program_args, "Wayfinder router gateway"),
+            systemd_unit_path(None),
+            which("systemctl"),
+        ),
+        ServicePlatform::Other => unreachable!("other handled above"),
+    };
+
+    match options.action.as_str() {
+        "install" => {
+            if options.print {
+                return Ok(CommandOutput {
+                    stdout: unit_text,
+                    stderr: String::new(),
+                });
+            }
+            if let Some(parent) = unit_file.parent() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    CliError::usage(format!("cannot create {}: {err}", parent.display()))
+                })?;
+            }
+            fs::write(&unit_file, unit_text).map_err(|err| {
+                CliError::usage(format!("cannot write {}: {err}", unit_file.display()))
+            })?;
+            let mut stderr = String::new();
+            match (platform, manager.as_deref()) {
+                (ServicePlatform::Macos, Some(manager)) => {
+                    let uid = current_uid();
+                    let bootstrap = run_manager(
+                        manager,
+                        &[
+                            "bootstrap",
+                            &format!("gui/{uid}"),
+                            unit_file.to_string_lossy().as_ref(),
+                        ],
+                    );
+                    let loaded = if bootstrap.success {
+                        bootstrap
+                    } else {
+                        run_manager(
+                            manager,
+                            &["load", "-w", unit_file.to_string_lossy().as_ref()],
+                        )
+                    };
+                    let probe =
+                        run_manager(manager, &["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")]);
+                    if !probe.success {
+                        let detail = loaded.detail();
+                        stderr.push_str(&format!(
+                            "wayfinder-router: launchctl could not load {}{}\n",
+                            unit_file.display(),
+                            detail_suffix(&detail)
+                        ));
+                        return Err(CliError::with_output(
+                            "launchctl could not load service",
+                            EXIT_CONFIG,
+                            "",
+                            stderr,
+                        ));
+                    }
+                    stderr.push_str(&format!(
+                        "wayfinder-router: installed and loaded {}\n",
+                        unit_file.display()
+                    ));
+                }
+                (ServicePlatform::Linux, Some(manager)) => {
+                    let _ = run_manager(manager, &["--user", "daemon-reload"]);
+                    let enabled =
+                        run_manager(manager, &["--user", "enable", "--now", SYSTEMD_UNIT_NAME]);
+                    if !enabled.success {
+                        let detail = enabled.detail();
+                        stderr.push_str(&format!(
+                            "wayfinder-router: systemctl could not enable {}{}\n",
+                            SYSTEMD_UNIT_NAME,
+                            detail_suffix(&detail)
+                        ));
+                        return Err(CliError::with_output(
+                            "systemctl could not enable service",
+                            EXIT_CONFIG,
+                            "",
+                            stderr,
+                        ));
+                    }
+                    stderr.push_str(&format!(
+                        "wayfinder-router: installed and started {}\n",
+                        unit_file.display()
+                    ));
+                }
+                (ServicePlatform::Macos, None) => {
+                    stderr.push_str(&format!(
+                        "wayfinder-router: wrote {}; start it with:\n  launchctl bootstrap gui/$(id -u) {}\n",
+                        unit_file.display(),
+                        unit_file.display()
+                    ));
+                }
+                (ServicePlatform::Linux, None) => {
+                    stderr.push_str(&format!(
+                        "wayfinder-router: wrote {}; start it with:\n  systemctl --user enable --now {}\n",
+                        unit_file.display(),
+                        SYSTEMD_UNIT_NAME
+                    ));
+                }
+                (ServicePlatform::Other, _) => unreachable!("other handled above"),
+            }
+            stderr.push_str(&format!(
+                "wayfinder-router: point your apps at OPENAI_BASE_URL={endpoint}\n"
+            ));
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr,
+            })
+        }
+        "uninstall" => {
+            if let (ServicePlatform::Macos, Some(manager)) = (platform, manager.as_deref()) {
+                let uid = current_uid();
+                let _ = run_manager(manager, &["bootout", &format!("gui/{uid}/{LAUNCHD_LABEL}")]);
+                let _ = run_manager(
+                    manager,
+                    &["unload", "-w", unit_file.to_string_lossy().as_ref()],
+                );
+            }
+            if let (ServicePlatform::Linux, Some(manager)) = (platform, manager.as_deref()) {
+                let _ = run_manager(manager, &["--user", "disable", "--now", SYSTEMD_UNIT_NAME]);
+            }
+            let existed = unit_file.is_file();
+            if existed {
+                fs::remove_file(&unit_file).map_err(|err| {
+                    CliError::usage(format!("cannot remove {}: {err}", unit_file.display()))
+                })?;
+            }
+            let stderr = if existed {
+                format!("wayfinder-router: removed {}\n", unit_file.display())
+            } else {
+                format!(
+                    "wayfinder-router: nothing to remove ({} not present)\n",
+                    unit_file.display()
+                )
+            };
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr,
+            })
+        }
+        "status" => {
+            let installed = unit_file.is_file();
+            let mut stderr = format!(
+                "unit file: {} ({})\nendpoint:  {endpoint}\n",
+                unit_file.display(),
+                if installed { "present" } else { "absent" }
+            );
+            if let (Some(manager), true) = (manager.as_deref(), installed) {
+                match platform {
+                    ServicePlatform::Macos => {
+                        let uid = current_uid();
+                        let probe =
+                            run_manager(manager, &["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")]);
+                        stderr.push_str(&format!(
+                            "launchd:   {}\n",
+                            if probe.success {
+                                "loaded"
+                            } else {
+                                "not loaded"
+                            }
+                        ));
+                    }
+                    ServicePlatform::Linux => {
+                        let probe =
+                            run_manager(manager, &["--user", "is-active", SYSTEMD_UNIT_NAME]);
+                        stderr.push_str(&format!(
+                            "systemd:   {}\n",
+                            non_empty_line(&probe.stdout).unwrap_or("unknown")
+                        ));
+                    }
+                    ServicePlatform::Other => {}
+                }
+            }
+            stderr.push_str(&format!(
+                "health:    {}\n",
+                probe_health(&options.host, options.port)
+            ));
+            if !installed {
+                stderr.push_str(&format!(
+                    "\ninstall with: wayfinder-router service install --port {}\n",
+                    options.port
+                ));
+            }
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr,
+            })
+        }
+        _ => Err(CliError::new(
+            "service action must be install, uninstall, or status",
+        )),
+    }
+}
+
+#[derive(Debug)]
+struct ProcessResult {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+impl ProcessResult {
+    fn detail(&self) -> String {
+        if self.stderr.trim().is_empty() {
+            self.stdout.trim().to_owned()
+        } else {
+            self.stderr.trim().to_owned()
+        }
+    }
+}
+
+fn run_manager(program: &str, args: &[&str]) -> ProcessResult {
+    match Command::new(program).args(args).output() {
+        Ok(output) => ProcessResult {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        Err(err) => ProcessResult {
+            success: false,
+            stdout: String::new(),
+            stderr: err.to_string(),
+        },
+    }
+}
+
+fn detail_suffix(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    }
+}
+
+fn non_empty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn which(program: &str) -> Option<String> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|path| path.join(program))
+        .find(|path| path.is_file())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn current_uid() -> String {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|uid| !uid.is_empty())
+        .unwrap_or_else(|| "0".to_owned())
+}
+
+fn probe_health(host: &str, port: u16) -> String {
+    let Ok(mut addrs) = (host, port).to_socket_addrs() else {
+        return "unreachable (service not running?)".to_owned();
+    };
+    let Some(addr) = addrs.next() else {
+        return "unreachable (service not running?)".to_owned();
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return "unreachable (service not running?)".to_owned();
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let request =
+        format!("GET /healthz HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return "unreachable (service not running?)".to_owned();
+    }
+    let mut response = String::new();
+    if stream.read_to_string(&mut response).is_err() {
+        return "unreachable (service not running?)".to_owned();
+    }
+    if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+        let status = response
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("unknown");
+        return format!("status {status}");
+    }
+    if response.contains("\"offline\":true") {
+        "ok (200, offline routing on)".to_owned()
+    } else {
+        "ok (200)".to_owned()
+    }
 }
 
 fn parse_chat<I>(args: I) -> Result<Option<ChatOptions>, CliError>
@@ -2365,7 +2776,7 @@ mod tests {
 
     use super::{
         parse, run, run_output, CalibrateOptions, CliCommand, JudgeOptions, OnboardOptions,
-        RecalibrateOptions, WebchatOptions,
+        RecalibrateOptions, ServiceOptions, WebchatOptions,
     };
     use wayfinder_internal_ui::UiOptions;
 
@@ -2386,6 +2797,74 @@ mod tests {
         assert!(output.contains("serve"));
         assert!(output.contains("0.0.0.0:9000"));
         assert!(output.contains("dry-run"));
+    }
+
+    #[test]
+    fn parse_service_accepts_install_print_shape() {
+        let command = parse([
+            "service",
+            "install",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8088",
+            "--print",
+        ])
+        .expect("service args should parse");
+
+        assert_eq!(
+            command,
+            CliCommand::Service(ServiceOptions {
+                action: "install".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 8088,
+                print: true,
+            })
+        );
+    }
+
+    #[test]
+    fn service_install_print_emits_platform_unit() {
+        let output = run_output(["service", "install", "--port", "8088", "--print"], None)
+            .expect("service install --print should succeed");
+
+        assert!(output.stderr.is_empty());
+        assert!(
+            output.stdout.contains("wayfinder-router")
+                && output.stdout.contains("serve")
+                && output.stdout.contains("8088")
+        );
+        assert!(
+            output.stdout.starts_with("<?xml version=\"1.0\"")
+                || output.stdout.starts_with("[Unit]\n")
+        );
+    }
+
+    #[test]
+    fn service_status_reports_unit_and_endpoint() {
+        let output = run_output(
+            ["service", "status", "--host", "127.0.0.1", "--port", "8088"],
+            None,
+        )
+        .expect("service status should succeed on supported platforms");
+
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.contains("unit file:"));
+        assert!(output
+            .stderr
+            .contains("endpoint:  http://127.0.0.1:8088/v1"));
+        assert!(output.stderr.contains("health:"));
+    }
+
+    #[test]
+    fn resolve_serve_args_targets_serve() {
+        let args = super::resolve_serve_args("127.0.0.1", 8088);
+
+        assert!(args.first().is_some_and(|arg| !arg.is_empty()));
+        assert_eq!(
+            &args[args.len() - 5..],
+            ["serve", "--host", "127.0.0.1", "--port", "8088"]
+        );
     }
 
     #[test]
@@ -2468,6 +2947,7 @@ mod tests {
             "route",
             "calibrate",
             "serve",
+            "service",
             "chat",
             "ui",
             "webchat",
@@ -2490,6 +2970,7 @@ mod tests {
             "route",
             "calibrate",
             "serve",
+            "service",
             "chat",
             "ui",
             "webchat",

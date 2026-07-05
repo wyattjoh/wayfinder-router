@@ -39,6 +39,7 @@ use wayfinder_internal_core::{DEFAULT_HOST, DEFAULT_PORT};
 pub mod bootstrap;
 pub mod recalibrate;
 pub mod reliability;
+pub mod service;
 
 pub const COMMAND_NAME: &str = "serve";
 
