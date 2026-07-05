@@ -1443,14 +1443,14 @@ fn execute_keys(options: KeysOptions) -> Result<CommandOutput, CliError> {
     let key_hash = vkeys::hash_key(&generated.plaintext);
     let mut lines = vec![
         "# Paste into wayfinder-router.toml (only the hash is stored — never the key):".to_owned(),
-        format!("[gateway.keys.{}]", options.id),
+        format!("[gateway.keys.{}]", toml_key(&options.id)),
         format!("hash = \"{key_hash}\""),
     ];
     if !options.tags.is_empty() {
         let tags = options
             .tags
             .iter()
-            .map(|tag| format!("\"{tag}\""))
+            .map(|tag| toml_string(tag))
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(format!("tags = [{tags}]"));
@@ -1464,6 +1464,21 @@ fn execute_keys(options: KeysOptions) -> Result<CommandOutput, CliError> {
         stdout: format!("{}\n", lines.join("\n")),
         stderr: String::new(),
     })
+}
+
+fn toml_key(key: &str) -> String {
+    if key
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        key.to_owned()
+    } else {
+        toml_string(key)
+    }
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
 fn unknown_preset_error(preset: &str) -> CliError {
@@ -2927,6 +2942,34 @@ api_key_env = "{key}"
         assert!(output.stdout.contains("tags = [\"prod\"]"));
         assert!(wayfinder_internal_core::vkeys::verify(key, hash));
         assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn keys_new_escapes_toml_special_id_and_tags() {
+        let output = run_output(
+            [
+                "keys",
+                "new",
+                "--id",
+                "we\"ird.id",
+                "--tag",
+                "a\"b",
+                "--tag",
+                "ok",
+            ],
+            None,
+        )
+        .expect("keys new should succeed");
+        let block = output
+            .stdout
+            .split("# Give this key")
+            .next()
+            .expect("config block should be present");
+        wayfinder_internal_gateway::validate_gateway_toml(block, "keys-new")
+            .expect("generated key block should be valid gateway TOML");
+
+        assert!(block.contains("[gateway.keys.\"we\\\"ird.id\"]"));
+        assert!(block.contains("tags = [\"a\\\"b\", \"ok\"]"));
     }
 
     #[test]

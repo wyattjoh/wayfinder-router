@@ -48,7 +48,9 @@ use wayfinder_internal_gateway::{
 
 use crate::commands::{parse_command, HELP, SCOPES};
 use crate::cost::{account_turn, cost_summary, fold_turn, load_ledger, savings_path, SessionCost};
-use crate::decision::{decide, pin_label, resolve_target, Decision, TuiState};
+use crate::decision::{
+    decide, decide_with_context, pin_label, resolve_target, Decision, DecisionContext, TuiState,
+};
 use crate::remote::{friendly_error, remote_reply};
 use crate::render::{
     footer_bar, render_cost, render_decision, render_empty_state, render_keys, render_models,
@@ -1196,7 +1198,17 @@ impl App {
             return;
         }
 
-        let decision = match decide(&text, &self.start_dir, self.threshold) {
+        let decision = match decide_with_context(
+            &text,
+            &self.start_dir,
+            self.threshold,
+            DecisionContext {
+                scope: self.state.scope.clone(),
+                sticky: self.state.sticky,
+                cooldown: self.state.cooldown,
+                messages: convo.clone(),
+            },
+        ) {
             Ok(decision) => decision,
             Err(err) => {
                 self.append_warn(err.to_string());
@@ -1345,13 +1357,25 @@ impl App {
             .collect();
         let model_field = pin.clone().unwrap_or_else(|| "auto".to_owned());
         let threshold = self.threshold;
+        let scope = self.state.scope.clone();
+        let sticky = self.state.sticky;
+        let cooldown = self.state.cooldown;
         let timeout = self.timeout;
 
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let cancel_thread = cancel.clone();
         std::thread::spawn(move || {
-            match remote_reply(&base_url, &messages_json, &model_field, threshold, timeout) {
+            match remote_reply(
+                &base_url,
+                &messages_json,
+                &model_field,
+                threshold,
+                &scope,
+                sticky,
+                cooldown,
+                timeout,
+            ) {
                 Ok((decision, reply)) => {
                     if cancel_thread.load(Ordering::Relaxed) {
                         let _ = tx.send(ReplyEvent::Cancelled {

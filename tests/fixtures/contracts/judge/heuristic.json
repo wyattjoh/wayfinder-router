@@ -13,9 +13,9 @@
       "prompt": "q",
       "cheap": "42",
       "expensive": "The capital of France is Paris.",
-      "sufficient": false,
-      "reason": "cheap arm refused/empty while the dear arm answered",
-      "comparator": "refusal"
+      "sufficient": null,
+      "reason": "answers diverge (0.00 similar); heuristic cannot adjudicate",
+      "comparator": "divergence"
     },
     {
       "prompt": "q",

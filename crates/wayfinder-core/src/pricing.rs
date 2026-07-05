@@ -216,11 +216,17 @@ impl Date {
 /// plus the count of turns whose tokens were estimated.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct DayBucket {
+    #[serde(default)]
     n: u64,
+    #[serde(default)]
     realized: f64,
+    #[serde(default)]
     baseline: f64,
+    #[serde(default)]
     savings: f64,
+    #[serde(default)]
     tokens: u64,
+    #[serde(default)]
     estimated_n: u64,
 }
 
@@ -267,9 +273,20 @@ pub struct PeriodSummary {
 /// never mistaken for currency. Persisted as JSON for cross-session continuity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavingsLedger {
+    #[serde(default = "default_max_days")]
     pub max_days: usize,
+    #[serde(default = "default_priced")]
     pub priced: bool,
+    #[serde(default)]
     days: BTreeMap<String, DayBucket>,
+}
+
+fn default_max_days() -> usize {
+    400
+}
+
+fn default_priced() -> bool {
+    true
 }
 
 impl Default for SavingsLedger {
@@ -506,5 +523,39 @@ mod tests {
 
         assert!(!loaded.priced);
         assert_eq!(loaded, ledger);
+    }
+
+    #[test]
+    fn load_tolerates_old_or_partial_buckets() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("wayfinder-savings-old-{nanos}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "max_days": 400,
+                "priced": true,
+                "days": {
+                    "2026-06-23": {
+                        "n": 2,
+                        "realized": 0.009,
+                        "baseline": 0.018,
+                        "savings": 0.009,
+                        "tokens": 1000
+                    }
+                }
+            }"#,
+        )
+        .expect("old ledger fixture should write");
+
+        let loaded = SavingsLedger::load(&path).expect("old bucket should coerce on load");
+        std::fs::remove_file(&path).ok();
+        let report = loaded.period(None, Some(Date::new(2026, 6, 23)));
+
+        assert_eq!(report.requests, 2);
+        assert_eq!(report.estimated_requests, 0);
+        assert_eq!(report.saved, 0.009);
     }
 }

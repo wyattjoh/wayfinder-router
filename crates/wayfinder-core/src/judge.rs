@@ -22,7 +22,7 @@ pub const DEFAULT_REFUSAL_MARKERS: &[&str] = &[
 
 pub const DEFAULT_MIN_ANSWER_CHARS: usize = 16;
 pub const DEFAULT_SIMILARITY_SUFFICIENT: f64 = 0.8;
-pub const HEURISTIC_JUDGE_VERSION: &str = "heuristic-1";
+pub const HEURISTIC_JUDGE_VERSION: &str = "heuristic-2";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Verdict {
@@ -60,7 +60,7 @@ impl HeuristicJudge {
     }
 
     fn is_non_answer(&self, normalized: &str) -> bool {
-        if normalized.is_empty() || normalized.chars().count() < self.min_answer_chars {
+        if normalized.is_empty() {
             return true;
         }
 
@@ -122,7 +122,9 @@ impl Judge for HeuristicJudge {
         }
 
         let ratio = sequence_matcher_ratio(&cheap_norm, &expensive_norm);
-        if ratio >= self.similarity_sufficient {
+        let long_enough = cheap_norm.chars().count() >= self.min_answer_chars
+            && expensive_norm.chars().count() >= self.min_answer_chars;
+        if long_enough && ratio >= self.similarity_sufficient {
             return Verdict::new(
                 Some(true),
                 format!(
@@ -354,7 +356,7 @@ mod tests {
         let judge = HeuristicJudge::default();
         let cases = [
             ("", PARIS, Some(false), "refusal"),
-            ("42", PARIS, Some(false), "refusal"),
+            ("42", PARIS, None, "divergence"),
             (
                 "I can't help with that, sorry.",
                 PARIS,
@@ -376,8 +378,26 @@ mod tests {
     }
 
     #[test]
+    fn terse_answers_are_answers_not_refusals() {
+        let judge = HeuristicJudge::default();
+
+        let short = judge.judge("q", "C", "C");
+        assert_eq!(short.sufficient, Some(true));
+        assert_eq!(short.comparator, "agreement");
+
+        let dear_short = judge.judge("q", CELL, "C");
+        assert_eq!(dear_short.sufficient, None);
+        assert_ne!(dear_short.comparator, "refusal");
+
+        let fuzzy_short = judge.judge("q", "cat", "car");
+        assert_eq!(fuzzy_short.sufficient, None);
+        assert_eq!(fuzzy_short.comparator, "divergence");
+    }
+
+    #[test]
     fn heuristic_judge_is_deterministic_and_versioned() {
         let judge = HeuristicJudge::default();
+        assert_eq!(judge.version(), "heuristic-2");
         assert_eq!(judge.version(), HEURISTIC_JUDGE_VERSION);
         assert_eq!(judge.judge("q", PARIS, CELL), judge.judge("q", PARIS, CELL));
     }

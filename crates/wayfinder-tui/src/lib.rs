@@ -21,7 +21,9 @@ pub mod theme;
 pub use app::run_interactive_chat;
 pub use commands::{parse_command, HELP, SCOPES};
 pub use cost::{account_turn, cost_summary, fold_turn, load_ledger, savings_path, SessionCost};
-pub use decision::{decide, pin_label, resolve_target, Decision, TuiState};
+pub use decision::{
+    decide, decide_with_context, pin_label, resolve_target, Decision, DecisionContext, TuiState,
+};
 pub use remote::{decision_from_debug, friendly_error, remote_reply};
 pub use render::{
     footer_bar, render_cost, render_decision, render_empty_state, render_keys, render_models,

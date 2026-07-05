@@ -46,9 +46,9 @@ pub fn threads_dir() -> PathBuf {
 /// A fresh, empty thread with a sortable, collision-resistant id.
 pub fn new_thread() -> Thread {
     let now = now_iso();
-    let suffix: u16 = rand::random();
+    let suffix: u64 = rand::random();
     Thread {
-        id: format!("{}-{suffix:04x}", now_stamp()),
+        id: format!("{}-{suffix:016x}", now_stamp()),
         title: String::new(),
         created: now.clone(),
         updated: now,
@@ -248,6 +248,15 @@ mod tests {
         assert_eq!(thread.created, thread.updated);
         let (stamp, suffix) = thread.id.split_once('-').expect("id has a suffix");
         assert_eq!(stamp.len(), 15); // YYYYMMDDTHHMMSS
-        assert_eq!(suffix.len(), 4); // two random bytes as hex
+        assert_eq!(suffix.len(), 16); // eight random bytes as hex
+    }
+
+    #[test]
+    fn new_thread_ids_do_not_collide_in_a_burst() {
+        let ids = (0..2000)
+            .map(|_| new_thread().id)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(ids.len(), 2000);
     }
 }

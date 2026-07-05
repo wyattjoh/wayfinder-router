@@ -4,11 +4,19 @@ use std::time::Duration;
 pub const FAILOVER_POLICIES: [&str; 3] = ["same-tier", "degrade", "escalate"];
 
 const RETRYABLE_STATUS: [u16; 5] = [429, 500, 502, 503, 504];
+const AUTH_FAILURE_STATUS: [u16; 3] = [401, 403, 407];
 
 pub fn is_retryable(status: Option<u16>) -> bool {
     match status {
         None => true,
         Some(status) => RETRYABLE_STATUS.contains(&status),
+    }
+}
+
+pub fn is_auth_failure(status: Option<u16>) -> bool {
+    match status {
+        Some(status) => AUTH_FAILURE_STATUS.contains(&status),
+        None => false,
     }
 }
 

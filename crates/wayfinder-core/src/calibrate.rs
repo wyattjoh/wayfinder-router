@@ -370,6 +370,12 @@ pub fn fit_classifier(
     samples: &[Sample],
     options: &CalibrationOptions,
 ) -> Result<CalibrationResult, CalibrationError> {
+    if options.l2 <= 0.0 {
+        return Err(CalibrationError::new(format!(
+            "--l2 must be > 0 (got {}); it keeps the solve well-posed",
+            options.l2
+        )));
+    }
     let order = options
         .models_order
         .clone()

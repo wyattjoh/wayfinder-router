@@ -6,6 +6,7 @@ use wayfinder_internal_core::complexity::{
     DEFAULT_THRESHOLD,
 };
 use wayfinder_internal_core::config::{load_routing_config, WayfinderConfigError};
+use wayfinder_internal_gateway::RelayMessage;
 
 /// The live settings the chat manages: surfaced by `/settings`, set by commands.
 ///
@@ -55,6 +56,25 @@ pub struct Decision {
     pub targets: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecisionContext {
+    pub scope: String,
+    pub sticky: bool,
+    pub cooldown: u32,
+    pub messages: Vec<RelayMessage>,
+}
+
+impl Default for DecisionContext {
+    fn default() -> Self {
+        Self {
+            scope: "turn".to_owned(),
+            sticky: false,
+            cooldown: 0,
+            messages: Vec::new(),
+        }
+    }
+}
+
 /// Score `text` and classify the route: the same path as `wayfinder-router route`.
 ///
 /// `is_local` is true when the recommendation falls in the lowest tier (the cheap,
@@ -63,6 +83,15 @@ pub fn decide(
     text: &str,
     start_dir: &Path,
     threshold: Option<f64>,
+) -> Result<Decision, WayfinderConfigError> {
+    decide_with_context(text, start_dir, threshold, DecisionContext::default())
+}
+
+pub fn decide_with_context(
+    text: &str,
+    start_dir: &Path,
+    threshold: Option<f64>,
+    context: DecisionContext,
 ) -> Result<Decision, WayfinderConfigError> {
     let base = load_routing_config(start_dir)?;
     let config = match threshold {
@@ -75,7 +104,8 @@ pub fn decide(
         None => base,
     };
 
-    let score = score_complexity(text, &config);
+    let routed_text = scoped_text(text, &context);
+    let score = score_complexity(&routed_text, &config);
 
     let mut tiers = config.tiers.clone();
     if tiers.is_empty() {
@@ -93,17 +123,131 @@ pub fn decide(
             idx = i;
         }
     }
+    let targets = tiers
+        .iter()
+        .map(|tier| tier.model.clone())
+        .collect::<Vec<_>>();
+    let mut model = score.recommendation.clone();
+    let mut mode = score.mode.to_owned();
+    if context.sticky {
+        let sticky_idx = sticky_tier_index(&context.messages, &config, tiers.len());
+        if sticky_idx > idx {
+            idx = sticky_idx;
+            if let Some(sticky_model) = tiers.get(sticky_idx).map(|tier| tier.model.clone()) {
+                model = sticky_model;
+                mode = "sticky".to_owned();
+            }
+        }
+    }
 
     Ok(Decision {
         text: text.to_owned(),
-        model: score.recommendation,
+        model,
         score: score.score,
-        mode: score.mode.to_owned(),
+        mode,
         is_local: idx == 0,
         contributions: explain_score(&score.features, config.weights),
         threshold,
-        targets: tiers.into_iter().map(|tier| tier.model).collect(),
+        targets,
     })
+}
+
+fn scoped_text(text: &str, context: &DecisionContext) -> String {
+    if context.messages.is_empty() {
+        return text.to_owned();
+    }
+    let mut parts = Vec::new();
+    match context.scope.as_str() {
+        "all" => {
+            parts.extend(context.messages.iter().filter_map(message_content));
+        }
+        "user" => {
+            parts.extend(
+                context
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == "user")
+                    .filter_map(message_content),
+            );
+        }
+        "last_user" => {
+            if let Some(content) = context
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .and_then(message_content)
+            {
+                parts.push(content);
+            }
+        }
+        _ => {
+            parts.extend(
+                context
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == "system")
+                    .filter_map(message_content),
+            );
+            if let Some(content) = context
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .and_then(message_content)
+            {
+                parts.push(content);
+            }
+        }
+    }
+    if parts.is_empty() {
+        text.to_owned()
+    } else {
+        parts.join("\n")
+    }
+}
+
+fn message_content(message: &RelayMessage) -> Option<String> {
+    let content = message.content.trim();
+    (!content.is_empty()).then(|| content.to_owned())
+}
+
+fn sticky_tier_index(
+    messages: &[RelayMessage],
+    config: &RoutingConfig,
+    tier_count: usize,
+) -> usize {
+    if tier_count == 0 {
+        return 0;
+    }
+    messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .filter_map(message_content)
+        .map(|content| score_complexity(&content, config).score)
+        .map(|score| tier_index(score, &config.tiers))
+        .max()
+        .unwrap_or(0)
+        .min(tier_count.saturating_sub(1))
+}
+
+fn tier_index(score: f64, tiers: &[wayfinder_internal_core::complexity::Tier]) -> usize {
+    let mut ordered = tiers.to_vec();
+    if ordered.is_empty() {
+        ordered = binary_tiers(DEFAULT_THRESHOLD);
+    }
+    ordered.sort_by(|a, b| {
+        a.min_score
+            .partial_cmp(&b.min_score)
+            .unwrap_or(Ordering::Equal)
+    });
+    let mut idx = 0;
+    for (i, tier) in ordered.iter().enumerate() {
+        if score >= tier.min_score {
+            idx = i;
+        }
+    }
+    idx
 }
 
 /// Resolve a forced route to `(model_name, is_local)` against the decision's tiers.

@@ -224,7 +224,8 @@ pub fn save_config_text(text: &str, start_dir: impl AsRef<Path>) -> Option<Strin
     if let Some(error) = validate_config_text(text) {
         return Some(error);
     }
-    let path = start_dir.as_ref().join(CONFIG_FILE);
+    let path = find_config_file(start_dir.as_ref())
+        .unwrap_or_else(|| start_dir.as_ref().join(CONFIG_FILE));
     fs::write(&path, text).err().map(|err| err.to_string())
 }
 
@@ -572,5 +573,32 @@ mod tests {
         let preserved = std::fs::read_to_string(dir.path().join("wayfinder-router.toml"))
             .expect("saved config");
         assert!(preserved.contains("0.7"));
+    }
+
+    #[test]
+    fn save_config_updates_resolved_parent_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested dir should be created");
+        std::fs::write(
+            dir.path().join("wayfinder-router.toml"),
+            "[routing]\nthreshold = 0.3\n",
+        )
+        .expect("parent config should write");
+
+        assert_eq!(
+            save_config_text("[routing]\nthreshold = 0.8\n", &nested),
+            None
+        );
+
+        assert!(
+            std::fs::read_to_string(dir.path().join("wayfinder-router.toml"))
+                .expect("parent config should read")
+                .contains("0.8")
+        );
+        assert!(
+            !nested.join("wayfinder-router.toml").exists(),
+            "save must not create a second ignored config in the nested dir"
+        );
     }
 }

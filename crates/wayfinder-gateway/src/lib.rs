@@ -1,3 +1,4 @@
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -61,6 +62,11 @@ const SAVINGS_FILE_ENV: &str = "WAYFINDER_ROUTER_SAVINGS_FILE";
 const SAVINGS_FILE: &str = "wayfinder-savings.json";
 const CONFIG_BODY_LIMIT: usize = 1024 * 1024;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+fn system_clock() -> Clock {
+    Arc::new(Instant::now)
+}
 
 const DASHBOARD_HTML: &str = r#"<!doctype html>
 <html lang="en">
@@ -151,6 +157,7 @@ struct AppState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GatewayConfig {
     pub models: BTreeMap<String, GatewayModel>,
+    pub offline: bool,
     pub retries: usize,
     pub breaker_threshold: usize,
     pub breaker_cooldown: f64,
@@ -269,9 +276,9 @@ struct CacheEntry {
     avoided_cost: f64,
 }
 
-#[derive(Default)]
 struct RateLimiter {
     config: Option<RateLimitConfig>,
+    clock: Clock,
     window_started: Option<Instant>,
     requests: u64,
     tokens: u64,
@@ -339,6 +346,7 @@ struct RecentCost {
 struct HealthResponse {
     status: &'static str,
     models: Vec<String>,
+    offline: bool,
 }
 
 #[derive(Serialize)]
@@ -399,8 +407,24 @@ pub fn build_app_from_dir(
     options: ServeOptions,
     start_dir: impl AsRef<Path>,
 ) -> Result<Router, GatewayError> {
-    let state = AppState::load(options, start_dir.as_ref())?;
-    Ok(Router::new()
+    let state = AppState::load(options, start_dir.as_ref(), system_clock())?;
+    Ok(router_with_state(state))
+}
+
+pub fn build_app_from_dir_with_clock<F>(
+    options: ServeOptions,
+    start_dir: impl AsRef<Path>,
+    clock: F,
+) -> Result<Router, GatewayError>
+where
+    F: Fn() -> Instant + Send + Sync + 'static,
+{
+    let state = AppState::load(options, start_dir.as_ref(), Arc::new(clock))?;
+    Ok(router_with_state(state))
+}
+
+fn router_with_state(state: AppState) -> Router {
+    Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/models", get(list_models))
         .route("/models", get(list_models))
@@ -421,7 +445,7 @@ pub fn build_app_from_dir(
             "/router/config",
             get(router_config).post(write_router_config),
         )
-        .with_state(state))
+        .with_state(state)
 }
 
 pub async fn serve(options: ServeOptions) -> Result<(), GatewayError> {
@@ -439,7 +463,7 @@ pub fn serve_blocking(options: ServeOptions) -> Result<(), GatewayError> {
 }
 
 impl AppState {
-    fn load(options: ServeOptions, start_dir: &Path) -> Result<Self, GatewayError> {
+    fn load(options: ServeOptions, start_dir: &Path, clock: Clock) -> Result<Self, GatewayError> {
         let loaded = load_config(start_dir)?;
         let model_ids = model_ids(&loaded.routing, &loaded.gateway);
         let tier_ladder = loaded
@@ -462,6 +486,7 @@ impl AppState {
             &loaded.gateway,
             priced,
             savings_path.clone(),
+            clock,
         ));
         Ok(Self {
             options,
@@ -490,6 +515,7 @@ fn load_config(start_dir: &Path) -> Result<LoadedConfig, GatewayError> {
             routing: RoutingConfig::default(),
             gateway: GatewayConfig {
                 models: BTreeMap::new(),
+                offline: false,
                 retries: DEFAULT_RETRIES,
                 breaker_threshold: DEFAULT_BREAKER_THRESHOLD,
                 breaker_cooldown: DEFAULT_BREAKER_COOLDOWN,
@@ -545,11 +571,15 @@ pub fn validate_gateway_toml(text: &str, where_: &str) -> Result<(), GatewayErro
 pub fn dump_gateway_toml(gateway: &GatewayConfig) -> String {
     let mut blocks = Vec::new();
     if gateway.retries != DEFAULT_RETRIES
+        || gateway.offline
         || gateway.breaker_threshold != DEFAULT_BREAKER_THRESHOLD
         || gateway.breaker_cooldown != DEFAULT_BREAKER_COOLDOWN
         || gateway.failover != DEFAULT_FAILOVER
     {
         let mut lines = vec!["[gateway]".to_owned()];
+        if gateway.offline {
+            lines.push("offline = true".to_owned());
+        }
         if gateway.retries != DEFAULT_RETRIES {
             lines.push(format!("retries = {}", gateway.retries));
         }
@@ -660,6 +690,7 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
     let Some(gateway_value) = data.get("gateway") else {
         return Ok(GatewayConfig {
             models: BTreeMap::new(),
+            offline: false,
             retries: DEFAULT_RETRIES,
             breaker_threshold: DEFAULT_BREAKER_THRESHOLD,
             breaker_cooldown: DEFAULT_BREAKER_COOLDOWN,
@@ -679,6 +710,15 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
             ))
         })?,
         None => DEFAULT_RETRIES,
+    };
+    let offline = match gateway_table.get("offline") {
+        Some(Value::Boolean(value)) => *value,
+        Some(_) => {
+            return Err(GatewayError::new(format!(
+                "{where_}: 'gateway.offline' must be a boolean"
+            )));
+        }
+        None => false,
     };
     let breaker_threshold = match gateway_table.get("breaker_threshold") {
         Some(value) => positive_usize_value(value).ok_or_else(|| {
@@ -717,6 +757,7 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
     let Some(models_value) = gateway_table.get("models") else {
         return Ok(GatewayConfig {
             models: BTreeMap::new(),
+            offline,
             retries,
             breaker_threshold,
             breaker_cooldown,
@@ -834,6 +875,7 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
     }
     Ok(GatewayConfig {
         models: parsed,
+        offline,
         retries,
         breaker_threshold,
         breaker_cooldown,
@@ -1048,7 +1090,7 @@ fn model_ids(routing: &RoutingConfig, gateway: &GatewayConfig) -> Vec<String> {
 }
 
 impl GatewayRuntime {
-    fn new(gateway: &GatewayConfig, priced: bool, savings_path: PathBuf) -> Self {
+    fn new(gateway: &GatewayConfig, priced: bool, savings_path: PathBuf, clock: Clock) -> Self {
         let ledger = SavingsLedger::load(&savings_path)
             .map(|mut ledger| {
                 ledger.priced = priced;
@@ -1057,7 +1099,7 @@ impl GatewayRuntime {
             .unwrap_or_else(|_| SavingsLedger::new(priced));
         Self {
             cache: Mutex::new(ResponseCache::new(gateway.cache.clone())),
-            rate_limiter: Mutex::new(RateLimiter::new(gateway.rate_limit.clone())),
+            rate_limiter: Mutex::new(RateLimiter::new(gateway.rate_limit.clone(), clock)),
             breaker: Mutex::new(reliability::CircuitBreaker::new(
                 gateway.breaker_threshold,
                 Duration::from_secs_f64(gateway.breaker_cooldown),
@@ -1135,9 +1177,10 @@ impl ResponseCache {
 }
 
 impl RateLimiter {
-    fn new(config: Option<RateLimitConfig>) -> Self {
+    fn new(config: Option<RateLimitConfig>, clock: Clock) -> Self {
         Self {
             config,
+            clock,
             window_started: None,
             requests: 0,
             tokens: 0,
@@ -1199,7 +1242,7 @@ impl RateLimiter {
     }
 
     fn roll_window(&mut self, config: &RateLimitConfig) {
-        let now = Instant::now();
+        let now = (self.clock)();
         let window = Duration::from_secs_f64(config.window);
         match self.window_started {
             Some(started) if now.duration_since(started) < window => {}
@@ -1216,7 +1259,7 @@ impl RateLimiter {
         let Some(started) = self.window_started else {
             return config.window.ceil().max(1.0) as u64;
         };
-        let elapsed = Instant::now().duration_since(started);
+        let elapsed = (self.clock)().duration_since(started);
         if elapsed >= window {
             1
         } else {
@@ -1436,6 +1479,7 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         models,
+        offline: state.gateway.offline,
     })
 }
 
@@ -1601,17 +1645,26 @@ async fn chat_completions_response(
     }
 
     let decision_started = Instant::now();
-    let prompt = extract_prompt(body.get("messages"));
+    let prompt = extract_scoped_prompt(body.get("messages"), &headers);
     let decision = score_complexity(&prompt, &state.routing);
     let decision_latency = decision_started.elapsed();
-    let route = match route_decision(&state, &headers, body.get("model"), &decision, &request_id) {
-        Ok(route) => route,
-        Err(response) => return response,
-    };
+    let mut route =
+        match route_decision(&state, &headers, body.get("model"), &decision, &request_id) {
+            Ok(route) => route,
+            Err(response) => return response,
+        };
+    apply_sticky_route(&state, &headers, body.get("messages"), &mut route);
     let client_body = body.clone();
     let mut response_headers =
         decision_headers(&route.chosen, decision.score, &route.mode, &request_id);
     add_rate_limit_headers(&state, &mut response_headers);
+    let offline = offline_enabled(&headers, &state.gateway);
+    if offline {
+        response_headers.insert(
+            "x-wayfinder-router-offline",
+            HeaderValue::from_static("true"),
+        );
+    }
     if let Some(key_id) = &key_id {
         response_headers.insert(
             "x-wayfinder-router-key",
@@ -1636,21 +1689,30 @@ async fn chat_completions_response(
             None,
             cost,
             key_id.clone(),
+            false,
         );
         return json_response(
             StatusCode::OK,
             response_headers,
-            dry_run_debug_body(&state, &decision, &route, &request_id),
+            dry_run_debug_body(&state, &decision, &route, &request_id, offline),
         );
     }
 
-    let Some(target) = state.gateway.models.get(&route.chosen).cloned() else {
+    let deliver_from = if offline {
+        tier_ladder(&state.routing)
+            .into_iter()
+            .find(|model| state.gateway.models.contains_key(model))
+            .unwrap_or_else(|| route.chosen.clone())
+    } else {
+        route.chosen.clone()
+    };
+    let Some(target) = state.gateway.models.get(&deliver_from).cloned() else {
         return json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             response_headers,
             json!({
                 "error": {
-                    "message": format!("no gateway endpoint configured for model '{}'", route.chosen),
+                    "message": format!("no gateway endpoint configured for model '{}'", deliver_from),
                     "type": "wayfinder_router_misconfigured"
                 }
             }),
@@ -1668,7 +1730,7 @@ async fn chat_completions_response(
             response_headers.insert("x-wayfinder-router-cache", HeaderValue::from_static("hit"));
             let cost = recent_cost_from_tokens(
                 &state,
-                &route.chosen,
+                &deliver_from,
                 entry.prompt_tokens,
                 entry.completion_tokens,
                 entry.estimated,
@@ -1683,7 +1745,7 @@ async fn chat_completions_response(
                 RecentDecision {
                     request_id: request_id.clone(),
                     model: route.chosen.clone(),
-                    served_by: route.chosen.clone(),
+                    served_by: deliver_from.clone(),
                     score: round_score(decision.score),
                     mode: route.mode.clone(),
                     ts: unix_ts(),
@@ -1694,7 +1756,7 @@ async fn chat_completions_response(
             return bytes_response(
                 entry.status,
                 with_content_type(
-                    served_headers(response_headers, &route.chosen, &route.chosen),
+                    served_headers(response_headers, &route.chosen, &deliver_from, offline),
                     &entry.content_type,
                 ),
                 entry.body,
@@ -1704,7 +1766,7 @@ async fn chat_completions_response(
         state.runtime.metrics.lock().unwrap().observe_cache_miss();
     }
     let policy = failover_policy(&headers, &state.gateway.failover);
-    let plan = delivery_plan_for(&state, &route.chosen, &prompt, policy);
+    let plan = delivery_plan_for(&state, &deliver_from, &prompt, policy, offline);
     if plan.is_empty() {
         return json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1713,7 +1775,7 @@ async fn chat_completions_response(
                 "error": {
                     "message": format!(
                         "no available upstream for '{}' (cooling down or context too small)",
-                        route.chosen
+                        deliver_from
                     ),
                     "type": "wayfinder_router_circuit_open"
                 }
@@ -1732,6 +1794,7 @@ async fn chat_completions_response(
             prompt,
             key_id,
             decision_latency,
+            offline,
         )
         .await;
     }
@@ -1748,6 +1811,7 @@ async fn chat_completions_response(
         cache_key,
         key_id,
         decision_latency,
+        offline,
     )
     .await
 }
@@ -1949,18 +2013,45 @@ fn failover_policy<'a>(headers: &'a HeaderMap, configured: &'a str) -> &'a str {
         .unwrap_or(configured)
 }
 
-fn delivery_plan_for(state: &AppState, chosen: &str, prompt: &str, policy: &str) -> Vec<String> {
+fn offline_enabled(headers: &HeaderMap, gateway: &GatewayConfig) -> bool {
+    gateway.offline
+        || headers
+            .get("x-wayfinder-offline")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+            .unwrap_or(false)
+}
+
+fn tier_ladder(routing: &RoutingConfig) -> Vec<String> {
+    let mut tiers = routing.tiers.clone();
+    tiers.sort_by(|a, b| {
+        a.min_score
+            .partial_cmp(&b.min_score)
+            .unwrap_or(CmpOrdering::Equal)
+    });
+    tiers.into_iter().map(|tier| tier.model).collect()
+}
+
+fn delivery_plan_for(
+    state: &AppState,
+    chosen: &str,
+    prompt: &str,
+    policy: &str,
+    offline: bool,
+) -> Vec<String> {
     let Some(target) = state.gateway.models.get(chosen) else {
         return Vec::new();
     };
-    let ladder = state
-        .routing
-        .tiers
-        .iter()
-        .map(|tier| tier.model.as_str())
-        .collect::<Vec<_>>();
+    let ladder = tier_ladder(&state.routing);
     let mut candidates = target.fallbacks.clone();
-    candidates.extend(reliability::failover_candidates(chosen, ladder, policy));
+    if !offline {
+        candidates.extend(reliability::failover_candidates(chosen, &ladder, policy));
+    }
     let estimated_tokens = estimate_tokens(prompt);
     let now = reliability_now();
     let breaker = state.runtime.breaker.lock().unwrap();
@@ -2001,12 +2092,17 @@ fn retry_delay(delays: &[Duration], attempt: usize) -> Duration {
     delays.get(attempt).copied().unwrap_or_default()
 }
 
-fn served_headers(mut headers: HeaderMap, chosen: &str, served_by: &str) -> HeaderMap {
+fn served_headers(
+    mut headers: HeaderMap,
+    chosen: &str,
+    served_by: &str,
+    offline: bool,
+) -> HeaderMap {
     headers.insert(
         "x-wayfinder-router-served-by",
         HeaderValue::from_str(served_by).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
     );
-    if served_by != chosen {
+    if served_by != chosen && !offline {
         headers.insert(
             "x-wayfinder-router-failover",
             HeaderValue::from_static("true"),
@@ -2028,6 +2124,7 @@ async fn forward_upstream(
     cache_key_hint: Option<String>,
     key_id: Option<String>,
     decision_latency: Duration,
+    offline: bool,
 ) -> Response<Body> {
     let client = upstream_client(&state.options);
     let mut last_error = "no upstream available".to_owned();
@@ -2087,14 +2184,14 @@ async fn forward_upstream(
                 }
             };
             if !reliability::is_retryable(Some(status.as_u16())) {
-                state
-                    .runtime
-                    .breaker
-                    .lock()
-                    .unwrap()
-                    .record(&served_by, true, reliability_now());
                 if status.is_success() {
-                    let served_headers = served_headers(headers, &route.chosen, &served_by);
+                    state.runtime.breaker.lock().unwrap().record(
+                        &served_by,
+                        true,
+                        reliability_now(),
+                    );
+                    let served_headers =
+                        served_headers(headers, &route.chosen, &served_by, offline);
                     let parsed = serde_json::from_slice::<JsonValue>(&bytes).ok();
                     let completion = parsed
                         .as_ref()
@@ -2123,7 +2220,7 @@ async fn forward_upstream(
                         let mut metrics = state.runtime.metrics.lock().unwrap();
                         metrics.observe_decision(&route.chosen, &route.mode, decision_latency);
                         metrics.observe_upstream(&served_by, upstream_latency);
-                        if served_by != route.chosen {
+                        if served_by != route.chosen && !offline {
                             metrics.observe_failover(&route.chosen, &served_by);
                         }
                         metrics.observe_cost(turn_cost.realized, turn_cost.baseline);
@@ -2165,7 +2262,7 @@ async fn forward_upstream(
                             if let Some(object) = parsed.as_object_mut() {
                                 object.insert(
                                     "wayfinder".to_owned(),
-                                    debug_payload(&decision, &route, &request_id),
+                                    debug_payload(&decision, &route, &request_id, offline),
                                 );
                                 return bytes_response(
                                     StatusCode::OK,
@@ -2181,10 +2278,29 @@ async fn forward_upstream(
                         bytes.to_vec(),
                     );
                 }
+                if reliability::is_auth_failure(Some(status.as_u16())) {
+                    state
+                        .runtime
+                        .metrics
+                        .lock()
+                        .unwrap()
+                        .observe_upstream_error(&served_by);
+                    state.runtime.breaker.lock().unwrap().record(
+                        &served_by,
+                        false,
+                        reliability_now(),
+                    );
+                } else {
+                    state.runtime.breaker.lock().unwrap().record(
+                        &served_by,
+                        true,
+                        reliability_now(),
+                    );
+                }
                 return bytes_response(
                     status,
                     with_content_type(
-                        served_headers(headers, &route.chosen, &served_by),
+                        served_headers(headers, &route.chosen, &served_by, offline),
                         &content_type,
                     ),
                     bytes.to_vec(),
@@ -2222,6 +2338,7 @@ async fn stream_upstream(
     prompt: String,
     key_id: Option<String>,
     decision_latency: Duration,
+    offline: bool,
 ) -> Response<Body> {
     let client = upstream_client(&state.options);
     let mut last_error = "no upstream available".to_owned();
@@ -2265,12 +2382,6 @@ async fn stream_upstream(
                 .unwrap_or("application/json")
                 .to_owned();
             if !reliability::is_retryable(Some(status.as_u16())) {
-                state
-                    .runtime
-                    .breaker
-                    .lock()
-                    .unwrap()
-                    .record(&served_by, true, reliability_now());
                 if status.is_success() {
                     opened = Some((served_by, response, upstream_started));
                     break 'targets;
@@ -2279,10 +2390,29 @@ async fn stream_upstream(
                     Ok(bytes) => bytes,
                     Err(_) => return upstream_error(headers, "upstream response failed"),
                 };
+                if reliability::is_auth_failure(Some(status.as_u16())) {
+                    state
+                        .runtime
+                        .metrics
+                        .lock()
+                        .unwrap()
+                        .observe_upstream_error(&served_by);
+                    state.runtime.breaker.lock().unwrap().record(
+                        &served_by,
+                        false,
+                        reliability_now(),
+                    );
+                } else {
+                    state.runtime.breaker.lock().unwrap().record(
+                        &served_by,
+                        true,
+                        reliability_now(),
+                    );
+                }
                 return bytes_response(
                     status,
                     with_content_type(
-                        served_headers(headers, &route.chosen, &served_by),
+                        served_headers(headers, &route.chosen, &served_by, offline),
                         &content_type,
                     ),
                     bytes.to_vec(),
@@ -2321,6 +2451,7 @@ async fn stream_upstream(
         score: decision.score,
         decision_latency,
         upstream_started,
+        offline,
         completion: String::new(),
         buffer: String::new(),
         failed: false,
@@ -2351,7 +2482,7 @@ async fn stream_upstream(
         .body(Body::from_stream(stream))
         .map(|mut response| {
             *response.headers_mut() = with_content_type(
-                served_headers(headers, &chosen, &served_by),
+                served_headers(headers, &chosen, &served_by, offline),
                 "text/event-stream",
             );
             response
@@ -2375,6 +2506,7 @@ struct StreamAccounting {
     score: f64,
     decision_latency: Duration,
     upstream_started: Instant,
+    offline: bool,
     completion: String,
     buffer: String,
     failed: bool,
@@ -2435,13 +2567,14 @@ impl StreamAccounting {
         observe_decision(
             &self.state,
             &self.route,
-            &self.route.chosen,
+            &self.served_by,
             &self.request_id,
             self.score,
             self.decision_latency,
             Some(self.upstream_started.elapsed()),
             cost,
             self.key_id.clone(),
+            self.offline,
         );
         self.state
             .runtime
@@ -3050,15 +3183,24 @@ fn debug_enabled(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn debug_payload(decision: &ComplexityScore, route: &RouteDecision, request_id: &str) -> JsonValue {
-    json!({
+fn debug_payload(
+    decision: &ComplexityScore,
+    route: &RouteDecision,
+    request_id: &str,
+    offline: bool,
+) -> JsonValue {
+    let mut payload = json!({
         "model": route.chosen,
         "score": round_score(decision.score),
         "mode": route.mode,
         "request_id": request_id,
         "features": decision.features,
         "tiers": decision.tiers
-    })
+    });
+    if offline {
+        payload["offline"] = JsonValue::Bool(true);
+    }
+    payload
 }
 
 fn dry_run_debug_body(
@@ -3066,8 +3208,9 @@ fn dry_run_debug_body(
     decision: &ComplexityScore,
     route: &RouteDecision,
     request_id: &str,
+    offline: bool,
 ) -> JsonValue {
-    json!({
+    let mut body = json!({
         "id": "resp-1",
         "object": "chat.completion",
         "wayfinder": {
@@ -3081,7 +3224,11 @@ fn dry_run_debug_body(
             "cost": dry_run_cost(state, &route.chosen, decision.features.word_count),
             "dry_run": true
         }
-    })
+    });
+    if offline {
+        body["wayfinder"]["offline"] = JsonValue::Bool(true);
+    }
+    body
 }
 
 fn dry_run_cost(state: &AppState, route: &str, word_count: usize) -> JsonValue {
@@ -3189,6 +3336,7 @@ fn observe_decision(
     upstream_latency: Option<Duration>,
     cost: RecentCost,
     key_id: Option<String>,
+    offline: bool,
 ) {
     {
         let mut metrics = state.runtime.metrics.lock().unwrap();
@@ -3196,7 +3344,7 @@ fn observe_decision(
         if let Some(upstream_latency) = upstream_latency {
             metrics.observe_upstream(served_by, upstream_latency);
         }
-        if served_by != route.chosen {
+        if served_by != route.chosen && !offline {
             metrics.observe_failover(&route.chosen, served_by);
         }
         metrics.observe_cost(cost.realized, cost.baseline);
@@ -3248,6 +3396,96 @@ fn next_request_id() -> String {
     format!("rust-{id:012x}")
 }
 
+fn extract_scoped_prompt(messages: Option<&JsonValue>, headers: &HeaderMap) -> String {
+    let scope = headers
+        .get("x-wayfinder-route-on")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|scope| matches!(*scope, "turn" | "last_user" | "user" | "all"))
+        .unwrap_or("turn");
+    if scope == "turn" {
+        return extract_prompt(messages);
+    }
+    let Some(messages) = messages.and_then(JsonValue::as_array) else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    match scope {
+        "all" => {
+            parts.extend(messages.iter().filter_map(extract_message_text));
+        }
+        "user" => {
+            parts.extend(messages.iter().filter_map(|message| {
+                (message.get("role").and_then(JsonValue::as_str) == Some("user"))
+                    .then(|| extract_message_text(message))
+                    .flatten()
+            }));
+        }
+        "last_user" => {
+            if let Some(text) = messages.iter().rev().find_map(|message| {
+                (message.get("role").and_then(JsonValue::as_str) == Some("user"))
+                    .then(|| extract_message_text(message))
+                    .flatten()
+            }) {
+                parts.push(text);
+            }
+        }
+        _ => {}
+    }
+    if parts.is_empty() {
+        extract_prompt(Some(&JsonValue::Array(messages.clone())))
+    } else {
+        parts.join("\n")
+    }
+}
+
+fn apply_sticky_route(
+    state: &AppState,
+    headers: &HeaderMap,
+    messages: Option<&JsonValue>,
+    route: &mut RouteDecision,
+) {
+    if route.mode == "pinned" || !sticky_enabled(headers) {
+        return;
+    }
+    let Some(messages) = messages.and_then(JsonValue::as_array) else {
+        return;
+    };
+    let ladder = tier_ladder(&state.routing);
+    if ladder.len() < 2 {
+        return;
+    }
+    let current = ladder
+        .iter()
+        .position(|model| model == &route.chosen)
+        .unwrap_or(0);
+    let sticky = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(JsonValue::as_str) == Some("user"))
+        .filter_map(extract_message_text)
+        .map(|text| score_complexity(&text, &state.routing).recommendation)
+        .filter_map(|model| ladder.iter().position(|candidate| candidate == &model))
+        .max()
+        .unwrap_or(current);
+    if sticky > current {
+        route.chosen = ladder[sticky].clone();
+        route.mode = "sticky".to_owned();
+    }
+}
+
+fn sticky_enabled(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-wayfinder-sticky")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn extract_prompt(messages: Option<&JsonValue>) -> String {
     let Some(messages) = messages.and_then(JsonValue::as_array) else {
         return String::new();
@@ -3285,6 +3523,11 @@ fn extract_prompt(messages: Option<&JsonValue>) -> String {
         }
     }
     selected.join("\n")
+}
+
+fn extract_message_text(message: &JsonValue) -> Option<String> {
+    let object = message.as_object()?;
+    message_text(object)
 }
 
 fn message_text(message: &Map<String, JsonValue>) -> Option<String> {
@@ -3710,19 +3953,31 @@ fn openai_sse_line_events(
 
 struct AnthropicSseTranslator {
     model: String,
-    text_started: bool,
+    next_index: usize,
+    text_index: Option<usize>,
     text_finished: bool,
+    tools: Vec<ToolSlot>,
     completion: String,
     output_tokens: Option<usize>,
     finish_reason: Option<JsonValue>,
+}
+
+#[derive(Debug, Default)]
+struct ToolSlot {
+    openai_index: usize,
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
 }
 
 impl AnthropicSseTranslator {
     fn new(model: String) -> Self {
         Self {
             model,
-            text_started: false,
+            next_index: 0,
+            text_index: None,
             text_finished: false,
+            tools: Vec::new(),
             completion: String::new(),
             output_tokens: None,
             finish_reason: None,
@@ -3763,32 +4018,47 @@ impl AnthropicSseTranslator {
             return out;
         };
         for choice in choices {
-            if let Some(text) = choice
-                .get("delta")
-                .and_then(|delta| delta.get("content"))
-                .and_then(JsonValue::as_str)
-            {
-                if !text.is_empty() {
-                    if !self.text_started {
-                        self.text_started = true;
-                        out.extend(sse_event(
-                            "content_block_start",
-                            json!({
-                                "type": "content_block_start",
-                                "index": 0,
-                                "content_block": {"type": "text", "text": ""}
-                            }),
-                        ));
+            let Some(delta) = choice.get("delta") else {
+                if let Some(reason) = choice.get("finish_reason") {
+                    if !reason.is_null() {
+                        self.finish_reason = Some(reason.clone());
                     }
+                }
+                continue;
+            };
+            if let Some(text) = delta.get("content").and_then(JsonValue::as_str) {
+                if !text.is_empty() {
+                    let index = match self.text_index {
+                        Some(index) => index,
+                        None => {
+                            let index = self.next_index;
+                            self.next_index += 1;
+                            self.text_index = Some(index);
+                            out.extend(sse_event(
+                                "content_block_start",
+                                json!({
+                                    "type": "content_block_start",
+                                        "index": index,
+                                    "content_block": {"type": "text", "text": ""}
+                                }),
+                            ));
+                            index
+                        }
+                    };
                     self.completion.push_str(text);
                     out.extend(sse_event(
                         "content_block_delta",
                         json!({
                             "type": "content_block_delta",
-                            "index": 0,
+                            "index": index,
                             "delta": {"type": "text_delta", "text": text}
                         }),
                     ));
+                }
+            }
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(JsonValue::as_array) {
+                for call in tool_calls {
+                    self.ingest_tool_call(call);
                 }
             }
             if let Some(reason) = choice.get("finish_reason") {
@@ -3800,24 +4070,108 @@ impl AnthropicSseTranslator {
         out
     }
 
+    fn ingest_tool_call(&mut self, call: &JsonValue) {
+        let openai_index = call
+            .get("index")
+            .and_then(JsonValue::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0);
+        let slot_index = match self
+            .tools
+            .iter()
+            .position(|slot| slot.openai_index == openai_index)
+        {
+            Some(index) => index,
+            None => {
+                self.tools.push(ToolSlot {
+                    openai_index,
+                    ..ToolSlot::default()
+                });
+                self.tools.len() - 1
+            }
+        };
+        let slot = &mut self.tools[slot_index];
+        if let Some(id) = call
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            slot.id = Some(id.to_owned());
+        }
+        if let Some(function) = call.get("function").and_then(JsonValue::as_object) {
+            if let Some(name) = function
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                slot.name = Some(name.to_owned());
+            }
+            if let Some(arguments) = function.get("arguments").and_then(JsonValue::as_str) {
+                slot.arguments.push_str(arguments);
+                self.completion.push_str(arguments);
+            }
+        }
+    }
+
     fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
-        if !self.text_started {
-            self.text_started = true;
+        if self.text_index.is_none() && self.tools.is_empty() {
+            let index = self.next_index;
+            self.next_index += 1;
+            self.text_index = Some(index);
             out.extend(sse_event(
                 "content_block_start",
                 json!({
                     "type": "content_block_start",
-                    "index": 0,
+                    "index": index,
                     "content_block": {"type": "text", "text": ""}
                 }),
             ));
         }
         if !self.text_finished {
             self.text_finished = true;
+            if let Some(index) = self.text_index {
+                out.extend(sse_event(
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": index}),
+                ));
+            }
+        }
+        self.tools.sort_by_key(|slot| slot.openai_index);
+        for tool in &self.tools {
+            let index = self.next_index;
+            self.next_index += 1;
+            let id = tool.id.clone().unwrap_or_else(|| format!("toolu_{index}"));
+            let name = tool.name.clone().unwrap_or_default();
+            out.extend(sse_event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": {}
+                    }
+                }),
+            ));
+            if !tool.arguments.is_empty() {
+                out.extend(sse_event(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": tool.arguments
+                        }
+                    }),
+                ));
+            }
             out.extend(sse_event(
                 "content_block_stop",
-                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "content_block_stop", "index": index}),
             ));
         }
         let output_tokens = self

@@ -108,6 +108,9 @@ pub fn remote_reply(
     messages: &[Value],
     model: &str,
     threshold: Option<f64>,
+    scope: &str,
+    sticky: bool,
+    cooldown: u32,
     timeout: Duration,
 ) -> Result<(Option<Decision>, Option<String>), String> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
@@ -124,6 +127,12 @@ pub fn remote_reply(
         .json(&body);
     if let Some(threshold) = threshold {
         request = request.header("X-Wayfinder-Threshold", threshold.to_string());
+    }
+    request = request.header("X-Wayfinder-Route-On", scope);
+    if sticky {
+        request = request
+            .header("X-Wayfinder-Sticky", "true")
+            .header("X-Wayfinder-Sticky-Cooldown", cooldown.to_string());
     }
 
     let response = request

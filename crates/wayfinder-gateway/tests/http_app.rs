@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Notify};
@@ -20,8 +20,8 @@ use wayfinder_internal_core::feedback::DEFAULT_LOG;
 use wayfinder_internal_core::profiles::PROFILES;
 use wayfinder_internal_core::vkeys;
 use wayfinder_internal_gateway::{
-    build_app_from_dir, dump_gateway_toml, gateway_config_from_toml, load_gateway_models,
-    ServeOptions,
+    build_app_from_dir, build_app_from_dir_with_clock, dump_gateway_toml, gateway_config_from_toml,
+    load_gateway_models, ServeOptions,
 };
 
 fn repo_root() -> PathBuf {
@@ -196,6 +196,7 @@ struct UpstreamState {
     requests: Arc<Mutex<Vec<UpstreamRequest>>>,
     status: StatusCode,
     stream: bool,
+    stream_body: Option<String>,
     body: Value,
 }
 
@@ -242,7 +243,32 @@ impl FakeUpstream {
             requests: requests.clone(),
             status,
             stream,
+            stream_body: None,
             body,
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(fake_chat_completion))
+            .with_state(state);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            requests,
+            task,
+        }
+    }
+
+    async fn start_with_stream_body(body: impl Into<String>) -> Self {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = UpstreamState {
+            requests: requests.clone(),
+            status: StatusCode::OK,
+            stream: true,
+            stream_body: Some(body.into()),
+            body: Value::Null,
         };
         let app = Router::new()
             .route("/chat/completions", post(fake_chat_completion))
@@ -404,6 +430,9 @@ async fn fake_chat_completion(
             .into_response();
     }
     if state.stream {
+        if let Some(body) = state.stream_body {
+            return ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response();
+        }
         return (
             [(header::CONTENT_TYPE, "text/event-stream")],
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n\
@@ -492,6 +521,7 @@ async fn healthz_reports_ok_and_default_models() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
     assert_eq!(body["models"], serde_json::json!(["cloud", "local"]));
+    assert_eq!(body["offline"], false);
 }
 
 #[tokio::test]
@@ -1368,6 +1398,93 @@ model = "local-upstream"
 }
 
 #[tokio::test]
+async fn auth_failure_opens_breaker_then_degrades() {
+    let cloud =
+        SequencedUpstream::start([StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED]).await;
+    let local = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[gateway]
+retries = 0
+breaker_threshold = 2
+breaker_cooldown = 30
+failover = "degrade"
+
+[routing]
+threshold = 0.0
+
+[gateway.models.local]
+base_url = "{local_url}"
+model = "local-upstream"
+
+[gateway.models.cloud]
+base_url = "{cloud_url}"
+model = "cloud-upstream"
+"#,
+            local_url = local.base_url,
+            cloud_url = cloud.base_url
+        ),
+    )
+    .unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Design a distributed database migration plan."}],
+        "stream": false
+    });
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let third = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(first.headers()["x-wayfinder-router-served-by"], "cloud");
+    assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(second.headers()["x-wayfinder-router-served-by"], "cloud");
+    assert_eq!(third.status(), StatusCode::OK);
+    assert_eq!(third.headers()["x-wayfinder-router-model"], "cloud");
+    assert_eq!(third.headers()["x-wayfinder-router-served-by"], "local");
+    assert_eq!(third.headers()["x-wayfinder-router-failover"], "true");
+    assert_eq!(cloud.calls().len(), 2);
+    assert_eq!(local.calls().len(), 1);
+}
+
+#[tokio::test]
 async fn chat_completions_relays_streaming_sse() {
     let upstream = FakeUpstream::start(StatusCode::OK, true).await;
     let dir = tempdir().unwrap();
@@ -1639,6 +1756,59 @@ model = "local-upstream"
     assert!(body.contains("event: content_block_stop"));
     assert!(body.contains("event: message_delta"));
     assert!(body.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn anthropic_streaming_parallel_tool_calls_keep_ids_and_arguments() {
+    let upstream = FakeUpstream::start_with_stream_body(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"alpha\",\"arguments\":\"{\\\"x\\\":\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"beta\",\"arguments\":\"{\\\"y\\\":\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"2}\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: [DONE]\n\n",
+    )
+    .await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+
+    let (status, _, body) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/messages",
+        &[],
+        serde_json::json!({
+            "model": "claude-3-5-haiku-latest",
+            "messages": [{"role": "user", "content": "Call tools."}],
+            "stream": true
+        }),
+    )
+    .await;
+    let body = String::from_utf8(body).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"type\":\"tool_use\""));
+    assert!(body.contains("\"id\":\"call_a\""));
+    assert!(body.contains("\"name\":\"alpha\""));
+    assert!(body.contains("\"id\":\"call_b\""));
+    assert!(body.contains("\"name\":\"beta\""));
+    assert!(body.contains("\"partial_json\":\"{\\\"x\\\":1}\""));
+    assert!(body.contains("\"partial_json\":\"{\\\"y\\\":2}\""));
+    assert_eq!(body.matches("\"type\":\"tool_use\"").count(), 2);
 }
 
 #[tokio::test]
@@ -2053,6 +2223,165 @@ model = "local-upstream"
 }
 
 #[tokio::test]
+async fn offline_config_forces_cheapest_tier_and_reports_health() {
+    let local = FakeUpstream::start(StatusCode::OK, false).await;
+    let cloud = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[gateway]
+offline = true
+
+[routing]
+threshold = 0.0
+
+[gateway.models.local]
+base_url = "{local_url}"
+model = "local-upstream"
+
+[gateway.models.cloud]
+base_url = "{cloud_url}"
+model = "cloud-upstream"
+"#,
+            local_url = local.base_url,
+            cloud_url = cloud.base_url
+        ),
+    )
+    .unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Design a distributed database migration plan."}]
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let headers = response.headers().clone();
+    let (health_status, health) = app_get_json(app, "/healthz").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(headers["x-wayfinder-router-model"], "cloud");
+    assert_eq!(headers["x-wayfinder-router-served-by"], "local");
+    assert_eq!(headers["x-wayfinder-router-offline"], "true");
+    assert!(!headers.contains_key("x-wayfinder-router-failover"));
+    assert_eq!(health_status, StatusCode::OK);
+    assert_eq!(health["offline"], true);
+    assert_eq!(local.calls().len(), 1);
+    assert_eq!(cloud.calls().len(), 0);
+}
+
+#[tokio::test]
+async fn offline_header_does_not_replay_cloud_cache() {
+    let local = FakeUpstream::start_with_body(
+        StatusCode::OK,
+        false,
+        serde_json::json!({
+            "id": "local",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": "answer from local"}}],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 20}
+        }),
+    )
+    .await;
+    let cloud = FakeUpstream::start_with_body(
+        StatusCode::OK,
+        false,
+        serde_json::json!({
+            "id": "cloud",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": "answer from cloud"}}],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 20}
+        }),
+    )
+    .await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.0
+
+[gateway.cache]
+enabled = true
+
+[gateway.models.local]
+base_url = "{local_url}"
+model = "local-upstream"
+
+[gateway.models.cloud]
+base_url = "{cloud_url}"
+model = "cloud-upstream"
+"#,
+            local_url = local.base_url,
+            cloud_url = cloud.base_url
+        ),
+    )
+    .unwrap();
+    let app = build_app_from_dir(ServeOptions::default(), dir.path()).expect("app should build");
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Design a distributed database migration plan."}],
+        "temperature": 0
+    });
+
+    let online = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let online_headers = online.headers().clone();
+    let online_body = online.into_body().collect().await.unwrap().to_bytes();
+    let offline = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Wayfinder-Offline", "true")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let offline_headers = offline.headers().clone();
+    let offline_body = offline.into_body().collect().await.unwrap().to_bytes();
+
+    assert_eq!(online_headers["x-wayfinder-router-served-by"], "cloud");
+    assert_eq!(online_headers["x-wayfinder-router-cache"], "miss");
+    assert!(String::from_utf8(online_body.to_vec())
+        .unwrap()
+        .contains("answer from cloud"));
+    assert_eq!(offline_headers["x-wayfinder-router-served-by"], "local");
+    assert_eq!(offline_headers["x-wayfinder-router-offline"], "true");
+    assert_eq!(offline_headers["x-wayfinder-router-cache"], "miss");
+    assert!(String::from_utf8(offline_body.to_vec())
+        .unwrap()
+        .contains("answer from local"));
+    assert_eq!(cloud.calls().len(), 1);
+    assert_eq!(local.calls().len(), 1);
+}
+
+#[tokio::test]
 async fn rate_limit_rpm_rejects_before_upstream_and_records_metric() {
     let upstream = FakeUpstream::start(StatusCode::OK, false).await;
     let dir = tempdir().unwrap();
@@ -2134,6 +2463,83 @@ model = "local-upstream"
     assert_eq!(body["error"]["type"], "wayfinder_router_rate_limited");
     assert_eq!(upstream.calls().len(), 1);
     assert!(metrics.contains("wayfinder_router_rate_limited_total{limit=\"rpm\"} 1"));
+}
+
+#[tokio::test]
+async fn rate_limit_window_rolls_with_injected_clock() {
+    let upstream = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.5
+
+[gateway.rate_limit]
+rpm = 1
+window = 60
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+    let now = Arc::new(Mutex::new(Instant::now()));
+    let clock = {
+        let now = now.clone();
+        move || *now.lock().unwrap()
+    };
+    let app = build_app_from_dir_with_clock(ServeOptions::default(), dir.path(), clock)
+        .expect("app should build");
+    let payload = serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": "Say hello."}]
+    });
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    *now.lock().unwrap() += Duration::from_secs(61);
+    let third = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(third.status(), StatusCode::OK);
 }
 
 #[tokio::test]

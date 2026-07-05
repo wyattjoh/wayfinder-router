@@ -2,7 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use wayfinder_internal_tui::{decide, pin_label, resolve_target};
+use wayfinder_internal_gateway::RelayMessage;
+use wayfinder_internal_tui::{
+    decide, decide_with_context, pin_label, resolve_target, DecisionContext,
+};
 
 #[test]
 fn low_score_prompt_routes_local() {
@@ -50,6 +53,71 @@ fn threshold_override_changes_the_route() {
     let forced_cloud = decide(prompt, &dir, Some(0.0)).expect("decide should score the prompt");
     assert!(!forced_cloud.is_local);
     assert_eq!(forced_cloud.model, "cloud");
+}
+
+#[test]
+fn context_scope_and_sticky_reach_local_decision() {
+    let dir = clean_start_dir();
+    let heavy = "# Plan\n\n## Steps\n\n".to_owned()
+        + &(0..20)
+            .map(|index| format!("- work through detailed subtask number {index}\n"))
+            .collect::<String>();
+    let messages = vec![
+        RelayMessage::new("user", heavy.clone()),
+        RelayMessage::new("user", "ok thanks"),
+    ];
+    let last_user = decide_with_context(
+        "ok thanks",
+        &dir,
+        Some(1.0),
+        DecisionContext {
+            scope: "last_user".to_owned(),
+            messages: messages.clone(),
+            ..DecisionContext::default()
+        },
+    )
+    .expect("last-user scope should score");
+    let all = decide_with_context(
+        "ok thanks",
+        &dir,
+        Some(1.0),
+        DecisionContext {
+            scope: "all".to_owned(),
+            messages: messages.clone(),
+            ..DecisionContext::default()
+        },
+    )
+    .expect("all scope should score");
+    let cut = (last_user.score + all.score) / 2.0;
+    let plain = decide_with_context(
+        "ok thanks",
+        &dir,
+        Some(cut),
+        DecisionContext {
+            scope: "last_user".to_owned(),
+            messages: messages.clone(),
+            ..DecisionContext::default()
+        },
+    )
+    .expect("plain scoped decision should score");
+    let sticky = decide_with_context(
+        "ok thanks",
+        &dir,
+        Some(cut),
+        DecisionContext {
+            scope: "last_user".to_owned(),
+            sticky: true,
+            messages,
+            ..DecisionContext::default()
+        },
+    )
+    .expect("sticky scoped decision should score");
+
+    assert!(all.score > last_user.score);
+    assert!(plain.is_local);
+    assert!(!sticky.is_local);
+    assert_eq!(sticky.mode, "sticky");
+    assert_eq!(sticky.text, "ok thanks");
 }
 
 #[test]
