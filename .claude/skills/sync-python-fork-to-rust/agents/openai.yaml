@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sync Python Fork To Rust"
+  short_description: "Catch up a Python fork and port changes to Rust"
+  default_prompt: "Use $sync-python-fork-to-rust to catch this fork up to upstream and port Python changes into the Rust implementation."
