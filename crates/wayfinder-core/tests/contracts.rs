@@ -107,6 +107,185 @@ fn assert_json_float_eq(actual: f64, expected: &JsonValue) {
     assert_float_eq(actual, expected.as_f64().expect("expected fixture float"));
 }
 
+struct PythonGoldenCase {
+    name: &'static str,
+    text: String,
+    score: f64,
+    recommendation: &'static str,
+    features: FeatureCounts,
+}
+
+fn golden_counts(values: [usize; FEATURE_ORDER.len()]) -> FeatureCounts {
+    FeatureCounts {
+        word_count: values[0],
+        heading_count: values[1],
+        max_heading_depth: values[2],
+        list_item_count: values[3],
+        link_count: values[4],
+        code_block_count: values[5],
+        table_row_count: values[6],
+        reasoning_term_count: values[7],
+        math_symbol_count: values[8],
+        constraint_term_count: values[9],
+        question_count: values[10],
+    }
+}
+
+fn python_golden_corpus() -> Vec<PythonGoldenCase> {
+    vec![
+        PythonGoldenCase {
+            name: "empty",
+            text: "".to_owned(),
+            score: 0.0,
+            recommendation: "local",
+            features: golden_counts([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "blank_whitespace",
+            text: "   \n\t  ".to_owned(),
+            score: 0.0,
+            recommendation: "local",
+            features: golden_counts([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "short_easy",
+            text: "fix my typo please".to_owned(),
+            score: 0.0,
+            recommendation: "local",
+            features: golden_counts([4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "question",
+            text: "what is the 100th prime number?".to_owned(),
+            score: 0.0,
+            recommendation: "local",
+            features: golden_counts([6, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1]),
+        },
+        PythonGoldenCase {
+            name: "headings_lists",
+            text: "# Plan\n\n## Steps\n- one\n- two\n- three\n1. first\n2. second".to_owned(),
+            score: 0.15,
+            recommendation: "local",
+            features: golden_counts([14, 2, 2, 5, 0, 0, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "code_fence",
+            text: "Here is code:\n```python\n# a comment that looks like a heading\n- not a list\nx = 1\n```\ndone"
+                .to_owned(),
+            score: 0.05,
+            recommendation: "local",
+            features: golden_counts([21, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "unterminated_fence",
+            text: "start\n```\nstuff\n- still in fence\n# also in fence".to_owned(),
+            score: 0.04,
+            recommendation: "local",
+            features: golden_counts([11, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "tilde_fence",
+            text: "~~~\ncode\n~~~\nafter".to_owned(),
+            score: 0.04,
+            recommendation: "local",
+            features: golden_counts([4, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "table",
+            text: "| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |".to_owned(),
+            score: 0.04,
+            recommendation: "local",
+            features: golden_counts([20, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "links",
+            text: "see [docs](http://x) and [more](http://y) plus [z](http://z)".to_owned(),
+            score: 0.03,
+            recommendation: "local",
+            features: golden_counts([6, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "math_symbols",
+            text: "show that ∑ x ≤ ∞ and ∫ f dx ≥ 0 using \\alpha and \\beta".to_owned(),
+            score: 0.01,
+            recommendation: "local",
+            features: golden_counts([16, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "reasoning_terms",
+            text: "prove the theorem by induction and derive the recurrence".to_owned(),
+            score: 0.01,
+            recommendation: "local",
+            features: golden_counts([9, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "constraints",
+            text: "you must do it without loops, only using exactly one pass".to_owned(),
+            score: 0.01,
+            recommendation: "local",
+            features: golden_counts([11, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0]),
+        },
+        PythonGoldenCase {
+            name: "frontmatter",
+            text: "---\ntitle: x\ntags: [a,b]\n---\n# Real Heading\nbody text here".to_owned(),
+            score: 0.04,
+            recommendation: "local",
+            features: golden_counts([6, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "crlf_endings",
+            text: "# H1\r\n- item one\r\n- item two\r\n| a | b |\r\n".to_owned(),
+            score: 0.08,
+            recommendation: "local",
+            features: golden_counts([13, 1, 1, 2, 0, 0, 1, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "long_400plus",
+            text: vec!["word"; 450].join(" "),
+            score: 0.27,
+            recommendation: "local",
+            features: golden_counts([450, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "emoji_cjk",
+            text: "请证明这个定理 🙏 prove it with 日本語 mixed 😀 text and more words here"
+                .to_owned(),
+            score: 0.01,
+            recommendation: "local",
+            features: golden_counts([13, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "rounding_a",
+            text: "alpha beta gamma ".repeat(7),
+            score: 0.01,
+            recommendation: "local",
+            features: golden_counts([21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "rounding_b",
+            text: "# h\n- a\n- b\n- c\ncode block follows\n```\nx\n```\nand a [l](u)"
+                .to_owned(),
+            score: 0.13,
+            recommendation: "local",
+            features: golden_counts([17, 1, 1, 3, 1, 1, 0, 0, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "rtl_arabic",
+            text: "أثبت النظرية prove the theorem باستخدام الاستقراء induction".to_owned(),
+            score: 0.01,
+            recommendation: "local",
+            features: golden_counts([8, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0]),
+        },
+        PythonGoldenCase {
+            name: "nbsp_whitespace",
+            text: "word word word line para tab\tend".to_owned(),
+            score: 0.0,
+            recommendation: "local",
+            features: golden_counts([7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        },
+    ]
+}
+
 #[test]
 fn scoring_contract_fixtures_match_python_outputs() {
     for name in ["scoring/simple.json", "scoring/markdown-structure.json"] {
@@ -120,6 +299,33 @@ fn scoring_contract_fixtures_match_python_outputs() {
             .expect("score should serialize");
 
         assert_eq!(actual, parsed["expected"]);
+    }
+}
+
+#[test]
+fn scoring_adversarial_corpus_matches_upstream_python_golden() {
+    for case in python_golden_corpus() {
+        let actual = score_complexity(&case.text, &RoutingConfig::default());
+        let delta = (actual.score - case.score).abs();
+
+        assert!(
+            delta < 1e-12,
+            "{} score changed, expected {}, got {}",
+            case.name,
+            case.score,
+            actual.score
+        );
+        assert_eq!(
+            actual.recommendation.as_str(),
+            case.recommendation,
+            "{} recommendation changed",
+            case.name
+        );
+        assert_eq!(
+            actual.features, case.features,
+            "{} features changed",
+            case.name
+        );
     }
 }
 
