@@ -564,7 +564,10 @@ async fn router_recent_empty_shape_is_metadata_only() {
         serde_json::json!({
             "total": 0,
             "by_model": {},
-            "recent": []
+            "recent": [],
+            // No history yet, so there is no median to report — null rather than 0.0,
+            // which would read as "decisions are instant".
+            "p50_decision_ms": null
         })
     );
 }
@@ -851,6 +854,114 @@ threshold = 0.2
     );
 }
 
+/// A config with routing but deliberately no `[gateway.models]` at all.
+const NO_MODELS_CONFIG: &str = r#"
+[routing]
+threshold = 0.2
+"#;
+
+const DECISION_ONLY_PROMPT: &str = "Design a distributed rate limiter with backpressure, \
+     explain the tradeoffs between token bucket and leaky bucket, and sketch the failure modes.";
+
+fn decision_only_payload() -> Value {
+    serde_json::json!({
+        "model": "auto",
+        "messages": [{"role": "user", "content": DECISION_ONLY_PROMPT}]
+    })
+}
+
+#[tokio::test]
+async fn no_models_live_gateway_returns_the_decision_not_a_misconfig_error() {
+    // The onboarding cold start: a live gateway with nothing to deliver to still answers
+    // with real routing, and never reaches for an upstream.
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("wayfinder-router.toml"), NO_MODELS_CONFIG).unwrap();
+
+    let (status, headers, body) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/chat/completions",
+        &[],
+        decision_only_payload(),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let wayfinder = &body["wayfinder"];
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-wayfinder-router-decision-only"], "true");
+    assert_eq!(wayfinder["decision_only"], true);
+    assert!(wayfinder.get("dry_run").is_none());
+    assert!(wayfinder["model"].as_str().is_some_and(|m| !m.is_empty()));
+    assert!(wayfinder["score"].as_f64().is_some());
+}
+
+#[tokio::test]
+async fn dry_run_still_flags_dry_run_and_is_never_decision_only() {
+    // An explicit dry run keeps its own flag even though the payload is otherwise shared.
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("wayfinder-router.toml"), NO_MODELS_CONFIG).unwrap();
+
+    let (status, headers, body) = post_chat(
+        dir.path(),
+        ServeOptions {
+            dry_run: true,
+            ..ServeOptions::default()
+        },
+        "/v1/chat/completions",
+        &[],
+        decision_only_payload(),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["wayfinder"]["dry_run"], true);
+    assert!(body["wayfinder"].get("decision_only").is_none());
+    assert!(!headers.contains_key("x-wayfinder-router-decision-only"));
+}
+
+#[tokio::test]
+async fn decision_only_decision_matches_the_dry_run_decision() {
+    // Only delivery is skipped, so the decision itself must be identical to the dry run's
+    // for the same prompt and config — the flag is the only difference.
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("wayfinder-router.toml"), NO_MODELS_CONFIG).unwrap();
+
+    let (_, _, live) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/chat/completions",
+        &[],
+        decision_only_payload(),
+    )
+    .await;
+    let (_, _, dry) = post_chat(
+        dir.path(),
+        ServeOptions {
+            dry_run: true,
+            ..ServeOptions::default()
+        },
+        "/v1/chat/completions",
+        &[],
+        decision_only_payload(),
+    )
+    .await;
+    let live: Value = serde_json::from_slice(&live).unwrap();
+    let dry: Value = serde_json::from_slice(&dry).unwrap();
+
+    assert_eq!(live["wayfinder"]["model"], dry["wayfinder"]["model"]);
+    assert_eq!(live["wayfinder"]["score"], dry["wayfinder"]["score"]);
+    assert_eq!(live["wayfinder"]["features"], dry["wayfinder"]["features"]);
+    assert_eq!(live["wayfinder"]["tiers"], dry["wayfinder"]["tiers"]);
+    assert_eq!(
+        live["wayfinder"]["contributions"],
+        dry["wayfinder"]["contributions"]
+    );
+    assert_eq!(live["wayfinder"]["decision_only"], true);
+    assert_eq!(dry["wayfinder"]["dry_run"], true);
+}
+
 #[tokio::test]
 async fn chat_completions_scores_and_forwards_to_configured_upstream_model_with_auth() {
     let upstream = FakeUpstream::start(StatusCode::OK, false).await;
@@ -1081,6 +1192,10 @@ model = "local-upstream"
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(headers["x-wayfinder-router-model"], "cloud");
     assert_eq!(body["error"]["type"], "wayfinder_router_misconfigured");
+    // The decision-only degrade is gated strictly on an empty model set. Models configured
+    // but none matching the chosen tier is a genuine misconfiguration, and must still fail
+    // loudly rather than quietly downgrading to a decision.
+    assert!(!headers.contains_key("x-wayfinder-router-decision-only"));
 }
 
 #[tokio::test]
@@ -2685,6 +2800,9 @@ cost_per_1k = 1.0
     assert_eq!(recent["recent"][0]["model"], "cloud");
     assert_eq!(recent["recent"][0]["served_by"], "cloud");
     assert_eq!(recent["recent"][0]["cost"]["tokens"], 60);
+    // Decision latency is metadata like the rest of the entry: a duration, never prompt text.
+    assert!(recent["recent"][0]["decision_ms"].as_f64().unwrap() >= 0.0);
+    assert!(recent["p50_decision_ms"].as_f64().unwrap() >= 0.0);
     assert!(!recent_text.contains("a secret prompt body"));
     assert!(metrics.contains("wayfinder_router_requests_total{model=\"cloud\",mode=\"pinned\"} 1"));
     assert!(metrics.contains("wayfinder_router_realized_cost_total"));

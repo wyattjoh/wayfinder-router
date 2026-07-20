@@ -329,6 +329,11 @@ struct RecentDecision {
     mode: String,
     ts: u64,
     cost: RecentCost,
+    /// Time spent deciding the route, in milliseconds.
+    ///
+    /// Never the upstream model's own response time — that is tracked separately by
+    /// the `wayfinder_router_upstream_latency_seconds` histogram on `/metrics`.
+    decision_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     key_id: Option<String>,
 }
@@ -1699,6 +1704,23 @@ async fn chat_completions_response(
         );
     }
 
+    // A live gateway with no models configured at all answers with the routing decision
+    // instead of a 500, so onboarding shows real routing before any backend exists and a
+    // client can render decisions while a local model is still warming up. Only delivery is
+    // skipped. This is deliberately narrower than the breaker/offline 503 below ("models
+    // exist but are cooling down"), and than the misconfigured-tier 500 that follows.
+    if state.gateway.models.is_empty() {
+        response_headers.insert(
+            "x-wayfinder-router-decision-only",
+            HeaderValue::from_static("true"),
+        );
+        return json_response(
+            StatusCode::OK,
+            response_headers,
+            decision_only_body(&state, &decision, &route, &request_id, offline),
+        );
+    }
+
     let deliver_from = if offline {
         tier_ladder(&state.routing)
             .into_iter()
@@ -1751,6 +1773,7 @@ async fn chat_completions_response(
                     mode: route.mode.clone(),
                     ts: unix_ts(),
                     cost,
+                    decision_ms: round_ms(decision_latency),
                     key_id,
                 },
             );
@@ -2236,6 +2259,7 @@ async fn forward_upstream(
                             mode: route.mode.clone(),
                             ts: unix_ts(),
                             cost: cost.clone(),
+                            decision_ms: round_ms(decision_latency),
                             key_id: key_id.clone(),
                         },
                     );
@@ -3211,6 +3235,33 @@ fn dry_run_debug_body(
     request_id: &str,
     offline: bool,
 ) -> JsonValue {
+    decision_debug_body(state, decision, route, request_id, offline, "dry_run")
+}
+
+/// The decision a live gateway returns when it has no models to deliver to.
+///
+/// Byte-identical to [`dry_run_debug_body`] apart from the trailing flag: only
+/// delivery is skipped, the decision itself is computed by the same offline path
+/// and is unchanged.
+fn decision_only_body(
+    state: &AppState,
+    decision: &ComplexityScore,
+    route: &RouteDecision,
+    request_id: &str,
+    offline: bool,
+) -> JsonValue {
+    decision_debug_body(state, decision, route, request_id, offline, "decision_only")
+}
+
+/// The shared routing-decision payload, flagged as either a dry run or decision-only.
+fn decision_debug_body(
+    state: &AppState,
+    decision: &ComplexityScore,
+    route: &RouteDecision,
+    request_id: &str,
+    offline: bool,
+    flag: &'static str,
+) -> JsonValue {
     let mut body = json!({
         "id": "resp-1",
         "object": "chat.completion",
@@ -3223,7 +3274,7 @@ fn dry_run_debug_body(
             "contributions": explain_score(&decision.features, state.routing.weights),
             "tiers": decision.tiers,
             "cost": dry_run_cost(state, &route.chosen, decision.features.word_count),
-            "dry_run": true
+            flag: true
         }
     });
     if offline {
@@ -3360,6 +3411,7 @@ fn observe_decision(
             mode: route.mode.clone(),
             ts: unix_ts(),
             cost,
+            decision_ms: round_ms(decision_latency),
             key_id,
         },
     );
@@ -3390,6 +3442,11 @@ fn round_cost(value: f64) -> f64 {
 
 fn round_score(score: f64) -> f64 {
     (score * 100.0).round() / 100.0
+}
+
+/// A decision duration as milliseconds, rounded to three decimal places.
+fn round_ms(latency: Duration) -> f64 {
+    (latency.as_secs_f64() * 1_000_000.0).round() / 1_000.0
 }
 
 fn next_request_id() -> String {
@@ -4224,8 +4281,23 @@ async fn router_recent(State(state): State<AppState>) -> Json<serde_json::Value>
     Json(json!({
         "total": recent.len(),
         "by_model": by_model,
-        "recent": recent.iter().cloned().collect::<Vec<_>>()
+        "recent": recent.iter().cloned().collect::<Vec<_>>(),
+        "p50_decision_ms": p50_decision_ms(&recent)
     }))
+}
+
+/// Median decision latency over whatever is still in the bounded ring, or `None`
+/// when nothing has been routed yet.
+///
+/// Upper median by nearest rank (the `len / 2` element of the sorted durations),
+/// never interpolated, so the value is always one a request actually observed.
+fn p50_decision_ms(recent: &VecDeque<RecentDecision>) -> Option<f64> {
+    if recent.is_empty() {
+        return None;
+    }
+    let mut durations: Vec<f64> = recent.iter().map(|decision| decision.decision_ms).collect();
+    durations.sort_by(f64::total_cmp);
+    durations.get(durations.len() / 2).copied()
 }
 
 async fn router_profiles() -> Json<JsonValue> {
