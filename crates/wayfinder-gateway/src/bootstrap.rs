@@ -413,6 +413,7 @@ mod tests {
             cost_per_1k: None,
             fallbacks: Vec::new(),
             context_window: None,
+            enabled: true,
         }
     }
 

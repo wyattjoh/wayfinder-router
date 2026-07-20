@@ -32,6 +32,52 @@ fn gateway_config_round_trips_like_python_dump() {
 }
 
 #[test]
+fn model_enabled_defaults_true_and_round_trips_only_when_disabled() {
+    let text = concat!(
+        "[gateway.models.on]\n",
+        "base_url = \"https://api.example.com/v1\"\n",
+        "model = \"m\"\n\n",
+        "[gateway.models.off]\n",
+        "base_url = \"https://api.example.com/v1\"\n",
+        "model = \"m\"\n",
+        "enabled = false\n"
+    );
+
+    let config = gateway_config_from_toml(text, "fixture").expect("config should parse");
+    assert!(
+        config.models["on"].enabled,
+        "absent enabled defaults to true"
+    );
+    assert!(!config.models["off"].enabled);
+
+    // An enabled model stays byte-clean (no `enabled = true` line it never had); a disabled
+    // one carries its flag through the dump.
+    let dumped = dump_gateway_toml(&config);
+    assert!(!dumped.contains("enabled = true"));
+    assert!(dumped.contains("enabled = false"));
+    let again = gateway_config_from_toml(&dumped, "dumped").expect("dump should parse");
+    assert!(again.models["on"].enabled);
+    assert!(!again.models["off"].enabled);
+}
+
+#[test]
+fn validate_gateway_toml_rejects_non_boolean_model_enabled() {
+    let bad = concat!(
+        "[gateway.models.cloud]\n",
+        "base_url = \"https://api.example.com/v1\"\n",
+        "model = \"m\"\n",
+        "enabled = \"yes\"\n"
+    );
+
+    let err = validate_gateway_toml(bad, "bad.toml").expect_err("config should be rejected");
+
+    assert_eq!(
+        err.to_string(),
+        "bad.toml: 'gateway.models.cloud.enabled' must be a boolean"
+    );
+}
+
+#[test]
 fn validate_gateway_toml_rejects_malformed_gateway_blocks() {
     let bad = r#"
 [gateway.models.cloud]

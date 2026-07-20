@@ -186,6 +186,10 @@ pub struct GatewayModel {
     pub cost_per_1k: Option<f64>,
     pub fallbacks: Vec<String>,
     pub context_window: Option<usize>,
+    /// Whether this model is eligible for delivery. Delivery-time only: a disabled model is
+    /// skipped at request time exactly like a broken endpoint, cascading to its fallbacks or
+    /// the tier's failover policy. The scored routing decision is never affected.
+    pub enabled: bool,
 }
 
 /// One OpenAI-style chat message handed to the in-process relay.
@@ -402,6 +406,8 @@ struct RouterModelEntry {
     tier: Option<&'static str>,
     api_key_env: Option<String>,
     key_ok: bool,
+    context_window: Option<usize>,
+    enabled: bool,
 }
 
 pub fn serve_summary(options: &ServeOptions) -> String {
@@ -699,6 +705,11 @@ pub fn dump_gateway_toml(gateway: &GatewayConfig) -> String {
         if let Some(context_window) = model.context_window {
             lines.push(format!("context_window = {context_window}"));
         }
+        // Only serialize when disabled: the default is enabled, so an untouched config stays
+        // byte-identical and does not sprout `enabled = true` lines it never had.
+        if !model.enabled {
+            lines.push("enabled = false".to_owned());
+        }
         blocks.push(lines.join("\n"));
     }
     blocks.join("\n\n")
@@ -883,6 +894,14 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
             })?),
             None => None,
         };
+        let enabled = match table.get("enabled") {
+            Some(value) => value.as_bool().ok_or_else(|| {
+                GatewayError::new(format!(
+                    "{where_}: 'gateway.models.{name}.enabled' must be a boolean"
+                ))
+            })?,
+            None => true,
+        };
         parsed.insert(
             name.clone(),
             GatewayModel {
@@ -893,6 +912,7 @@ fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, Gatew
                 cost_per_1k,
                 fallbacks,
                 context_window,
+                enabled,
             },
         );
     }
@@ -2115,7 +2135,11 @@ fn delivery_plan_for(
             .gateway
             .models
             .get(name)
-            .map(|model| reliability::precheck_ok(estimated_tokens, model.context_window))
+            // A disabled model is skipped like a broken endpoint, cascading to the next
+            // candidate. The scored decision is unchanged; only delivery is affected.
+            .map(|model| {
+                model.enabled && reliability::precheck_ok(estimated_tokens, model.context_window)
+            })
             .unwrap_or(true)
     })
 }
@@ -4354,6 +4378,8 @@ async fn router_models(State(state): State<AppState>) -> Json<JsonValue> {
                 .as_ref()
                 .map(|env| std::env::var_os(env).is_some())
                 .unwrap_or(true),
+            context_window: model.context_window,
+            enabled: model.enabled,
         })
         .collect::<Vec<_>>();
     Json(json!({

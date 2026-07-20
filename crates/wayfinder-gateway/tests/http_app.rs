@@ -776,6 +776,11 @@ cost_per_1k = 0.01
     assert_eq!(by_name["local"]["tier"], Value::Null);
     assert_eq!(by_name["cloud"]["provider"], "openai-compatible");
     assert_eq!(by_name["cloud"]["tier"], Value::Null);
+    // context_window and enabled are also part of the shared contract; both models here are
+    // enabled by default and set no window.
+    assert_eq!(by_name["local"]["enabled"], true);
+    assert_eq!(by_name["local"]["context_window"], Value::Null);
+    assert_eq!(by_name["cloud"]["enabled"], true);
     assert!(!models.to_string().contains("secret"));
 
     let (chat_status, _, _) = post_chat(
@@ -1086,6 +1091,58 @@ api_key_env = "WAYFINDER_TEST_CLOUD_KEY"
         calls[0].authorization.as_deref(),
         Some("Bearer secret-test-key")
     );
+}
+
+#[tokio::test]
+async fn disabled_model_is_skipped_at_delivery_and_cascades_to_its_fallback() {
+    // Disabling a model must not change which model the router *chooses* (the scored decision
+    // is unchanged), only where the request is *delivered*: the chosen-but-disabled model is
+    // skipped like a broken endpoint and its fallback serves instead.
+    let upstream = FakeUpstream::start(StatusCode::OK, false).await;
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("wayfinder-router.toml"),
+        format!(
+            r#"
+[routing]
+threshold = 0.0
+
+[gateway.models.local]
+base_url = "{base_url}"
+model = "local-upstream"
+
+[gateway.models.cloud]
+base_url = "{base_url}"
+model = "cloud-upstream"
+fallbacks = ["local"]
+enabled = false
+"#,
+            base_url = upstream.base_url
+        ),
+    )
+    .unwrap();
+
+    let (status, headers, _) = post_chat(
+        dir.path(),
+        ServeOptions::default(),
+        "/v1/chat/completions",
+        &[],
+        serde_json::json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Say hello."}],
+            "stream": false
+        }),
+    )
+    .await;
+    let calls = upstream.calls();
+
+    assert_eq!(status, StatusCode::OK);
+    // The decision still picks cloud...
+    assert_eq!(headers["x-wayfinder-router-model"], "cloud");
+    // ...but delivery falls through to the enabled fallback.
+    assert_eq!(headers["x-wayfinder-router-served-by"], "local");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].body["model"], "local-upstream");
 }
 
 #[tokio::test]
