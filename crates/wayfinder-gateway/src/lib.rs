@@ -393,6 +393,13 @@ struct RouterModelEntry {
     name: String,
     endpoint: String,
     model: String,
+    /// Delivery provider. This fork only speaks the OpenAI-compatible contract, so this is
+    /// always `"openai-compatible"` — it is emitted so the `/router/models` shape matches
+    /// upstream, where native providers (e.g. Apple Foundation Models) also appear.
+    provider: &'static str,
+    /// Explicit provider locality. Only native providers assert one, so this fork always
+    /// reports `null`, alongside `provider` for the same cross-fork contract reason.
+    tier: Option<&'static str>,
     api_key_env: Option<String>,
     key_ok: bool,
 }
@@ -4339,6 +4346,8 @@ async fn router_models(State(state): State<AppState>) -> Json<JsonValue> {
             name: name.clone(),
             endpoint: model.base_url.clone(),
             model: model.model.clone(),
+            provider: "openai-compatible",
+            tier: None,
             api_key_env: model.api_key_env.clone(),
             key_ok: model
                 .api_key_env

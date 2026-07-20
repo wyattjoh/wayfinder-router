@@ -769,6 +769,13 @@ cost_per_1k = 0.01
         "WAYFINDER_ROUTER_TEST_MISSING_KEY_09"
     );
     assert_eq!(by_name["cloud"]["key_ok"], false);
+    // provider and tier are part of the /router/models contract shared with upstream. This
+    // fork only speaks the OpenAI-compatible protocol, so every model reports that provider
+    // and a null tier — but the fields are always present so the shape does not diverge.
+    assert_eq!(by_name["local"]["provider"], "openai-compatible");
+    assert_eq!(by_name["local"]["tier"], Value::Null);
+    assert_eq!(by_name["cloud"]["provider"], "openai-compatible");
+    assert_eq!(by_name["cloud"]["tier"], Value::Null);
     assert!(!models.to_string().contains("secret"));
 
     let (chat_status, _, _) = post_chat(
