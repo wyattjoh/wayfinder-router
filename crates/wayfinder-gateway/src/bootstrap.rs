@@ -179,6 +179,47 @@ pub fn render_config(preset: &Preset) -> String {
     preset.config_toml.to_string()
 }
 
+/// The `api_key_cmd` that reads `env`'s key from the macOS Keychain.
+///
+/// The single seam reference every Keychain-backed model is built from (`init --keychain`,
+/// `config add-model --keychain`), so exactly one place knows this command's shape. The
+/// desktop app stores the item under service `wayfinder-router`, account `<env>`; the key
+/// itself never lands in the config file.
+#[must_use]
+pub fn keychain_api_key_cmd(env: &str) -> String {
+    format!("/usr/bin/security find-generic-password -s wayfinder-router -a {env} -w")
+}
+
+/// The `wayfinder-router.toml` scaffold for `preset`, with every keyed model reading its key
+/// from the macOS Keychain (`init --keychain`).
+///
+/// Every *uncommented* `api_key_env = "X"` line gains an `api_key_cmd` reading that variable
+/// from the Keychain. Commented example blocks stay untouched, keyless models gain nothing,
+/// and the result still loads back unchanged. This is the reference the desktop app scaffolds
+/// through so it never has to author TOML itself.
+#[must_use]
+pub fn render_config_with_keychain(preset: &Preset) -> String {
+    let mut out = String::with_capacity(preset.config_toml.len());
+    for line in preset.config_toml.split_inclusive('\n') {
+        out.push_str(line);
+        let stripped = line.trim();
+        // Only uncommented api_key_env lines: a leading '#' means a commented example block
+        // (e.g. hybrid's Gemini alternative), which must survive byte-for-byte.
+        let Some(rest) = stripped.strip_prefix("api_key_env") else {
+            continue;
+        };
+        let Some((_, value)) = rest.split_once('=') else {
+            continue;
+        };
+        let env = value.trim().trim_matches('"');
+        let cmd = keychain_api_key_cmd(env);
+        out.push_str(&format!(
+            "api_key_cmd = \"{cmd}\"   # macOS Keychain (the desktop app stores this item)\n"
+        ));
+    }
+    out
+}
+
 /// A `.env.example` with the preset's env-var *names* only — never a secret.
 pub fn render_env_example(preset: &Preset) -> String {
     let mut lines = vec![
@@ -435,6 +476,54 @@ mod tests {
         let cloud = &parsed["gateway"]["models"]["cloud"];
         assert_eq!(cloud["api_key_env"].as_str(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(cloud["model"].as_str(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn keychain_scaffold_adds_api_key_cmd_per_keyed_model() {
+        // Every keyed model gains an api_key_cmd reading its OWN env var from the Keychain;
+        // keyless models gain nothing; and the config still loads.
+        for name in ["hybrid", "openai", "gemini"] {
+            let text = render_config_with_keychain(&PRESETS[name]);
+            let config = crate::gateway_config_from_toml(&text, "keychain-preset")
+                .expect("keychain scaffold should parse");
+            for model in config.models.values() {
+                match &model.api_key_env {
+                    None => assert_eq!(model.api_key_cmd, None, "keyless models gain nothing"),
+                    Some(env) => assert_eq!(
+                        model.api_key_cmd.as_deref(),
+                        Some(keychain_api_key_cmd(env).as_str()),
+                        "each keyed model reads its own env var from the Keychain"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keychain_scaffold_leaves_commented_blocks_alone() {
+        // The hybrid template's commented Gemini alternative and its `# api_key_cmd` example
+        // must survive untouched — only uncommented api_key_env lines gain a reference.
+        let plain = render_config(&PRESETS["hybrid"]);
+        let keyed = render_config_with_keychain(&PRESETS["hybrid"]);
+        // Exactly one insertion for hybrid (one keyed model: cloud).
+        assert_eq!(keyed.matches("find-generic-password").count(), 1);
+        for line in plain
+            .lines()
+            .filter(|line| line.trim_start().starts_with('#'))
+        {
+            assert!(
+                keyed.contains(line),
+                "commented line should survive byte-for-byte: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn keychain_false_is_byte_identical_to_the_plain_scaffold() {
+        for name in ["hybrid", "openai", "gemini"] {
+            let preset = &PRESETS[name];
+            assert_eq!(render_config(preset), preset.config_toml);
+        }
     }
 
     #[test]

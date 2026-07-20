@@ -26,8 +26,8 @@ use wayfinder_internal_core::sufficiency::{
 };
 use wayfinder_internal_core::vkeys;
 use wayfinder_internal_gateway::bootstrap::{
-    key_status, missing_keys, render_config, render_env_example, resolve_keys,
-    suggest_key_commands, DEFAULT_PRESET, PRESETS,
+    key_status, missing_keys, render_config, render_config_with_keychain, render_env_example,
+    resolve_keys, suggest_key_commands, DEFAULT_PRESET, PRESETS,
 };
 use wayfinder_internal_gateway::recalibrate::{recalibrate, DEFAULT_MIN_LABELS};
 use wayfinder_internal_gateway::service::{
@@ -181,6 +181,8 @@ pub struct InitOptions {
     pub path: PathBuf,
     pub force: bool,
     pub print: bool,
+    /// macOS: emit an `api_key_cmd` per keyed model reading the key from the Keychain.
+    pub keychain: bool,
 }
 
 impl Default for InitOptions {
@@ -191,6 +193,7 @@ impl Default for InitOptions {
             path: PathBuf::from(CONFIG_FILE),
             force: false,
             print: false,
+            keychain: false,
         }
     }
 }
@@ -442,6 +445,8 @@ options:
   --path <path>              config path to write
   --force                    overwrite existing files
   --print                    print config instead of writing
+  --keychain                 macOS: read each keyed model's key from the Keychain
+                             (service 'wayfinder-router', account = the env-var name)
   --help, -h                 show this help";
 
 const DOCTOR_USAGE: &str = "\
@@ -1212,6 +1217,7 @@ where
             "--path" => options.path = next_value(&mut args, "--path")?.into(),
             "--force" => options.force = true,
             "--print" => options.print = true,
+            "--keychain" => options.keychain = true,
             other => return Err(CliError::new(format!("unknown init option '{other}'"))),
         }
     }
@@ -1729,7 +1735,11 @@ fn execute_init(options: InitOptions) -> Result<CommandOutput, CliError> {
     let preset = PRESETS
         .get(options.preset.as_str())
         .ok_or_else(|| unknown_preset_error(&options.preset))?;
-    let config_text = render_config(preset);
+    let config_text = if options.keychain {
+        render_config_with_keychain(preset)
+    } else {
+        render_config(preset)
+    };
     if options.print {
         return Ok(CommandOutput {
             stdout: config_text,
@@ -3318,6 +3328,37 @@ mod tests {
             assert!(!path.exists());
             assert!(!dir.join(".env.example").exists());
         }
+    }
+
+    #[test]
+    fn init_keychain_print_emits_keychain_references() {
+        let dir = unique_temp_dir("cli-init-keychain");
+        let path = dir.join("wayfinder-router.toml");
+        let output = run_output(
+            [
+                "init",
+                "--preset",
+                "hybrid",
+                "--path",
+                path.to_str().expect("path is utf-8"),
+                "--print",
+                "--keychain",
+            ],
+            None,
+        )
+        .expect("init --keychain --print should succeed");
+
+        assert_eq!(
+            output.stdout,
+            wayfinder_internal_gateway::bootstrap::render_config_with_keychain(
+                &wayfinder_internal_gateway::bootstrap::PRESETS["hybrid"],
+            )
+        );
+        assert!(output.stdout.contains(
+            "api_key_cmd = \"/usr/bin/security find-generic-password \
+             -s wayfinder-router -a ANTHROPIC_API_KEY -w\""
+        ));
+        assert!(!path.exists());
     }
 
     #[test]
