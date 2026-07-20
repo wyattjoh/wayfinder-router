@@ -12,7 +12,7 @@ pub const SCOPES: [&str; 4] = ["turn", "last_user", "user", "all"];
 /// The `/help` text (ported verbatim from the Python `_HELP`, em dashes already absent).
 pub const HELP: &str = "\
 commands
-  /init [hybrid|openai|gemini]  scaffold a wayfinder-router.toml and load its models
+  /init [hybrid|local|openai|gemini]  scaffold a wayfinder-router.toml and load its models
   /models                       show configured models and whether each key is set
   /keys                         re-check keys: resolve from your secret store, fix hints
   /cost                         session routing mix and estimated savings vs cloud

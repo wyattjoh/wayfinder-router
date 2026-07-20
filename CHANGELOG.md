@@ -41,6 +41,8 @@ The **feedback release** — features driven by post-launch feedback.
   Keychain at request time; the key itself is never written to the config.
 - **`init` creates missing parent directories**, so `init --path some/new/dir/wayfinder-router.toml`
   works from a fresh checkout without a manual `mkdir -p`.
+- **A `local` preset.** `wayfinder-router init --preset local` scaffolds a single keyless Ollama arm
+  with `offline = true`, so every request stays on this machine — no keys, nothing to escalate to.
 - **Automated sufficiency judge for calibration** (WF-ADR-0037). `wayfinder-router judge
   prompts.jsonl --gold gold.jsonl` closes the calibration loop without a human grading every
   prompt: it runs each prompt through two tiers, asks an automated judge *"was the cheaper tier

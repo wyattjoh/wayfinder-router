@@ -497,7 +497,7 @@ Scaffold a wayfinder-router.toml and matching .env.example.
 
 options:
   -i, --interactive          accept the interactive init flag
-  --preset <name>            hybrid, openai, or gemini
+  --preset <name>            hybrid, local, openai, or gemini
   --path <path>              config path to write
   --force                    overwrite existing files
   --print                    print config instead of writing

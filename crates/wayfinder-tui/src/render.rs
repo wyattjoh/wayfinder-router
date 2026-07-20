@@ -480,6 +480,10 @@ pub fn render_empty_state(palette: &Palette) -> Text<'static> {
             "          scaffold the hybrid preset (keyless local Ollama → Anthropic cloud)",
         ),
         preset(
+            "  /init local",
+            "    a single keyless Ollama arm with offline delivery enforced",
+        ),
+        preset(
             "  /init openai",
             "   two OpenAI tiers (gpt-4o-mini → gpt-4o)",
         ),
