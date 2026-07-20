@@ -575,6 +575,221 @@ fn quote(value: &str) -> String {
     format!("{value:?}")
 }
 
+// --- Line-preserving TOML editors (WF-ADR-0044 config seam) ---
+//
+// The CLI is the only author of `wayfinder-router.toml`, so these edits must never clobber a
+// hand-edited file: every line except the one they touch survives byte-for-byte, comments and
+// blank lines included. Each is a pure text transform; every caller re-parses the result
+// through the real config parsers before writing anything to disk (belt and braces).
+
+/// A TOML basic-string literal: backslash and double-quote escaped, wrapped in quotes.
+///
+/// Deliberately narrower than [`quote`] (which uses Rust's debug escaping): it matches the
+/// upstream seam's own renderer, which only ever handles values without control characters
+/// (URLs, model ids, env-var names), so it escapes exactly the two characters TOML requires.
+fn toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn line_indent(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+fn section_header(stripped: &str) -> Option<&str> {
+    if stripped.starts_with('[') && stripped.ends_with(']') {
+        Some(stripped[1..stripped.len() - 1].trim())
+    } else {
+        None
+    }
+}
+
+/// Set `key = true|false` in the top-level `[table]` section, preserving every other line.
+///
+/// Three cases: an existing uncommented `key =` inside `[table]` is replaced in place; a
+/// `[table]` without the key gains it directly under the header; a missing section is appended
+/// (TOML allows declaring a super-table after its sub-tables, so a trailing `[gateway]` after
+/// `[gateway.models.*]` is valid).
+#[must_use]
+pub fn set_toml_bool(text: &str, table: &str, key: &str, value: bool) -> String {
+    let rendered = if value { "true" } else { "false" };
+    set_scalar_line(text, table, key, rendered)
+}
+
+/// Set `key = ["a", "b"]` in the top-level `[table]` section, preserving every other line.
+///
+/// [`set_toml_bool`]'s sibling for a list-of-strings field. An empty list clears the key to
+/// `[]` rather than removing the line, so re-applying the same edit twice is a no-op either way.
+#[must_use]
+pub fn set_toml_string_list(text: &str, table: &str, key: &str, values: &[String]) -> String {
+    let rendered = format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| toml_string(value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    set_scalar_line(text, table, key, &rendered)
+}
+
+/// The shared line-preserving setter behind [`set_toml_bool`] and [`set_toml_string_list`].
+fn set_scalar_line(text: &str, table: &str, key: &str, rendered: &str) -> String {
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_owned).collect();
+    let mut section: Option<String> = None;
+    let mut header_idx: Option<usize> = None;
+    for i in 0..lines.len() {
+        let stripped = lines[i].trim().to_owned();
+        if let Some(name) = section_header(&stripped) {
+            section = Some(name.to_owned());
+            if name == table {
+                header_idx = Some(i);
+            }
+            continue;
+        }
+        if section.as_deref() == Some(table) && !stripped.starts_with('#') {
+            if let Some((name, _)) = stripped.split_once('=') {
+                if name.trim() == key {
+                    let indent = line_indent(&lines[i]).to_owned();
+                    lines[i] = format!("{indent}{key} = {rendered}\n");
+                    return lines.concat();
+                }
+            }
+        }
+    }
+    if let Some(idx) = header_idx {
+        lines.insert(idx + 1, format!("{key} = {rendered}\n"));
+        return lines.concat();
+    }
+    let tail = if text.ends_with('\n') || text.is_empty() {
+        ""
+    } else {
+        "\n"
+    };
+    format!("{text}{tail}\n[{table}]\n{key} = {rendered}\n")
+}
+
+/// Whether a `[gateway.models.<name>]` table header already appears in `text`.
+fn has_model_table(text: &str, name: &str) -> bool {
+    let target = format!("gateway.models.{name}");
+    text.lines()
+        .filter_map(|line| section_header(line.trim()))
+        .any(|header| header.trim() == target)
+}
+
+/// Insert a new `[gateway.models.<name>]` table, without touching any existing line.
+///
+/// Always appended at the end (TOML lets a table appear anywhere relative to unrelated tables),
+/// so this never has to parse or rewrite what is already there. Errors if a table by this name
+/// already exists: unlike [`set_toml_bool`]'s idempotent update, two additions are never "the
+/// same edit twice", so a name collision is always a mistake worth stopping on.
+pub fn add_model_table(
+    text: &str,
+    name: &str,
+    base_url: &str,
+    model: &str,
+    api_key_env: Option<&str>,
+    api_key_cmd: Option<&str>,
+    cost_per_1k: Option<f64>,
+) -> Result<String, WayfinderConfigError> {
+    if has_model_table(text, name) {
+        return Err(WayfinderConfigError::new(format!(
+            "a model named '{name}' already exists in this config"
+        )));
+    }
+    let mut lines = vec![
+        format!("[gateway.models.{name}]"),
+        format!("base_url = {}", toml_string(base_url)),
+        format!("model = {}", toml_string(model)),
+    ];
+    if let Some(api_key_env) = api_key_env {
+        lines.push(format!("api_key_env = {}", toml_string(api_key_env)));
+    }
+    if let Some(api_key_cmd) = api_key_cmd {
+        lines.push(format!("api_key_cmd = {}", toml_string(api_key_cmd)));
+    }
+    if let Some(cost_per_1k) = cost_per_1k {
+        lines.push(format!("cost_per_1k = {}", fmt_num(cost_per_1k)));
+    }
+    let tail = if text.ends_with('\n') || text.is_empty() {
+        ""
+    } else {
+        "\n"
+    };
+    Ok(format!("{text}{tail}\n{}\n", lines.join("\n")))
+}
+
+/// Set `min_score` on the `[[routing.tiers]]` entry whose `model` matches, preserving every
+/// other line (including every other tier).
+///
+/// The seam's own array-of-tables editor: [`set_toml_bool`]'s single-named-table logic can't
+/// match a repeated `[[table]]` header by a field value rather than by name. Errors if no tier
+/// names `model`. A resulting monotonicity violation is caught by the caller's reparse, not here.
+pub fn set_tier_min_score(
+    text: &str,
+    model: &str,
+    min_score: f64,
+) -> Result<String, WayfinderConfigError> {
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_owned).collect();
+    let block_starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim() == "[[routing.tiers]]")
+        .map(|(i, _)| i)
+        .collect();
+    if block_starts.is_empty() {
+        return Err(WayfinderConfigError::new(
+            "no '[[routing.tiers]]' entries found in this config",
+        ));
+    }
+    for (idx, &start) in block_starts.iter().enumerate() {
+        let scan_from = start + 1;
+        let mut end = block_starts.get(idx + 1).copied().unwrap_or(lines.len());
+        // A tier block ends at the next section header (a nested `[routing.tiers.x]` or any
+        // other table), whichever comes before the next `[[routing.tiers]]`.
+        if let Some(offset) = lines[scan_from..end].iter().position(|line| {
+            let stripped = line.trim();
+            stripped.starts_with('[') && stripped != "[[routing.tiers]]"
+        }) {
+            end = scan_from + offset;
+        }
+        let mut block_model: Option<String> = None;
+        let mut min_score_line: Option<usize> = None;
+        for (offset, line) in lines[scan_from..end].iter().enumerate() {
+            let stripped = line.trim();
+            if stripped.is_empty() || stripped.starts_with('#') || !stripped.contains('=') {
+                continue;
+            }
+            let (key, raw_value) = stripped.split_once('=').expect("checked for '=' above");
+            match key.trim() {
+                "model" => {
+                    block_model = Some(raw_value.trim().trim_matches(['"', '\'']).to_owned())
+                }
+                "min_score" => min_score_line = Some(scan_from + offset),
+                _ => {}
+            }
+        }
+        if block_model.as_deref() != Some(model) {
+            continue;
+        }
+        let rendered = fmt_num(min_score);
+        if let Some(line) = min_score_line {
+            let indent = line_indent(&lines[line]).to_owned();
+            lines[line] = format!("{indent}min_score = {rendered}\n");
+        } else {
+            let indent = if start + 1 < end {
+                line_indent(&lines[start + 1]).to_owned()
+            } else {
+                String::new()
+            };
+            lines.insert(start + 1, format!("{indent}min_score = {rendered}\n"));
+        }
+        return Ok(lines.concat());
+    }
+    Err(WayfinderConfigError::new(format!(
+        "no '[[routing.tiers]]' entry has model = '{model}'"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -684,5 +899,128 @@ mod tests {
         assert!(err.to_string().contains("invalid TOML"));
 
         fs::remove_dir_all(&dir).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn set_toml_bool_replaces_in_place_without_touching_comments() {
+        let text = "# top comment\n[gateway]\noffline = false  # trailing note\nretries = 3\n";
+        let out = set_toml_bool(text, "gateway", "offline", true);
+        assert_eq!(
+            out, "# top comment\n[gateway]\noffline = true\nretries = 3\n",
+            "the key line is replaced; every other line survives"
+        );
+    }
+
+    #[test]
+    fn set_toml_bool_inserts_under_an_existing_header() {
+        let text = "[gateway]\nretries = 3\n";
+        let out = set_toml_bool(text, "gateway", "offline", true);
+        assert_eq!(out, "[gateway]\noffline = true\nretries = 3\n");
+    }
+
+    #[test]
+    fn set_toml_bool_appends_a_missing_section() {
+        let text = "[routing]\nthreshold = 0.2\n";
+        let out = set_toml_bool(text, "gateway", "offline", false);
+        assert_eq!(
+            out,
+            "[routing]\nthreshold = 0.2\n\n[gateway]\noffline = false\n"
+        );
+    }
+
+    #[test]
+    fn set_toml_bool_ignores_a_commented_key_line() {
+        // A `# offline = true` example must not be mistaken for the real key.
+        let text = "[gateway]\n# offline = true\nretries = 3\n";
+        let out = set_toml_bool(text, "gateway", "offline", true);
+        assert_eq!(
+            out,
+            "[gateway]\noffline = true\n# offline = true\nretries = 3\n"
+        );
+    }
+
+    #[test]
+    fn set_toml_string_list_renders_and_clears() {
+        let text = "[gateway.models.cloud]\nmodel = \"m\"\n";
+        let set = set_toml_string_list(
+            text,
+            "gateway.models.cloud",
+            "fallbacks",
+            &["local".to_owned()],
+        );
+        assert_eq!(
+            set,
+            "[gateway.models.cloud]\nfallbacks = [\"local\"]\nmodel = \"m\"\n"
+        );
+        let cleared = set_toml_string_list(&set, "gateway.models.cloud", "fallbacks", &[]);
+        assert_eq!(
+            cleared,
+            "[gateway.models.cloud]\nfallbacks = []\nmodel = \"m\"\n"
+        );
+    }
+
+    #[test]
+    fn add_model_table_appends_and_rejects_duplicates() {
+        let text = "[routing]\nthreshold = 0.2\n";
+        let out = add_model_table(
+            text,
+            "anthropic",
+            "https://api.anthropic.com/v1",
+            "claude-x",
+            Some("ANTHROPIC_API_KEY"),
+            None,
+            Some(0.009),
+        )
+        .expect("first add succeeds");
+        assert_eq!(
+            out,
+            concat!(
+                "[routing]\nthreshold = 0.2\n\n",
+                "[gateway.models.anthropic]\n",
+                "base_url = \"https://api.anthropic.com/v1\"\n",
+                "model = \"claude-x\"\n",
+                "api_key_env = \"ANTHROPIC_API_KEY\"\n",
+                "cost_per_1k = 0.009\n"
+            )
+        );
+        let dup = add_model_table(
+            &out,
+            "anthropic",
+            "https://api.anthropic.com/v1",
+            "claude-y",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            dup.unwrap_err().to_string(),
+            "a model named 'anthropic' already exists in this config"
+        );
+    }
+
+    #[test]
+    fn set_tier_min_score_edits_the_matching_tier_only() {
+        let text = concat!(
+            "[[routing.tiers]]\nmin_score = 0.0\nmodel = \"small\"\n\n",
+            "[[routing.tiers]]\nmin_score = 0.08\nmodel = \"large\"\n"
+        );
+        let out = set_tier_min_score(text, "large", 0.2).expect("large tier exists");
+        assert_eq!(
+            out,
+            concat!(
+                "[[routing.tiers]]\nmin_score = 0.0\nmodel = \"small\"\n\n",
+                "[[routing.tiers]]\nmin_score = 0.2\nmodel = \"large\"\n"
+            )
+        );
+    }
+
+    #[test]
+    fn set_tier_min_score_errors_on_an_unknown_model() {
+        let text = "[[routing.tiers]]\nmin_score = 0.0\nmodel = \"small\"\n";
+        let err = set_tier_min_score(text, "missing", 0.5).expect_err("no such tier");
+        assert_eq!(
+            err.to_string(),
+            "no '[[routing.tiers]]' entry has model = 'missing'"
+        );
     }
 }

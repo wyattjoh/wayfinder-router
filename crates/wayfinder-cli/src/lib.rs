@@ -17,7 +17,10 @@ use wayfinder_internal_core::complexity::{
     binary_tiers, explain_score, score_complexity, ComplexityScore, FeatureWeights, RoutingConfig,
     DEFAULT_WEIGHTS, FEATURE_ORDER,
 };
-use wayfinder_internal_core::config::{find_config_file, load_routing_config, CONFIG_FILE};
+use wayfinder_internal_core::config::{
+    add_model_table, find_config_file, load_routing_config, routing_config_from_toml,
+    set_tier_min_score, set_toml_bool, set_toml_string_list, CONFIG_FILE,
+};
 use wayfinder_internal_core::feedback::{read_labels, record_label, DEFAULT_LOG};
 use wayfinder_internal_core::judge::{HeuristicJudge, Judge, OnboardOutputs};
 use wayfinder_internal_core::onboard::OnboardSummary;
@@ -26,8 +29,8 @@ use wayfinder_internal_core::sufficiency::{
 };
 use wayfinder_internal_core::vkeys;
 use wayfinder_internal_gateway::bootstrap::{
-    key_status, missing_keys, render_config, render_config_with_keychain, render_env_example,
-    resolve_keys, suggest_key_commands, DEFAULT_PRESET, PRESETS,
+    key_status, keychain_api_key_cmd, missing_keys, render_config, render_config_with_keychain,
+    render_env_example, resolve_keys, suggest_key_commands, DEFAULT_PRESET, PRESETS,
 };
 use wayfinder_internal_gateway::recalibrate::{recalibrate, DEFAULT_MIN_LABELS};
 use wayfinder_internal_gateway::service::{
@@ -36,7 +39,8 @@ use wayfinder_internal_gateway::service::{
 };
 use wayfinder_internal_gateway::{
     gateway_config_from_toml, invoke_messages, load_gateway_models,
-    serve_summary as gateway_serve_summary, GatewayModel, RelayMessage, ServeOptions,
+    serve_summary as gateway_serve_summary, GatewayConfig, GatewayModel, RelayMessage,
+    ServeOptions,
 };
 use wayfinder_internal_tui::{run_chat, ChatOptions, HELP};
 use wayfinder_internal_ui::{serve_summary as ui_serve_summary, UiOptions};
@@ -44,7 +48,7 @@ use wayfinder_internal_ui::{serve_summary as ui_serve_summary, UiOptions};
 const EXIT_CONFIG: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 const COMMAND_LIST: &str =
-    "route, calibrate, serve, service, chat, ui, webchat, onboard, judge, recalibrate, init, doctor, keys";
+    "route, calibrate, serve, service, chat, ui, webchat, onboard, judge, recalibrate, init, config, doctor, keys";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CliError {
@@ -120,6 +124,7 @@ pub enum CliCommand {
     Ui(UiOptions),
     Webchat(WebchatOptions),
     Init(InitOptions),
+    Config(ConfigCommand),
     Doctor(DoctorOptions),
     Keys(KeysOptions),
     Route(RouteOptions),
@@ -196,6 +201,56 @@ impl Default for InitOptions {
             keychain: false,
         }
     }
+}
+
+/// The `config` command's mutation verbs (WF-ADR-0044 config seam).
+///
+/// The seam grows verb by verb, key by key: each verb is a whitelisted, line-preserving,
+/// schema-validated edit, never a general TOML editor.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConfigCommand {
+    Set(ConfigSetOptions),
+    AddModel(ConfigAddModelOptions),
+    SetModel(ConfigSetModelOptions),
+    SetThreshold(ConfigSetThresholdOptions),
+}
+
+/// `config set <key> <value>` — set one whitelisted scalar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigSetOptions {
+    pub key: String,
+    pub value: String,
+    pub path: Option<PathBuf>,
+}
+
+/// `config add-model` — register a new `[gateway.models.*]` endpoint.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigAddModelOptions {
+    pub name: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: Option<String>,
+    pub cost_per_1k: Option<f64>,
+    pub keychain: bool,
+    pub path: Option<PathBuf>,
+}
+
+/// `config set-model` — edit delivery-time fields on an existing model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigSetModelOptions {
+    pub name: String,
+    pub enabled: Option<bool>,
+    pub fallback: Option<String>,
+    pub no_fallback: bool,
+    pub path: Option<PathBuf>,
+}
+
+/// `config set-threshold` — move an existing tier's score boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigSetThresholdOptions {
+    pub model: String,
+    pub min_score: f64,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -392,6 +447,7 @@ commands:
   judge        auto-label prompts behind trust checks
   recalibrate  re-fit config from the feedback log
   init         scaffold wayfinder-router.toml
+  config       set a whitelisted value in wayfinder-router.toml
   doctor       check config and key readiness
   keys         mint virtual gateway keys
 
@@ -447,6 +503,71 @@ options:
   --print                    print config instead of writing
   --keychain                 macOS: read each keyed model's key from the Keychain
                              (service 'wayfinder-router', account = the env-var name)
+  --help, -h                 show this help";
+
+const CONFIG_USAGE: &str = "\
+usage: wayfinder-router config <set|add-model|set-model|set-threshold> [OPTIONS]
+
+Mutate wayfinder-router.toml through a whitelisted, line-preserving, schema-validated
+verb (WF-ADR-0044) — never a general editor.
+
+verbs:
+  set <key> <value>          set a whitelisted scalar (currently: gateway.offline)
+  add-model                  register a new [gateway.models.*] endpoint
+  set-model                  edit an existing model's --enabled and/or --fallback
+  set-threshold              move an existing tier's --min-score
+
+Every verb accepts --path <path> (default: WAYFINDER_CONFIG, else the cwd walk-up).
+Run `config <verb> --help` for that verb's options.";
+
+const CONFIG_SET_USAGE: &str = "\
+usage: wayfinder-router config set <key> <value> [--path <path>]
+
+Set a whitelisted scalar; a running gateway hot-reloads it on its next request.
+
+keys:
+  gateway.offline true|false   serve the cheapest tier for every request";
+
+const CONFIG_ADD_MODEL_USAGE: &str = "\
+usage: wayfinder-router config add-model --name <slug> --base-url <url> --model <id> [OPTIONS]
+
+Register a new [gateway.models.*] endpoint — any OpenAI-compatible provider. It is not
+added to any routing tier, so restart the gateway and place it in a tier to route to it.
+
+options:
+  --name <slug>              lowercase letters, digits, '-'/'_' only (no dots)
+  --base-url <url>           the http:// or https:// OpenAI-compatible base URL
+  --model <id>               the upstream model id to send
+  --api-key-env <VAR>        env var holding the key (omit for a keyless endpoint)
+  --cost-per-1k <n>          optional informational $/1k-token cost
+  --keychain                 macOS: read --api-key-env from the Keychain
+  --path <path>              config file (default: WAYFINDER_CONFIG, else the cwd walk-up)
+  --help, -h                 show this help";
+
+const CONFIG_SET_MODEL_USAGE: &str = "\
+usage: wayfinder-router config set-model --name <name> [--enabled true|false] [--fallback <model>|--no-fallback] [--path <path>]
+
+Edit delivery-time fields on an existing [gateway.models.*] entry. --enabled is
+delivery-time only: the scored decision is never affected.
+
+options:
+  --name <name>              the model to edit (must already exist)
+  --enabled true|false       enable or disable this model for delivery
+  --fallback <model>         set this model's single same-tier fallback
+  --no-fallback              clear this model's fallback list
+  --path <path>              config file (default: WAYFINDER_CONFIG, else the cwd walk-up)
+  --help, -h                 show this help";
+
+const CONFIG_SET_THRESHOLD_USAGE: &str = "\
+usage: wayfinder-router config set-threshold --model <model> --min-score <n> [--path <path>]
+
+Move an existing [[routing.tiers]] entry's score boundary — a real routing-decision
+change, rejected up front if it breaks tier ordering.
+
+options:
+  --model <model>            the tier's model name
+  --min-score <n>            new score boundary, 0.0-1.0
+  --path <path>              config file (default: WAYFINDER_CONFIG, else the cwd walk-up)
   --help, -h                 show this help";
 
 const DOCTOR_USAGE: &str = "\
@@ -595,6 +716,7 @@ where
             None => Ok(CliCommand::Help(INIT_USAGE.to_owned())),
             Some(options) => Ok(CliCommand::Init(options)),
         },
+        Some("config") => parse_config(args),
         Some("doctor") => match parse_doctor(args)? {
             None => Ok(CliCommand::Help(DOCTOR_USAGE.to_owned())),
             Some(options) => Ok(CliCommand::Doctor(options)),
@@ -655,6 +777,7 @@ pub fn execute(command: CliCommand) -> Result<CommandOutput, CliError> {
             stderr: String::new(),
         }),
         CliCommand::Init(options) => execute_init(options),
+        CliCommand::Config(command) => execute_config(command),
         CliCommand::Doctor(options) => execute_doctor(options),
         CliCommand::Keys(options) => execute_keys(options),
         CliCommand::Route(options) => execute_route(options),
@@ -1222,6 +1345,209 @@ where
         }
     }
     Ok(Some(options))
+}
+
+fn parse_config<I>(args: I) -> Result<CliCommand, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let Some(verb) = args.next() else {
+        return Err(CliError::new(
+            "config requires a verb: set, add-model, set-model, or set-threshold",
+        ));
+    };
+    match verb.as_str() {
+        "--help" | "-h" => Ok(CliCommand::Help(CONFIG_USAGE.to_owned())),
+        "set" => match parse_config_set(args)? {
+            None => Ok(CliCommand::Help(CONFIG_SET_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Config(ConfigCommand::Set(options))),
+        },
+        "add-model" => match parse_config_add_model(args)? {
+            None => Ok(CliCommand::Help(CONFIG_ADD_MODEL_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Config(ConfigCommand::AddModel(options))),
+        },
+        "set-model" => match parse_config_set_model(args)? {
+            None => Ok(CliCommand::Help(CONFIG_SET_MODEL_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Config(ConfigCommand::SetModel(options))),
+        },
+        "set-threshold" => match parse_config_set_threshold(args)? {
+            None => Ok(CliCommand::Help(CONFIG_SET_THRESHOLD_USAGE.to_owned())),
+            Some(options) => Ok(CliCommand::Config(ConfigCommand::SetThreshold(options))),
+        },
+        other => Err(CliError::new(format!(
+            "unknown config verb '{other}' (expected set, add-model, set-model, or set-threshold)"
+        ))),
+    }
+}
+
+fn parse_config_set<I>(args: I) -> Result<Option<ConfigSetOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let mut positionals: Vec<String> = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--path" => path = Some(next_value(&mut args, "--path")?.into()),
+            other if other.starts_with('-') => {
+                return Err(CliError::new(format!(
+                    "unknown config set option '{other}'"
+                )));
+            }
+            _ => positionals.push(arg),
+        }
+    }
+    let [key, value] = positionals.as_slice() else {
+        return Err(CliError::new(
+            "config set takes exactly two arguments: <key> <value>",
+        ));
+    };
+    Ok(Some(ConfigSetOptions {
+        key: key.clone(),
+        value: value.clone(),
+        path,
+    }))
+}
+
+fn parse_config_add_model<I>(args: I) -> Result<Option<ConfigAddModelOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let mut name: Option<String> = None;
+    let mut base_url: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut api_key_env: Option<String> = None;
+    let mut cost_per_1k: Option<f64> = None;
+    let mut keychain = false;
+    let mut path: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--name" => name = Some(next_value(&mut args, "--name")?),
+            "--base-url" => base_url = Some(next_value(&mut args, "--base-url")?),
+            "--model" => model = Some(next_value(&mut args, "--model")?),
+            "--api-key-env" => api_key_env = Some(next_value(&mut args, "--api-key-env")?),
+            "--cost-per-1k" => {
+                cost_per_1k = Some(
+                    next_value(&mut args, "--cost-per-1k")?
+                        .parse()
+                        .map_err(|_| CliError::new("--cost-per-1k must be a number"))?,
+                );
+            }
+            "--keychain" => keychain = true,
+            "--path" => path = Some(next_value(&mut args, "--path")?.into()),
+            other => {
+                return Err(CliError::new(format!(
+                    "unknown config add-model option '{other}'"
+                )));
+            }
+        }
+    }
+    let (Some(name), Some(base_url), Some(model)) = (name, base_url, model) else {
+        return Err(CliError::new(
+            "config add-model requires --name, --base-url, and --model",
+        ));
+    };
+    Ok(Some(ConfigAddModelOptions {
+        name,
+        base_url,
+        model,
+        api_key_env,
+        cost_per_1k,
+        keychain,
+        path,
+    }))
+}
+
+fn parse_config_set_model<I>(args: I) -> Result<Option<ConfigSetModelOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let mut name: Option<String> = None;
+    let mut enabled: Option<bool> = None;
+    let mut fallback: Option<String> = None;
+    let mut no_fallback = false;
+    let mut path: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--name" => name = Some(next_value(&mut args, "--name")?),
+            "--enabled" => {
+                let raw = next_value(&mut args, "--enabled")?;
+                enabled = Some(match raw.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(CliError::new(format!(
+                            "--enabled takes 'true' or 'false', not '{other}'"
+                        )));
+                    }
+                });
+            }
+            "--fallback" => fallback = Some(next_value(&mut args, "--fallback")?),
+            "--no-fallback" => no_fallback = true,
+            "--path" => path = Some(next_value(&mut args, "--path")?.into()),
+            other => {
+                return Err(CliError::new(format!(
+                    "unknown config set-model option '{other}'"
+                )));
+            }
+        }
+    }
+    let Some(name) = name else {
+        return Err(CliError::new("config set-model requires --name"));
+    };
+    Ok(Some(ConfigSetModelOptions {
+        name,
+        enabled,
+        fallback,
+        no_fallback,
+        path,
+    }))
+}
+
+fn parse_config_set_threshold<I>(args: I) -> Result<Option<ConfigSetThresholdOptions>, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let mut model: Option<String> = None;
+    let mut min_score: Option<f64> = None;
+    let mut path: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--model" => model = Some(next_value(&mut args, "--model")?),
+            "--min-score" => {
+                min_score = Some(
+                    next_value(&mut args, "--min-score")?
+                        .parse()
+                        .map_err(|_| CliError::new("--min-score must be a number"))?,
+                );
+            }
+            "--path" => path = Some(next_value(&mut args, "--path")?.into()),
+            other => {
+                return Err(CliError::new(format!(
+                    "unknown config set-threshold option '{other}'"
+                )));
+            }
+        }
+    }
+    let (Some(model), Some(min_score)) = (model, min_score) else {
+        return Err(CliError::new(
+            "config set-threshold requires --model and --min-score",
+        ));
+    };
+    Ok(Some(ConfigSetThresholdOptions {
+        model,
+        min_score,
+        path,
+    }))
 }
 
 fn parse_doctor<I>(args: I) -> Result<Option<DoctorOptions>, CliError>
@@ -1813,6 +2139,303 @@ fn execute_init(options: InitOptions) -> Result<CommandOutput, CliError> {
         "next:  wayfinder-router chat        # or `wayfinder-router doctor` to re-check\n",
     );
     Ok(CommandOutput { stdout, stderr })
+}
+
+// The `config set` whitelist (WF-ADR-0044): the seam grows key by key, never into a general
+// TOML editor. Each entry maps a dotted key to its (table, key).
+const CONFIG_BOOL_KEYS: &[(&str, (&str, &str))] = &[("gateway.offline", ("gateway", "offline"))];
+
+fn execute_config(command: ConfigCommand) -> Result<CommandOutput, CliError> {
+    match command {
+        ConfigCommand::Set(options) => execute_config_set(options),
+        ConfigCommand::AddModel(options) => execute_config_add_model(options),
+        ConfigCommand::SetModel(options) => execute_config_set_model(options),
+        ConfigCommand::SetThreshold(options) => execute_config_set_threshold(options),
+    }
+}
+
+/// Resolve the config file a `config` verb should edit: an explicit `--path`, else the normal
+/// discovery. A missing file is a usage error pointing at `init`, never a silent create.
+fn resolve_config_target(path: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    let resolved = match &path {
+        Some(explicit) => Some(explicit.clone()),
+        None => find_config_file(Path::new(".")),
+    };
+    match resolved {
+        Some(path) if path.is_file() => Ok(path),
+        _ => {
+            let where_ = path
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| CONFIG_FILE.to_owned());
+            Err(CliError::usage(format!(
+                "no config at {where_} — run `wayfinder-router init` to create one"
+            )))
+        }
+    }
+}
+
+/// Re-parse edited config text through both real parsers; the seam never writes a file the
+/// gateway itself would not load (WF-ADR-0044, belt and braces).
+fn revalidate_config(text: &str, where_: &str) -> Result<GatewayConfig, CliError> {
+    let gateway = gateway_config_from_toml(text, where_)
+        .map_err(|err| CliError::config(format!("refusing to write — {err}")))?;
+    routing_config_from_toml(text, where_)
+        .map_err(|err| CliError::config(format!("refusing to write — {err}")))?;
+    Ok(gateway)
+}
+
+fn write_config(path: &Path, text: &str) -> Result<(), CliError> {
+    fs::write(path, text)
+        .map_err(|err| CliError::config(format!("cannot write {}: {err}", path.display())))
+}
+
+fn config_success(message: String) -> CommandOutput {
+    CommandOutput {
+        stdout: String::new(),
+        stderr: format!("{message}\n"),
+    }
+}
+
+/// A bare `[gateway.models.<name>]` slug: lowercase letters, digits, `-`/`_`, no dots (a dotted
+/// name would silently create a deeper nested table instead of the single model entry).
+fn valid_model_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 64
+        && first.is_ascii_lowercase()
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// An `api_key_env` var name like `ANTHROPIC_API_KEY` — the same shape the desktop's Keychain
+/// code enforces, so both ends agree on the variable that crosses between them.
+fn valid_env_var(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 64
+        && first.is_ascii_uppercase()
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn execute_config_set(options: ConfigSetOptions) -> Result<CommandOutput, CliError> {
+    let Some((_, (table, key))) = CONFIG_BOOL_KEYS
+        .iter()
+        .find(|(name, _)| *name == options.key)
+    else {
+        let known = CONFIG_BOOL_KEYS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CliError::usage(format!(
+            "unknown config key '{}' (known: {known})",
+            options.key
+        )));
+    };
+    let value = match options.value.as_str() {
+        "true" => true,
+        "false" => false,
+        other => {
+            return Err(CliError::usage(format!(
+                "{} takes 'true' or 'false', not '{other}'",
+                options.key
+            )));
+        }
+    };
+
+    let path = resolve_config_target(options.path)?;
+    let original = read_config_text(&path)?;
+    let updated = set_toml_bool(&original, table, key, value);
+    let gateway = revalidate_config(&updated, &path.to_string_lossy())?;
+    if gateway.offline != value {
+        return Err(CliError::config(
+            "refusing to write — edit did not take effect",
+        ));
+    }
+    write_config(&path, &updated)?;
+    Ok(config_success(format!(
+        "set {} = {} in {} (a running gateway hot-reloads this on its next request)",
+        options.key,
+        options.value,
+        path.display()
+    )))
+}
+
+fn execute_config_add_model(options: ConfigAddModelOptions) -> Result<CommandOutput, CliError> {
+    if !valid_model_name(&options.name) {
+        return Err(CliError::usage(format!(
+            "--name '{}' must be lowercase letters, digits, '-', or '_' only (no dots)",
+            options.name
+        )));
+    }
+    if !(options.base_url.starts_with("http://") || options.base_url.starts_with("https://")) {
+        return Err(CliError::usage(
+            "--base-url must be a http:// or https:// URL",
+        ));
+    }
+    if options.model.is_empty() {
+        return Err(CliError::usage("--model must not be empty"));
+    }
+    if let Some(env) = &options.api_key_env {
+        if !valid_env_var(env) {
+            return Err(CliError::usage(format!(
+                "--api-key-env '{env}' must look like ANTHROPIC_API_KEY (A-Z, 0-9, _, starting with a letter)"
+            )));
+        }
+    }
+    if options.cost_per_1k.is_some_and(|cost| cost < 0.0) {
+        return Err(CliError::usage("--cost-per-1k must not be negative"));
+    }
+    if options.keychain && options.api_key_env.is_none() {
+        return Err(CliError::usage(
+            "--keychain needs --api-key-env to name the variable it fills",
+        ));
+    }
+
+    let path = resolve_config_target(options.path)?;
+    let api_key_cmd = options
+        .keychain
+        .then(|| keychain_api_key_cmd(options.api_key_env.as_deref().unwrap_or_default()));
+    let original = read_config_text(&path)?;
+    let updated = add_model_table(
+        &original,
+        &options.name,
+        &options.base_url,
+        &options.model,
+        options.api_key_env.as_deref(),
+        api_key_cmd.as_deref(),
+        options.cost_per_1k,
+    )
+    .map_err(|err| CliError::config(format!("refusing to write — {err}")))?;
+    let gateway = revalidate_config(&updated, &path.to_string_lossy())?;
+    if !gateway.models.contains_key(&options.name) {
+        return Err(CliError::config(
+            "refusing to write — edit did not take effect",
+        ));
+    }
+    write_config(&path, &updated)?;
+    Ok(config_success(format!(
+        "added gateway.models.{} ({} via {}) to {} — restart the gateway to pick it up; not yet in any routing tier",
+        options.name,
+        options.model,
+        options.base_url,
+        path.display()
+    )))
+}
+
+fn execute_config_set_model(options: ConfigSetModelOptions) -> Result<CommandOutput, CliError> {
+    if options.fallback.is_some() && options.no_fallback {
+        return Err(CliError::usage(
+            "--fallback and --no-fallback are mutually exclusive",
+        ));
+    }
+    if options.enabled.is_none() && options.fallback.is_none() && !options.no_fallback {
+        return Err(CliError::usage(
+            "nothing to do — pass --enabled and/or --fallback/--no-fallback",
+        ));
+    }
+
+    let path = resolve_config_target(options.path)?;
+    let original = read_config_text(&path)?;
+    let where_ = path.to_string_lossy().into_owned();
+    let current = gateway_config_from_toml(&original, &where_).map_err(|err| {
+        CliError::config(format!(
+            "{} does not currently parse: {err}",
+            path.display()
+        ))
+    })?;
+    if !current.models.contains_key(&options.name) {
+        let mut known = current.models.keys().cloned().collect::<Vec<_>>();
+        known.sort();
+        let known = if known.is_empty() {
+            "(none configured)".to_owned()
+        } else {
+            known.join(", ")
+        };
+        return Err(CliError::usage(format!(
+            "unknown model '{}' (known: {known})",
+            options.name
+        )));
+    }
+
+    let table = format!("gateway.models.{}", options.name);
+    let mut updated = original;
+    if let Some(enabled) = options.enabled {
+        updated = set_toml_bool(&updated, &table, "enabled", enabled);
+    }
+    if let Some(fallback) = &options.fallback {
+        updated = set_toml_string_list(
+            &updated,
+            &table,
+            "fallbacks",
+            std::slice::from_ref(fallback),
+        );
+    } else if options.no_fallback {
+        updated = set_toml_string_list(&updated, &table, "fallbacks", &[]);
+    }
+
+    let gateway = revalidate_config(&updated, &where_)?;
+    let edited = gateway.models.get(&options.name);
+    let took = edited.is_some_and(|model| {
+        options.enabled.is_none_or(|want| model.enabled == want)
+            && options
+                .fallback
+                .as_ref()
+                .is_none_or(|want| model.fallbacks == [want.clone()])
+            && (!options.no_fallback || model.fallbacks.is_empty())
+    });
+    if !took {
+        return Err(CliError::config(
+            "refusing to write — edit did not take effect",
+        ));
+    }
+    write_config(&path, &updated)?;
+    Ok(config_success(format!(
+        "updated gateway.models.{} in {} (restart the gateway to pick up delivery changes)",
+        options.name,
+        path.display()
+    )))
+}
+
+fn execute_config_set_threshold(
+    options: ConfigSetThresholdOptions,
+) -> Result<CommandOutput, CliError> {
+    if !(0.0..=1.0).contains(&options.min_score) {
+        return Err(CliError::usage("--min-score must be between 0.0 and 1.0"));
+    }
+
+    let path = resolve_config_target(options.path)?;
+    let where_ = path.to_string_lossy().into_owned();
+    let original = read_config_text(&path)?;
+    let updated = set_tier_min_score(&original, &options.model, options.min_score)
+        .map_err(|err| CliError::config(format!("refusing to write — {err}")))?;
+    let routing = routing_config_from_toml(&updated, &where_)
+        .map_err(|err| CliError::config(format!("refusing to write — {err}")))?;
+    let took = routing
+        .tiers
+        .iter()
+        .find(|tier| tier.model == options.model)
+        .is_some_and(|tier| (tier.min_score - options.min_score).abs() < 1e-6);
+    if !took {
+        return Err(CliError::config(
+            "refusing to write — edit did not take effect",
+        ));
+    }
+    write_config(&path, &updated)?;
+    Ok(config_success(format!(
+        "set routing.tiers[model={}].min_score = {} in {} (a running gateway hot-reloads this on its next request)",
+        options.model,
+        options.min_score,
+        path.display()
+    )))
+}
+
+fn read_config_text(path: &Path) -> Result<String, CliError> {
+    fs::read_to_string(path)
+        .map_err(|err| CliError::config(format!("cannot read {}: {err}", path.display())))
 }
 
 fn execute_doctor(options: DoctorOptions) -> Result<CommandOutput, CliError> {
@@ -3411,6 +4034,353 @@ mod tests {
                 .expect("env example should read")
                 .contains("OPENAI_API_KEY=")
         );
+    }
+
+    /// Write a minimal config into a fresh temp dir and return its path. Uses `--path`
+    /// throughout so the config tests never depend on the working directory or environment.
+    fn config_fixture(prefix: &str, body: &str) -> std::path::PathBuf {
+        let dir = unique_temp_dir(prefix);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("wayfinder-router.toml");
+        fs::write(&path, body).expect("fixture write");
+        path
+    }
+
+    fn config_arg(path: &std::path::Path) -> String {
+        path.to_str().expect("path is utf-8").to_owned()
+    }
+
+    #[test]
+    fn config_set_flips_offline_and_preserves_the_file() {
+        let path = config_fixture("cli-config-set", "# keep me\n[routing]\nthreshold = 0.2\n");
+        let p = config_arg(&path);
+
+        let output = run_output(
+            ["config", "set", "gateway.offline", "true", "--path", &p],
+            None,
+        )
+        .expect("config set should succeed");
+        assert!(output.stderr.contains("set gateway.offline = true"));
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(after.contains("# keep me"), "comments must survive");
+        assert!(after.contains("threshold = 0.2"));
+        assert!(after.contains("offline = true"));
+
+        // Flip back off through the in-place replace path.
+        run_output(
+            ["config", "set", "gateway.offline", "false", "--path", &p],
+            None,
+        )
+        .expect("second config set should succeed");
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("offline = false"));
+    }
+
+    #[test]
+    fn config_set_rejects_unknown_key_bad_value_and_missing_file() {
+        // Off-whitelist key.
+        let path = config_fixture("cli-config-set-reject", "[routing]\nthreshold = 0.2\n");
+        let p = config_arg(&path);
+        let unknown = run_output(
+            ["config", "set", "routing.threshold", "0.5", "--path", &p],
+            None,
+        )
+        .expect_err("off-whitelist key should be rejected");
+        assert_eq!(unknown.exit_code(), 2);
+        assert!(unknown.to_string().contains("unknown config key"));
+
+        // Non-boolean value.
+        let bad_value = run_output(
+            ["config", "set", "gateway.offline", "maybe", "--path", &p],
+            None,
+        )
+        .expect_err("non-boolean value should be rejected");
+        assert_eq!(bad_value.exit_code(), 2);
+        assert!(bad_value.to_string().contains("'true' or 'false'"));
+
+        // Missing file.
+        let missing = run_output(
+            [
+                "config",
+                "set",
+                "gateway.offline",
+                "true",
+                "--path",
+                "/no/such/wayfinder-router.toml",
+            ],
+            None,
+        )
+        .expect_err("missing config should be rejected");
+        assert_eq!(missing.exit_code(), 2);
+        assert!(missing.to_string().contains("wayfinder-router init"));
+    }
+
+    #[test]
+    fn config_add_model_registers_and_validates() {
+        let path = config_fixture("cli-config-add", "[routing]\nthreshold = 0.2\n");
+        let p = config_arg(&path);
+
+        let output = run_output(
+            [
+                "config",
+                "add-model",
+                "--name",
+                "anthropic",
+                "--base-url",
+                "https://api.anthropic.com/v1",
+                "--model",
+                "claude-x",
+                "--api-key-env",
+                "ANTHROPIC_API_KEY",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect("add-model should succeed");
+        assert!(output.stderr.contains("added gateway.models.anthropic"));
+        let text = fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("[gateway.models.anthropic]"));
+        assert!(text.contains("api_key_env = \"ANTHROPIC_API_KEY\""));
+
+        // Re-adding the same name collides.
+        let dup = run_output(
+            [
+                "config",
+                "add-model",
+                "--name",
+                "anthropic",
+                "--base-url",
+                "https://api.anthropic.com/v1",
+                "--model",
+                "claude-y",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect_err("duplicate name should be rejected");
+        assert_eq!(dup.exit_code(), 1);
+        assert!(dup.to_string().contains("already exists"));
+
+        // A dotted name would create a nested table, not a single model.
+        let dotted = run_output(
+            [
+                "config",
+                "add-model",
+                "--name",
+                "a.b",
+                "--base-url",
+                "https://api.example.com/v1",
+                "--model",
+                "m",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect_err("dotted name should be rejected");
+        assert_eq!(dotted.exit_code(), 2);
+        assert!(dotted.to_string().contains("no dots"));
+
+        // A non-URL base is rejected.
+        let bad_url = run_output(
+            [
+                "config",
+                "add-model",
+                "--name",
+                "ftpish",
+                "--base-url",
+                "ftp://api.example.com/v1",
+                "--model",
+                "m",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect_err("non-http base_url should be rejected");
+        assert_eq!(bad_url.exit_code(), 2);
+        assert!(bad_url.to_string().contains("http:// or https://"));
+    }
+
+    #[test]
+    fn config_add_model_keychain_emits_api_key_cmd() {
+        let path = config_fixture("cli-config-add-keychain", "[routing]\nthreshold = 0.2\n");
+        let p = config_arg(&path);
+
+        run_output(
+            [
+                "config",
+                "add-model",
+                "--name",
+                "anthropic",
+                "--base-url",
+                "https://api.anthropic.com/v1",
+                "--model",
+                "claude-x",
+                "--api-key-env",
+                "ANTHROPIC_API_KEY",
+                "--keychain",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect("add-model --keychain should succeed");
+        let text = fs::read_to_string(&path).expect("read back");
+        assert!(text.contains(
+            "api_key_cmd = \"/usr/bin/security find-generic-password \
+             -s wayfinder-router -a ANTHROPIC_API_KEY -w\""
+        ));
+
+        // --keychain without --api-key-env has nothing to fill.
+        let need_env = run_output(
+            [
+                "config",
+                "add-model",
+                "--name",
+                "keyless",
+                "--base-url",
+                "https://api.example.com/v1",
+                "--model",
+                "m",
+                "--keychain",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect_err("--keychain without --api-key-env should be rejected");
+        assert_eq!(need_env.exit_code(), 2);
+        assert!(need_env
+            .to_string()
+            .contains("--keychain needs --api-key-env"));
+    }
+
+    #[test]
+    fn config_set_model_toggles_enabled_and_rejects_unknown() {
+        let path = config_fixture(
+            "cli-config-set-model",
+            concat!(
+                "[routing]\nthreshold = 0.2\n\n",
+                "[gateway.models.cloud]\n",
+                "base_url = \"https://api.example.com/v1\"\n",
+                "model = \"m\"\n"
+            ),
+        );
+        let p = config_arg(&path);
+
+        run_output(
+            [
+                "config",
+                "set-model",
+                "--name",
+                "cloud",
+                "--enabled",
+                "false",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect("set-model should succeed");
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("enabled = false"));
+
+        let unknown = run_output(
+            [
+                "config",
+                "set-model",
+                "--name",
+                "ghost",
+                "--enabled",
+                "false",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect_err("unknown model should be rejected");
+        assert_eq!(unknown.exit_code(), 2);
+        assert!(unknown.to_string().contains("unknown model 'ghost'"));
+
+        // Nothing to change is a usage error, not a silent no-op.
+        let nothing = run_output(
+            ["config", "set-model", "--name", "cloud", "--path", &p],
+            None,
+        )
+        .expect_err("no fields should be rejected");
+        assert_eq!(nothing.exit_code(), 2);
+        assert!(nothing.to_string().contains("nothing to do"));
+    }
+
+    #[test]
+    fn config_set_threshold_moves_the_tier_and_guards_ordering() {
+        let path = config_fixture(
+            "cli-config-set-threshold",
+            concat!(
+                "[[routing.tiers]]\nmin_score = 0.0\nmodel = \"small\"\n\n",
+                "[[routing.tiers]]\nmin_score = 0.08\nmodel = \"large\"\n"
+            ),
+        );
+        let p = config_arg(&path);
+
+        run_output(
+            [
+                "config",
+                "set-threshold",
+                "--model",
+                "large",
+                "--min-score",
+                "0.2",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect("set-threshold should succeed");
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("min_score = 0.2"));
+
+        // Out of range.
+        let oob = run_output(
+            [
+                "config",
+                "set-threshold",
+                "--model",
+                "large",
+                "--min-score",
+                "1.5",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect_err("out-of-range score should be rejected");
+        assert_eq!(oob.exit_code(), 2);
+        assert!(oob.to_string().contains("between 0.0 and 1.0"));
+
+        // Breaking monotonicity (large below small) is caught by the reparse.
+        let broken = run_output(
+            [
+                "config",
+                "set-threshold",
+                "--model",
+                "small",
+                "--min-score",
+                "0.5",
+                "--path",
+                &p,
+            ],
+            None,
+        )
+        .expect_err("a non-monotonic ladder should be rejected");
+        assert_eq!(broken.exit_code(), 1);
+        assert!(broken.to_string().contains("refusing to write"));
     }
 
     #[test]
