@@ -525,6 +525,66 @@ async fn healthz_reports_ok_and_default_models() {
 }
 
 #[tokio::test]
+async fn explicit_config_option_loads_a_file_from_a_foreign_working_directory() {
+    // The service-managed case: the gateway is started somewhere with no config anywhere
+    // above it, and must still load the file it was pointed at.
+    let config_dir = tempdir().unwrap();
+    let start_dir = tempdir().unwrap();
+    let config_path = config_dir.path().join("pinned.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[routing]
+threshold = 0.5
+
+[gateway.models.pinned-only]
+base_url = "http://127.0.0.1:9/v1"
+model = "pinned-upstream"
+"#,
+    )
+    .unwrap();
+
+    let app = build_app_from_dir(
+        ServeOptions {
+            config: Some(config_path.clone()),
+            ..ServeOptions::default()
+        },
+        start_dir.path(),
+    )
+    .expect("app should build from the named config");
+    let (status, body) = app_get_json(app, "/healthz").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["models"],
+        serde_json::json!(["pinned-only"]),
+        "the named config should be loaded even though the start dir has none"
+    );
+}
+
+#[tokio::test]
+async fn explicit_config_option_that_is_missing_is_an_error_not_a_silent_default() {
+    // Falling back to built-in defaults here would start a gateway that looks healthy while
+    // silently ignoring the operator's file, so this has to fail loudly.
+    let start_dir = tempdir().unwrap();
+    let missing = start_dir.path().join("not-there.toml");
+
+    let error = build_app_from_dir(
+        ServeOptions {
+            config: Some(missing.clone()),
+            ..ServeOptions::default()
+        },
+        start_dir.path(),
+    )
+    .expect_err("a missing --config file should not fall back to defaults");
+
+    assert!(
+        error.to_string().contains("no such config file"),
+        "error should name the missing file, got: {error}"
+    );
+}
+
+#[tokio::test]
 async fn models_returns_openai_compatible_directives_and_routes() {
     let (status, body) = get_json("/v1/models").await;
     let (_, bare) = get_json("/models").await;

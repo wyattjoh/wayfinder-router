@@ -19,7 +19,7 @@ use wayfinder_internal_core::complexity::{
     binary_tiers, explain_score, score_complexity, RoutingConfig,
 };
 use wayfinder_internal_core::config::{
-    dump_routing_toml, load_routing_config, routing_config_from_toml, CONFIG_FILE,
+    dump_routing_toml, find_config_file, load_routing_config, routing_config_from_toml, CONFIG_FILE,
 };
 use wayfinder_internal_core::feedback::{read_labels, record_label, DEFAULT_LOG};
 use wayfinder_internal_gateway::recalibrate::{
@@ -496,16 +496,6 @@ fn default_onboard_invoker(model: &GatewayModel, prompt: &str) -> Result<String,
         &[RelayMessage::new("user", prompt)],
         DEFAULT_INVOKE_TIMEOUT,
     )
-}
-
-fn find_config_file(start_dir: &Path) -> Option<PathBuf> {
-    let current = start_dir
-        .canonicalize()
-        .unwrap_or_else(|_| start_dir.to_path_buf());
-    current.ancestors().find_map(|directory| {
-        let candidate = directory.join(CONFIG_FILE);
-        candidate.is_file().then_some(candidate)
-    })
 }
 
 #[cfg(test)]

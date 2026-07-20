@@ -5,6 +5,7 @@ fn serve_summary_mentions_current_gateway_shape() {
         port: 8088,
         dry_run: true,
         timeout_seconds: Some(30.0),
+        config: None,
     };
 
     let message = wayfinder_internal_gateway::serve_summary(&options);

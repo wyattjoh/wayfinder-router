@@ -26,7 +26,9 @@ use toml::Value;
 use wayfinder_internal_core::complexity::{
     explain_score, recommend_tier, score_complexity, ComplexityScore, RoutingConfig, Tier,
 };
-use wayfinder_internal_core::config::{dump_routing_toml, routing_config_from_toml, CONFIG_FILE};
+use wayfinder_internal_core::config::{
+    dump_routing_toml, find_config_file, routing_config_from_toml, CONFIG_FILE,
+};
 use wayfinder_internal_core::feedback::{read_labels, record_label, DEFAULT_LOG};
 use wayfinder_internal_core::pricing::{
     estimate_tokens, price_table, table_version, turn_cost, usage_tokens, Date, SavingsLedger,
@@ -102,6 +104,11 @@ pub struct ServeOptions {
     pub port: u16,
     pub dry_run: bool,
     pub timeout_seconds: Option<f64>,
+    /// An explicit config file, overriding both `WAYFINDER_CONFIG` and the walk-up.
+    ///
+    /// Threaded through rather than exported into the process environment so that the
+    /// override stays scoped to this gateway instance.
+    pub config: Option<PathBuf>,
 }
 
 impl Default for ServeOptions {
@@ -111,6 +118,7 @@ impl Default for ServeOptions {
             port: DEFAULT_PORT,
             dry_run: false,
             timeout_seconds: None,
+            config: None,
         }
     }
 }
@@ -470,7 +478,7 @@ pub fn serve_blocking(options: ServeOptions) -> Result<(), GatewayError> {
 
 impl AppState {
     fn load(options: ServeOptions, start_dir: &Path, clock: Clock) -> Result<Self, GatewayError> {
-        let loaded = load_config(start_dir)?;
+        let loaded = load_config(start_dir, options.config.as_deref())?;
         let model_ids = model_ids(&loaded.routing, &loaded.gateway);
         let tier_ladder = loaded
             .routing
@@ -514,7 +522,25 @@ struct LoadedConfig {
     gateway: GatewayConfig,
 }
 
-fn load_config(start_dir: &Path) -> Result<LoadedConfig, GatewayError> {
+/// Resolve and load the gateway's config.
+///
+/// Precedence is `--config` (the `override_path` argument), then `WAYFINDER_CONFIG`, then the
+/// walk up from `start_dir`, then built-in defaults. An explicit override that is not there is
+/// an error rather than a silent fall back to defaults, because a gateway told to load a
+/// specific file and quietly running on defaults instead is the worse failure.
+fn load_config(
+    start_dir: &Path,
+    override_path: Option<&Path>,
+) -> Result<LoadedConfig, GatewayError> {
+    if let Some(override_path) = override_path {
+        if !override_path.is_file() {
+            return Err(GatewayError::new(format!(
+                "{}: no such config file",
+                override_path.display()
+            )));
+        }
+        return read_config(override_path.to_path_buf());
+    }
     let Some(path) = find_config(start_dir) else {
         return Ok(LoadedConfig {
             config_path: start_dir.join(CONFIG_FILE),
@@ -532,6 +558,10 @@ fn load_config(start_dir: &Path) -> Result<LoadedConfig, GatewayError> {
             },
         });
     };
+    read_config(path)
+}
+
+fn read_config(path: PathBuf) -> Result<LoadedConfig, GatewayError> {
     let text = std::fs::read_to_string(&path)
         .map_err(|err| GatewayError::new(format!("{}: {err}", path.display())))?;
     let where_ = path.to_string_lossy();
@@ -680,13 +710,7 @@ fn python_float_repr(value: f64) -> String {
 }
 
 fn find_config(start_dir: &Path) -> Option<PathBuf> {
-    for dir in start_dir.ancestors() {
-        let path = dir.join(CONFIG_FILE);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
+    find_config_file(start_dir)
 }
 
 fn parse_gateway_config(text: &str, where_: &str) -> Result<GatewayConfig, GatewayError> {

@@ -11,6 +11,11 @@ use crate::complexity::{
 };
 
 pub const CONFIG_FILE: &str = "wayfinder-router.toml";
+/// An explicit path to the config file, overriding the working-directory walk-up.
+///
+/// Lets a service-managed gateway (whose working directory is unpredictable) and a desktop
+/// client agree on one well-known file. `serve --config PATH` sets it for the process.
+pub const CONFIG_PATH_ENV: &str = "WAYFINDER_CONFIG";
 pub const THRESHOLD_ENV: &str = "WAYFINDER_ROUTER_THRESHOLD";
 const MAX_LEXICON_TERMS: usize = 2000;
 
@@ -109,7 +114,19 @@ fn default_binary_config(threshold: f64) -> RoutingConfig {
     }
 }
 
-fn find_config_file(start_dir: &Path) -> Option<std::path::PathBuf> {
+/// The config file to load: an explicit [`CONFIG_PATH_ENV`] override, else the nearest
+/// [`CONFIG_FILE`] at or above `start_dir`, else `None`.
+///
+/// The override is absolute. When [`CONFIG_PATH_ENV`] is set but names a file that is not
+/// there, the result is `None` — a clear "your configured file is missing" — never a silent
+/// walk up to some other config that happens to sit above the working directory.
+///
+/// This exists because a service-managed gateway (launchd, systemd) has an unpredictable
+/// working directory, so walking up from it finds the wrong file or no file at all.
+pub fn find_config_file(start_dir: &Path) -> Option<std::path::PathBuf> {
+    if let Some(override_path) = config_path_override() {
+        return override_path.is_file().then_some(override_path);
+    }
     let current = start_dir
         .canonicalize()
         .unwrap_or_else(|_| start_dir.to_path_buf());
@@ -117,6 +134,29 @@ fn find_config_file(start_dir: &Path) -> Option<std::path::PathBuf> {
         let candidate = directory.join(CONFIG_FILE);
         candidate.is_file().then_some(candidate)
     })
+}
+
+/// The [`CONFIG_PATH_ENV`] override as a path, with a leading `~` expanded.
+fn config_path_override() -> Option<std::path::PathBuf> {
+    let raw = std::env::var(CONFIG_PATH_ENV).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(expand_tilde(&raw))
+}
+
+fn expand_tilde(raw: &str) -> std::path::PathBuf {
+    let Some(rest) = raw.strip_prefix('~') else {
+        return std::path::PathBuf::from(raw);
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        return std::path::PathBuf::from(raw);
+    };
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    if rest.is_empty() {
+        return std::path::PathBuf::from(home);
+    }
+    std::path::PathBuf::from(home).join(rest)
 }
 
 pub fn dump_routing_toml(config: &RoutingConfig) -> String {

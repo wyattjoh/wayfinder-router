@@ -17,7 +17,7 @@ use wayfinder_internal_core::complexity::{
     binary_tiers, explain_score, score_complexity, ComplexityScore, FeatureWeights, RoutingConfig,
     DEFAULT_WEIGHTS, FEATURE_ORDER,
 };
-use wayfinder_internal_core::config::{load_routing_config, CONFIG_FILE};
+use wayfinder_internal_core::config::{find_config_file, load_routing_config, CONFIG_FILE};
 use wayfinder_internal_core::feedback::{read_labels, record_label, DEFAULT_LOG};
 use wayfinder_internal_core::judge::{HeuristicJudge, Judge, OnboardOutputs};
 use wayfinder_internal_core::onboard::OnboardSummary;
@@ -145,6 +145,8 @@ pub struct ServiceOptions {
     pub host: String,
     pub port: u16,
     pub print: bool,
+    /// Baked into the generated unit as `serve --config PATH`.
+    pub config: Option<PathBuf>,
 }
 
 impl Default for ServiceOptions {
@@ -154,6 +156,7 @@ impl Default for ServiceOptions {
             host: "127.0.0.1".to_owned(),
             port: 8088,
             print: false,
+            config: None,
         }
     }
 }
@@ -423,6 +426,8 @@ Run the gateway as an always-on local service.
 options:
   --host <host>   gateway host
   --port <port>   gateway port
+  --config <path> config file to bake into the unit, so the service loads a fixed
+                  file regardless of its working directory
   --print         print the generated unit file instead of installing it
   --help, -h      show this help";
 
@@ -681,6 +686,9 @@ where
                         .map_err(|_| CliError::new("--timeout must be a number"))?,
                 );
             }
+            "--config" => {
+                options.config = Some(PathBuf::from(next_value(&mut args, "--config")?));
+            }
             other => return Err(CliError::new(format!("unknown serve option '{other}'"))),
         }
     }
@@ -719,6 +727,9 @@ where
                     .map_err(|_| CliError::new("--port must be an integer"))?;
             }
             "--print" => options.print = true,
+            "--config" => {
+                options.config = Some(PathBuf::from(next_value(&mut args, "--config")?));
+            }
             other => return Err(CliError::new(format!("unknown service option '{other}'"))),
         }
     }
@@ -782,6 +793,7 @@ pub fn webchat_serve_options(options: &WebchatOptions) -> ServeOptions {
         port: options.port,
         dry_run: options.dry_run,
         timeout_seconds: options.timeout_seconds,
+        config: None,
     }
 }
 
@@ -806,19 +818,28 @@ pub fn demo_url(host: &str, port: u16) -> String {
     format!("http://{display}:{port}/demo")
 }
 
-pub fn resolve_serve_args(host: &str, port: u16) -> Vec<String> {
+/// The arguments a service manager should launch the gateway with.
+///
+/// When `config` is given it is appended as `--config PATH`, so a service-managed gateway
+/// loads a fixed file rather than walking up from a working directory it does not control.
+pub fn resolve_serve_args(host: &str, port: u16, config: Option<&Path>) -> Vec<String> {
     let executable = std::env::current_exe()
         .ok()
         .filter(|path| path.is_file())
         .unwrap_or_else(|| PathBuf::from("wayfinder-router"));
-    vec![
+    let mut args = vec![
         executable.to_string_lossy().into_owned(),
         "serve".to_owned(),
         "--host".to_owned(),
         host.to_owned(),
         "--port".to_owned(),
         port.to_string(),
-    ]
+    ];
+    if let Some(config) = config {
+        args.push("--config".to_owned());
+        args.push(config.to_string_lossy().into_owned());
+    }
+    args
 }
 
 fn execute_service(options: ServiceOptions) -> Result<CommandOutput, CliError> {
@@ -832,7 +853,7 @@ fn execute_service(options: ServiceOptions) -> Result<CommandOutput, CliError> {
         ));
     }
 
-    let program_args = resolve_serve_args(&options.host, options.port);
+    let program_args = resolve_serve_args(&options.host, options.port, options.config.as_deref());
     let endpoint = format!("http://{}:{}/v1", options.host, options.port);
     let (unit_text, unit_file, manager) = match platform {
         ServicePlatform::Macos => (
@@ -1947,16 +1968,6 @@ fn summarize_routing(config: &RoutingConfig) -> String {
         .join(" · ")
 }
 
-fn find_config_file(start_dir: &Path) -> Option<PathBuf> {
-    let current = start_dir
-        .canonicalize()
-        .unwrap_or_else(|_| start_dir.to_path_buf());
-    current.ancestors().find_map(|directory| {
-        let candidate = directory.join(CONFIG_FILE);
-        candidate.is_file().then_some(candidate)
-    })
-}
-
 #[cfg(test)]
 fn execute_onboard_with_invoker<I, R, J>(
     options: OnboardOptions,
@@ -2772,11 +2783,12 @@ fn non_empty(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         parse, run, run_output, CalibrateOptions, CliCommand, JudgeOptions, OnboardOptions,
-        RecalibrateOptions, ServiceOptions, WebchatOptions,
+        RecalibrateOptions, ServeOptions, ServiceOptions, WebchatOptions,
     };
     use wayfinder_internal_ui::UiOptions;
 
@@ -2819,6 +2831,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port: 8088,
                 print: true,
+                config: None,
             })
         );
     }
@@ -2858,12 +2871,65 @@ mod tests {
 
     #[test]
     fn resolve_serve_args_targets_serve() {
-        let args = super::resolve_serve_args("127.0.0.1", 8088);
+        let args = super::resolve_serve_args("127.0.0.1", 8088, None);
 
         assert!(args.first().is_some_and(|arg| !arg.is_empty()));
         assert_eq!(
             &args[args.len() - 5..],
             ["serve", "--host", "127.0.0.1", "--port", "8088"]
+        );
+    }
+
+    #[test]
+    fn resolve_serve_args_bakes_in_an_explicit_config_path() {
+        // A service manager launches the gateway from a working directory it does not
+        // control, so the unit has to name the config file outright.
+        let args = super::resolve_serve_args(
+            "127.0.0.1",
+            8088,
+            Some(Path::new("/etc/wayfinder/wayfinder-router.toml")),
+        );
+
+        assert_eq!(
+            &args[args.len() - 7..],
+            [
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8088",
+                "--config",
+                "/etc/wayfinder/wayfinder-router.toml"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_service_accepts_a_config_path() {
+        let command = super::parse(["service", "install", "--config", "/tmp/wf.toml"])
+            .expect("service args should parse");
+
+        assert_eq!(
+            command,
+            CliCommand::Service(ServiceOptions {
+                action: "install".to_owned(),
+                config: Some(PathBuf::from("/tmp/wf.toml")),
+                ..ServiceOptions::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_serve_accepts_a_config_path() {
+        let command =
+            super::parse(["serve", "--config", "/tmp/wf.toml"]).expect("serve args should parse");
+
+        assert_eq!(
+            command,
+            CliCommand::Serve(ServeOptions {
+                config: Some(PathBuf::from("/tmp/wf.toml")),
+                ..ServeOptions::default()
+            })
         );
     }
 
