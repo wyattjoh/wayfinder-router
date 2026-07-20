@@ -10,6 +10,37 @@ The **feedback release** — features driven by post-launch feedback.
 
 ### Added
 
+- **A config-editing seam in the CLI** (WF-ADR-0044). Four whitelisted verbs mutate
+  `wayfinder-router.toml` without you hand-editing TOML, and without a client ever authoring it:
+  `config set gateway.offline true|false` (the one scalar today; the whitelist grows key by key,
+  never into a general editor), `config add-model` to register any OpenAI-compatible endpoint,
+  `config set-model` to enable/disable a model or set its fallback, and `config set-threshold` to
+  move a tier's score boundary. Every edit is **line-preserving** (comments and unrelated sections
+  survive byte-for-byte) and **schema-validated** — the result is re-parsed through the real config
+  parsers before a single byte is written, so the seam never leaves you with a file the gateway
+  wouldn't load. `config set` is hot-reloaded by a running gateway on its next request;
+  `add-model`/`set-model` need a restart. A newly added model is visible on `/router/models` and
+  keyable immediately, but stays out of the scored routing ladder until you place it in a tier by
+  hand.
+- **A fixed config file for service-managed gateways** (WF-ADR-0042). `serve --config PATH` and the
+  `WAYFINDER_CONFIG` environment variable point the gateway at one well-known file instead of
+  walking up from a working directory a launchd/systemd unit doesn't control; `service install
+  --config PATH` bakes it into the generated unit. Resolution is `--config`, then `WAYFINDER_CONFIG`,
+  then the walk-up, then defaults — and a named-but-missing file is an error, never a silent
+  fall-back to defaults.
+- **A no-backend gateway answers with the routing decision** (WF-ADR-0042). A live gateway with no
+  `[gateway.models]` configured now returns the routing decision from `/v1/chat/completions`
+  (HTTP 200, plus an `x-wayfinder-router-decision-only` header) instead of an error, so you see real
+  routing the instant the gateway is up — before wiring any backend. Only delivery is skipped; the
+  decision is byte-identical to a dry run.
+- **Per-model on/off switch.** A model can be marked `enabled = false` (or toggled via `config
+  set-model --enabled`). A disabled model is skipped at delivery like a broken endpoint, cascading
+  to its fallback — the scored decision is never affected.
+- **macOS Keychain-backed keys from `init`.** `wayfinder-router init --keychain` (and `config
+  add-model --keychain`) writes an `api_key_cmd` per keyed model that reads the key from the macOS
+  Keychain at request time; the key itself is never written to the config.
+- **`init` creates missing parent directories**, so `init --path some/new/dir/wayfinder-router.toml`
+  works from a fresh checkout without a manual `mkdir -p`.
 - **Automated sufficiency judge for calibration** (WF-ADR-0037). `wayfinder-router judge
   prompts.jsonl --gold gold.jsonl` closes the calibration loop without a human grading every
   prompt: it runs each prompt through two tiers, asks an automated judge *"was the cheaper tier
@@ -28,6 +59,15 @@ The **feedback release** — features driven by post-launch feedback.
 
 ### Changed
 
+- **`[[routing.tiers]]` must be declared in ascending `min_score` order.** Tier order is the routing
+  ladder order, so the declared order is now authoritative: an out-of-order ladder is rejected
+  rather than silently sorted into shape. Configs written by `init` or `calibrate` are already in
+  order; only a hand-edited file with out-of-order tiers is affected.
+- **`/router/models` reports more per model.** Each entry now carries `provider`
+  (`openai-compatible`), `tier`, `context_window`, and `enabled`, so a client can render a model's
+  delivery identity and state without guessing. `/router/recent` additionally reports `decision_ms`
+  per entry and `p50_decision_ms` over the recent window — the time to *decide* a route, never the
+  upstream model's own response time.
 - **Docs & positioning pass** (from post-launch feedback). Plainer, less marketing-flavored copy
   across the README, explainer, and demo. The "How it compares" table now lists **Bifrost**
   alongside LiteLLM and spells out the distinction: OpenRouter / Bifrost / LiteLLM are
