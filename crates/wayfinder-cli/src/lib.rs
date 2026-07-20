@@ -2086,6 +2086,15 @@ fn execute_init(options: InitOptions) -> Result<CommandOutput, CliError> {
             stderr,
         ));
     }
+    // Create any missing parent directories so `init --path a/b/c.toml` works from a fresh
+    // checkout without the caller having to `mkdir -p` first.
+    if let Some(parent) = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|err| CliError::usage(format!("cannot create {}: {err}", parent.display())))?;
+    }
     fs::write(&target, &config_text)
         .map_err(|err| CliError::usage(format!("cannot write {}: {err}", target.display())))?;
 
@@ -4008,8 +4017,9 @@ mod tests {
     #[test]
     fn init_writes_config_and_env_example_next_to_path() {
         let dir = unique_temp_dir("cli-init-write");
+        // The nested parent does not exist yet: init must create it rather than fail.
         let path = dir.join("nested").join("router.toml");
-        fs::create_dir_all(path.parent().expect("path has a parent")).expect("dir write");
+        fs::create_dir_all(&dir).expect("temp root");
 
         let output = run_output(
             [

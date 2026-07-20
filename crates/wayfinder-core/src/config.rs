@@ -389,7 +389,9 @@ fn parse_tiers(where_: &str, value: &Value) -> Result<Vec<Tier>, WayfinderConfig
         });
     }
 
-    tiers.sort_by(|a, b| a.min_score.total_cmp(&b.min_score));
+    // Tier order is the routing ladder order, so the declared order is authoritative: an
+    // out-of-order ladder is rejected rather than silently reordered. Validate the declared
+    // sequence as-is instead of sorting first.
     if tiers[0].min_score != 0.0 {
         return Err(WayfinderConfigError::new(format!(
             "{where_}: the first tier must have min_score = 0.0"
@@ -996,6 +998,33 @@ mod tests {
             dup.unwrap_err().to_string(),
             "a model named 'anthropic' already exists in this config"
         );
+    }
+
+    #[test]
+    fn tiers_must_be_declared_in_ascending_order() {
+        // Declared order is the routing ladder order, so it is authoritative: an out-of-order
+        // ladder is rejected, never silently sorted into shape.
+        let text = concat!(
+            "[[routing.tiers]]\nmin_score = 0.0\nmodel = \"small\"\n\n",
+            "[[routing.tiers]]\nmin_score = 0.5\nmodel = \"large\"\n\n",
+            "[[routing.tiers]]\nmin_score = 0.2\nmodel = \"medium\"\n"
+        );
+        let err = routing_config_from_toml(text, "fixture").expect_err("out-of-order tiers");
+        assert!(err.to_string().contains("strictly ascending"), "got: {err}");
+
+        // The same tiers in ascending order parse, and keep their declared order.
+        let ordered = concat!(
+            "[[routing.tiers]]\nmin_score = 0.0\nmodel = \"small\"\n\n",
+            "[[routing.tiers]]\nmin_score = 0.2\nmodel = \"medium\"\n\n",
+            "[[routing.tiers]]\nmin_score = 0.5\nmodel = \"large\"\n"
+        );
+        let config = routing_config_from_toml(ordered, "fixture").expect("ascending tiers parse");
+        let models: Vec<&str> = config
+            .tiers
+            .iter()
+            .map(|tier| tier.model.as_str())
+            .collect();
+        assert_eq!(models, ["small", "medium", "large"]);
     }
 
     #[test]
